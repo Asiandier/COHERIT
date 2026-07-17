@@ -56,6 +56,7 @@ _component_spec_mod = importlib.import_module(f"{pkg_name}.component_spec")
 
 InfinitesimalREMLFitter = _inf_mod.InfinitesimalREMLFitter
 FitConfig = _inf_mod.FitConfig
+standardize_response = _inf_mod.standardize_response
 load_pheno_covar_aligned = _data_mod.load_pheno_covar_aligned
 LassoPathConfig = _lasso_mod.LassoPathConfig
 compute_projected_hinv_vector = _lasso_mod.compute_projected_hinv_vector
@@ -469,7 +470,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lasso-active-set-period", type=int, default=5)
     p.add_argument("--lasso-ridge", type=float, default=1e-6)
     p.add_argument("--proj-ridge", type=float, default=1e-6)
-    p.add_argument("--ebic-p-mode", choices=["candidate", "full"], default="candidate")
+    p.add_argument(
+        "--ebic-p-mode",
+        choices=["candidate", "full"],
+        default="full",
+        help=(
+            "Model-space size used by the EBIC combinatorial penalty. "
+            "The default 'full' matches genome-wide KKT certification; "
+            "'candidate' is retained only for screened-EBIC sensitivity analyses."
+        ),
+    )
     p.add_argument("--kkt-check", action="store_true")
     p.add_argument("--no-kkt-check", dest="kkt_check", action="store_false")
     p.set_defaults(kkt_check=True)
@@ -514,6 +524,24 @@ def parse_args() -> argparse.Namespace:
 def _max_rel_change(new_v: np.ndarray, old_v: np.ndarray) -> float:
     denom = np.maximum(np.abs(old_v), 1e-6)
     return float(np.max(np.abs(new_v - old_v) / denom))
+
+
+def _require_pcg_converged(
+    rel_res,
+    *,
+    tol: float,
+    iters: int,
+    maxiter: int,
+    stage: str,
+) -> float:
+    """Reject sparse-pipeline statistics built from an unconverged PCG solve."""
+    rel = float(np.asarray(jax.device_get(rel_res)))
+    if (not np.isfinite(rel)) or rel > float(tol) * 1.05:
+        raise RuntimeError(
+            f"{stage} PCG did not converge: relative residual={rel:.3e}, "
+            f"tolerance={float(tol):.3e}, iterations={int(iters)}/{int(maxiter)}."
+        )
+    return rel
 
 
 def _fixed_point_skip_reml(
@@ -561,6 +589,63 @@ def _chive_q_hat_given_active(
     term1 = float(g @ g / n)
     term2 = float(2.0 * (beta @ (Zs.T @ r)) / n)
     return term1 + term2, term1, term2
+
+
+def _phenotype_standardization_stats(y: np.ndarray) -> tuple[float, float]:
+    """Return the exact mean/scale convention used internally by ``fit_reml``."""
+    _y_std, y_mean, y_scale = standardize_response(
+        jnp.asarray(np.asarray(y, dtype=np.float32).reshape(-1), dtype=jnp.float32)
+    )
+    mean_host, scale_host = jax.device_get((y_mean, y_scale))
+    return float(mean_host), float(scale_host)
+
+
+def _quadratic_variance_to_reml_scale(q_raw: float, y_scale: float) -> float:
+    """Convert a phenotype-variance quantity to fit_reml's standardized-y scale."""
+    scale = float(y_scale)
+    if not np.isfinite(scale) or scale <= 0.0:
+        raise ValueError("y_scale must be positive and finite.")
+    return float(q_raw) / (scale * scale)
+
+
+def _sparse_dense_h2(
+    q_sparse_standardized: float,
+    background_genetic_variance: float,
+    residual_variance: float,
+) -> float:
+    """Combine sparse, dense-background, and residual variance on one scale."""
+    genetic = float(q_sparse_standardized) + float(background_genetic_variance)
+    return genetic / (genetic + float(residual_variance))
+
+
+def _primary_sparse_dense_h2(
+    h2_penalized_chive: float,
+    h2_post_gls_diagnostic: float,
+) -> float:
+    """Define the primary estimator; post-selection GLS is diagnostic only.
+
+    CHIVE calibration is designed around a sparse regularized initial estimate.
+    An unpenalized same-sample refit can add a degrees-of-freedom term to the
+    quadratic functional, so it is intentionally not the primary result.
+    """
+    del h2_post_gls_diagnostic
+    return float(h2_penalized_chive)
+
+
+def _select_primary_h2_with_fallback(
+    h2_sparse_dense_hybrid: float,
+    h2_covariates_only_reml: float,
+    *,
+    alpha_theta_fixed_point_coherent: bool,
+) -> tuple[float, bool, str | None]:
+    """Apply the publication safety rule for an unmatched alpha/theta iterate."""
+    if alpha_theta_fixed_point_coherent:
+        return float(h2_sparse_dense_hybrid), False, None
+    return (
+        float(h2_covariates_only_reml),
+        True,
+        "sparse_outer_not_alpha_theta_fixed_point",
+    )
 
 
 def _gls_refit_on_support(
@@ -899,6 +984,7 @@ def main() -> None:
     )
 
     y_jax = jnp.asarray(y_np, dtype=jnp.float32)
+    phenotype_mean, phenotype_scale = _phenotype_standardization_stats(y_np)
     n_grm = len(ops.K_mvs)
     genetic_trace_atoms = np.asarray(
         jax.device_get(fitter._projected_core_diag_atoms(ops.diag_list)),
@@ -966,6 +1052,8 @@ def main() -> None:
     theta_lasso = theta.copy()
     n_samples = y_np.shape[0]
     has_reml_refit = False
+    outer_converged = False
+    outer_stop_reason = "outer_max"
 
     # ---- Precompute loop-invariant B_screen = [y | covar] on device --------
     screen_parts = [y_np[:, None]]
@@ -990,6 +1078,13 @@ def main() -> None:
             hv, B_screen_dev,
             M=precond, tol=args.pcg_tol, maxiter=args.max_pcg_iters,
             X0=x0_screen,
+        )
+        _require_pcg_converged(
+            res_screen,
+            tol=args.pcg_tol,
+            iters=it_screen,
+            maxiter=args.max_pcg_iters,
+            stage=f"outer {outer} screening",
         )
         warm_screen = sol_screen
 
@@ -1080,6 +1175,13 @@ def main() -> None:
                 hv, B_z, M=precond, tol=args.pcg_tol,
                 maxiter=args.max_pcg_iters, X0=x0_z,
             )
+            _require_pcg_converged(
+                res_all,
+                tol=args.pcg_tol,
+                iters=it_all,
+                maxiter=args.max_pcg_iters,
+                stage=f"outer {outer} KKT round {kkt_round} candidate",
+            )
 
             sol_z_np = np.asarray(sol_z, dtype=np.float32)
             warm_z_dict = {
@@ -1138,6 +1240,13 @@ def main() -> None:
                 M=precond,
                 tol=args.pcg_tol,
                 maxiter=args.max_pcg_iters,
+            )
+            _require_pcg_converged(
+                res_kkt,
+                tol=args.pcg_tol,
+                iters=it_kkt,
+                maxiter=args.max_pcg_iters,
+                stage=f"outer {outer} KKT round {kkt_round} residual",
             )
             score_kkt = np.abs(grm_index.xtv_all(sol_resid[:, 0], normalize=False))
             violators, max_outside_score, kkt_threshold = _outside_kkt_violators(
@@ -1230,6 +1339,8 @@ def main() -> None:
                 "[INFO] stop at outer=%s: k_selected=0 and support already empty; "
                 "skip redundant REML refit.", outer,
             )
+            outer_converged = True
+            outer_stop_reason = "empty_support_fixed_point"
             break
 
         # If theta was already stable from the previous outer iteration and
@@ -1270,6 +1381,8 @@ def main() -> None:
                     "[INFO] stop at outer=%s: support repeated under stable theta; "
                     "skip redundant REML refit.", outer,
                 )
+                outer_converged = True
+                outer_stop_reason = "support_theta_fixed_point"
                 break
             if args.verbose:
                 logger.info(
@@ -1355,6 +1468,8 @@ def main() -> None:
 
         if stable_rounds >= int(args.support_stable_rounds):
             logger.info("[INFO] stop at outer=%s: support+variance stabilized.", outer)
+            outer_converged = True
+            outer_stop_reason = "support_variance_stabilized"
             break
 
     # ---- Output results ----
@@ -1362,15 +1477,28 @@ def main() -> None:
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
 
-    h2_reml = _trace_weighted_h2(theta)
-    h2_chive = h2_reml
-    h2_chive_reml = h2_reml
+    h2_background_reml = _trace_weighted_h2(theta)
+    # Compatibility alias.  Once sparse SNPs enter the REML fixed-effect
+    # design, this is background-only rather than total heritability.
+    h2_reml = h2_background_reml
+    h2_chive = h2_background_reml
+    h2_chive_at_lasso_theta = h2_background_reml
+    h2_chive_reml = h2_background_reml
+    h2_chive_post_gls = h2_background_reml
+    theta_final_sum = _trace_weighted_genetic_var(theta)
+    theta_e_final = float(theta[-1])
     q_chive = 0.0
+    q_chive_standardized = 0.0
     q_chive_reml = 0.0
+    q_chive_post_gls_standardized = 0.0
     q_chive_term1 = 0.0
     q_chive_term2 = 0.0
+    q_chive_term1_standardized = 0.0
+    q_chive_term2_standardized = 0.0
     q_chive_reml_term1 = 0.0
     q_chive_reml_term2 = 0.0
+    q_chive_post_gls_term1_standardized = 0.0
+    q_chive_post_gls_term2_standardized = 0.0
     beta_cov_lasso = np.empty((0,), dtype=np.float64)
     beta_cov_gls = np.empty((0,), dtype=np.float64)
     beta_gls_active = np.empty((0,), dtype=np.float64)
@@ -1392,13 +1520,15 @@ def main() -> None:
             y_chive,
             beta_lasso_active,
         )
-        theta_lasso_sum = _trace_weighted_genetic_var(theta_lasso)
-        theta_lasso_e = float(theta_lasso[-1])
-        h2_chive = float(
-            (q_chive + theta_lasso_sum) /
-            max(q_chive + theta_lasso_sum + theta_lasso_e, 1e-8)
+        q_chive_standardized = _quadratic_variance_to_reml_scale(
+            q_chive, phenotype_scale
         )
-
+        q_chive_term1_standardized = _quadratic_variance_to_reml_scale(
+            q_chive_term1, phenotype_scale
+        )
+        q_chive_term2_standardized = _quadratic_variance_to_reml_scale(
+            q_chive_term2, phenotype_scale
+        )
         theta_g = jnp.asarray(theta[:-1], dtype=jnp.float32)
         theta_e = jnp.asarray(theta[-1], dtype=jnp.float32)
         hv_final = fitter._make_hv(ops, theta_g, theta_e)
@@ -1411,12 +1541,19 @@ def main() -> None:
             n_covar = int(covar_np.shape[1])
         solve_parts.append(Z_support)
         B_final = np.concatenate(solve_parts, axis=1).astype(np.float32, copy=False)
-        sol_final, _, _ = pcg_solve(
+        sol_final, res_final, it_final = pcg_solve(
             hv_final,
             jnp.asarray(B_final, dtype=jnp.float32),
             M=precond_final,
             tol=args.pcg_tol,
             maxiter=args.max_pcg_iters,
+        )
+        _require_pcg_converged(
+            res_final,
+            tol=args.pcg_tol,
+            iters=it_final,
+            maxiter=args.max_pcg_iters,
+            stage="final post-selection GLS",
         )
         sol_final_np = np.asarray(sol_final, dtype=np.float64)
         Hinv_y_final = sol_final_np[:, 0]
@@ -1442,17 +1579,100 @@ def main() -> None:
             y_chive_reml,
             beta_gls_active,
         )
-        theta_sum = _trace_weighted_genetic_var(theta)
-        theta_e_final = float(theta[-1])
-        h2_chive_reml = float(
-            (q_chive_reml + theta_sum) /
-            max(q_chive_reml + theta_sum + theta_e_final, 1e-8)
+        q_chive_post_gls_standardized = _quadratic_variance_to_reml_scale(
+            q_chive_reml, phenotype_scale
         )
+        q_chive_post_gls_term1_standardized = _quadratic_variance_to_reml_scale(
+            q_chive_reml_term1, phenotype_scale
+        )
+        q_chive_post_gls_term2_standardized = _quadratic_variance_to_reml_scale(
+            q_chive_reml_term2, phenotype_scale
+        )
+        h2_chive_post_gls = _sparse_dense_h2(
+            q_chive_post_gls_standardized,
+            theta_final_sum,
+            theta_e_final,
+        )
+        # Compatibility alias for historical result readers.
+        h2_chive_reml = h2_chive_post_gls
 
-    h2 = h2_chive_reml
+    # The primary penalized estimate is combined with the final REML variance
+    # components.  At a genuine outer fixed point this equals the value using
+    # theta_lasso; keeping both fields makes max-iteration exits auditable.
+    h2_chive_at_lasso_theta = _sparse_dense_h2(
+        q_chive_standardized,
+        _trace_weighted_genetic_var(theta_lasso),
+        float(theta_lasso[-1]),
+    )
+    h2_chive = _sparse_dense_h2(
+        q_chive_standardized,
+        theta_final_sum,
+        theta_e_final,
+    )
+    theta_lasso_to_final_rel = _max_rel_change(theta, theta_lasso)
+    alpha_theta_fixed_point_coherent = bool(
+        outer_converged
+        and theta_lasso_to_final_rel < float(args.vc_rel_tol)
+    )
+    theta_primary = theta.copy()
+    h2_covariates_only_reml_fallback = None
+    primary_fallback_reml_iterations = 0
+    if not alpha_theta_fixed_point_coherent:
+        logger.warning(
+            "[WARN] sparse outer loop did not finish at a matched alpha/theta fixed point: "
+            "stop=%s theta_lasso_to_final_rel=%.3e vc_rel_tol=%.3e. "
+            "The hybrid estimate is diagnostic only. Running a covariates-only REML "
+            "fallback for the primary h2; increase --outer-max or revise the sparse "
+            "model before publication analyses.",
+            outer_stop_reason,
+            theta_lasso_to_final_rel,
+            float(args.vc_rel_tol),
+        )
+        fallback_res = fitter.fit_infinitesimal(
+            y_jax,
+            jnp.asarray(covar_np, dtype=jnp.float32) if covar_np is not None else None,
+            h2_init=_trace_weighted_h2(theta),
+            var_components_init=jnp.asarray(theta, dtype=jnp.float32),
+        )
+        theta_primary = np.asarray(fallback_res.var_components, dtype=np.float64)
+        h2_covariates_only_reml_fallback = _trace_weighted_h2(theta_primary)
+        primary_fallback_reml_iterations = len(fallback_res.history)
+
+    h2_sparse_dense_hybrid = _primary_sparse_dense_h2(
+        h2_chive, h2_chive_post_gls
+    )
+    h2, primary_fallback, primary_fallback_reason = (
+        _select_primary_h2_with_fallback(
+            h2_sparse_dense_hybrid,
+            (
+                h2_covariates_only_reml_fallback
+                if h2_covariates_only_reml_fallback is not None
+                else h2_background_reml
+            ),
+            alpha_theta_fixed_point_coherent=alpha_theta_fixed_point_coherent,
+        )
+    )
+    primary_h2_method = (
+        "covariates_only_reml_fallback"
+        if primary_fallback
+        else "penalized_lasso_chive"
+    )
     print(f"[RESULT] var_components={theta.tolist()}")
+    print(f"[RESULT] var_components_primary={theta_primary.tolist()}")
+    print(f"[RESULT] h2={h2:.6f} (primary={primary_h2_method})")
+    if primary_fallback:
+        print(
+            f"[RESULT] h2_sparse_dense_unconverged={h2_sparse_dense_hybrid:.6f} "
+            "(diagnostic only)"
+        )
+    print(f"[RESULT] h2_background_reml={h2_background_reml:.6f}")
+    print(f"[RESULT] h2_chive={h2_chive:.6f} (penalized LASSO calibration)")
+    print(
+        f"[RESULT] h2_chive_post_gls={h2_chive_post_gls:.6f} "
+        "(diagnostic only)"
+    )
+    # Historical stdout labels retained for downstream parsers.
     print(f"[RESULT] h2_reml={h2_reml:.6f}")
-    print(f"[RESULT] h2_chive={h2_chive:.6f}")
     print(f"[RESULT] h2_chive_reml={h2_chive_reml:.6f}")
     print(f"[RESULT] support_size={int(support.size)}")
 
@@ -1465,29 +1685,87 @@ def main() -> None:
         "n_grms": grm_index.n_grm,
         "m_per_grm": grm_index.m_per_grm.tolist(),
         "genetic_trace_atoms": genetic_trace_atoms.tolist(),
+        "ebic_p_mode": args.ebic_p_mode,
+        "ebic_model_space_size": (
+            grm_index.m_total
+            if args.ebic_p_mode == "full"
+            else int(final_candidate.size)
+        ),
         "component_spec": component_spec_source or None,
         "component_partition_mode": (
             "snp_id" if component_variant_indices else "input_prefix"
         ),
         "var_components": theta.tolist(),
+        "var_components_primary": theta_primary.tolist(),
+        "var_components_covariates_only_reml_fallback": (
+            theta_primary.tolist() if primary_fallback else None
+        ),
+        "var_components_at_lasso": theta_lasso.tolist(),
+        "phenotype_mean": phenotype_mean,
+        "phenotype_scale": phenotype_scale,
+        "variance_component_scale": "standardized_phenotype",
+        "primary_h2_method": primary_h2_method,
+        "primary_fallback": primary_fallback,
+        "primary_fallback_reason": primary_fallback_reason,
+        "primary_fallback_reml_iterations": primary_fallback_reml_iterations,
+        "outer_converged": outer_converged,
+        "outer_stop_reason": outer_stop_reason,
+        "alpha_theta_fixed_point_coherent": alpha_theta_fixed_point_coherent,
+        "theta_lasso_to_final_rel_change": theta_lasso_to_final_rel,
+        "h2_background_reml": h2_background_reml,
+        "h2_reml_background_only": h2_background_reml,
         "h2_reml": h2_reml,
         "h2_chive": h2_chive,
+        "h2_chive_penalized_lasso": h2_chive,
+        "h2_chive_at_lasso_theta": h2_chive_at_lasso_theta,
         "h2_chive_reml": h2_chive_reml,
+        "h2_chive_post_gls": h2_chive_post_gls,
+        "h2_chive_post_gls_role": "diagnostic_only",
+        "h2_sparse_dense_hybrid": h2_sparse_dense_hybrid,
+        "h2_sparse_dense_unconverged": (
+            h2_sparse_dense_hybrid if primary_fallback else None
+        ),
+        "h2_covariates_only_reml_fallback": h2_covariates_only_reml_fallback,
         "h2": h2,
+        # Compatibility fields q_chive/q_chive_reml retain their historical
+        # raw-phenotype units.  Explicit fields below provide both scales.
         "q_chive": q_chive,
         "q_chive_reml": q_chive_reml,
+        "q_chive_raw": q_chive,
+        "q_chive_standardized": q_chive_standardized,
+        "q_chive_post_gls_raw": q_chive_reml,
+        "q_chive_post_gls_standardized": q_chive_post_gls_standardized,
+        "q_chive_reml_standardized": q_chive_post_gls_standardized,
         "q_chive_components": {
             "term1_g2_over_n": q_chive_term1,
             "term2_cross": q_chive_term2,
+            "scale": "raw_phenotype_variance",
+        },
+        "q_chive_components_standardized": {
+            "term1_g2_over_n": q_chive_term1_standardized,
+            "term2_cross": q_chive_term2_standardized,
+            "scale": "standardized_phenotype_variance",
         },
         "q_chive_reml_components": {
             "term1_g2_over_n": q_chive_reml_term1,
             "term2_cross": q_chive_reml_term2,
+            "scale": "raw_phenotype_variance",
+        },
+        "q_chive_post_gls_components_standardized": {
+            "term1_g2_over_n": q_chive_post_gls_term1_standardized,
+            "term2_cross": q_chive_post_gls_term2_standardized,
+            "scale": "standardized_phenotype_variance",
         },
         "support_size": int(support.size),
         "support_indices": support.tolist(),
         "support_source_indices": grm_index.source_variant_indices(support).tolist(),
         "kkt_check_enabled": bool(args.kkt_check),
+        # Candidate expansion certifies the EBIC-selected lambda in each outer
+        # round.  It does not certify every unselected point on the lambda path.
+        "kkt_certification_scope": (
+            "selected_lambda_only" if args.kkt_check else "disabled"
+        ),
+        "ebic_path_globally_kkt_certified": False,
         "kkt_certified": bool(
             args.kkt_check and history and bool(history[-1].get("kkt_certified", False))
         ),

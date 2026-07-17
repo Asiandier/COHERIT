@@ -86,6 +86,30 @@ $$
 (\hat\alpha_\lambda,\hat b_\lambda)=\arg\min_{\alpha,b}\frac{1}{2}(y-C\alpha-Z_Sb)^TV(\theta)^{-1}(y-C\alpha-Z_Sb)+\lambda\|b\|_1.
 $$
 
+The sparse command alternates this weighted-LASSO selection step with REML
+conditional on the selected SNP span.  It is a selection--REML fixed-point
+procedure, not block coordinate optimization of one restricted likelihood.
+The default EBIC penalty uses the full eligible marker count, and the accepted
+LASSO solution is checked against genome-wide inactive-coordinate KKT
+conditions.
+
+Sparse-run output semantics are deliberately explicit:
+
+- `h2` is the primary total estimate.  At a coherent sparse--REML fixed point
+  it combines the penalized-LASSO calibrated quadratic with the final
+  trace-weighted background variance.
+- `h2_background_reml` (legacy alias `h2_reml`) is background-only once SNPs
+  enter the fixed-effect design; it is not total heritability.
+- `h2_chive_post_gls` (legacy alias `h2_chive_reml`) is a same-sample
+  post-selection GLS diagnostic and is not primary.
+- Raw-scale sparse quadratic terms and standardized-phenotype REML components
+  are never added directly.  The summary records both quadratic scales and the
+  phenotype scale used for conversion.
+- If the outer loop does not produce a matched sparse coefficient/covariance
+  fixed point, the hybrid value is retained only as
+  `h2_sparse_dense_unconverged`; primary `h2` is recomputed by a genuine
+  covariates-only REML fallback, with `primary_fallback=true`.
+
 ## Research Use Cases
 
 GPU_REML is most useful when the scientific question requires more than a

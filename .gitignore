@@ -17,6 +17,12 @@ effect_estimate/
 
 # Local tests and test datasets are intentionally not pushed to GitHub.
 
+# Publication-critical sparse-REML regression tests are version-visible even
+# though the remainder of the local validation suite and datasets stay ignored.
+!tests/
+tests/*
+!tests/test_sparse_reml_regressions.py
+
 # Local backup snapshot
 bolt_jax_副本 22-47-38-277/
 
