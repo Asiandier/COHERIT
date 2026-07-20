@@ -448,7 +448,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--slq-samples", type=int, default=100)
     p.add_argument("--slq-m", type=int, default=int(env("SLQ_M", "50")))
     p.add_argument("--precond-type", choices=["projected_core"], default=env("PRECOND_TYPE", "projected_core"))
-    p.add_argument("--minq-iter", type=int, default=int(env("MINQ_ITER", "10")))
+    p.add_argument("--minq-iter", type=int, default=int(env("MINQ_ITER", "50")))
     p.add_argument("--pcg-tol", type=float, default=float(env("PCG_TOL", "5e-3")))
     p.add_argument("--pcg-ridge", type=float, default=float(env("PCG_RIDGE", "1e-6")))
     p.add_argument("--max-pcg-iters", type=int, default=int(env("MAX_PCG_ITERS", "400")))
@@ -526,6 +526,70 @@ def _max_rel_change(new_v: np.ndarray, old_v: np.ndarray) -> float:
     return float(np.max(np.abs(new_v - old_v) / denom))
 
 
+def _accepted_reml_theta(
+    fit_result,
+    *,
+    expected_components: int,
+    stage: str,
+) -> tuple[np.ndarray, str]:
+    """Return a numerically accepted REML result or fail closed."""
+    theta = np.asarray(fit_result.var_components, dtype=np.float64).reshape(-1)
+    history = list(fit_result.history)
+    stop_reason = (
+        str(history[-1].get("stop_reason", "")) if history else ""
+    )
+    valid_theta = (
+        theta.shape == (int(expected_components),)
+        and np.all(np.isfinite(theta))
+        and np.all(theta[:-1] >= 0.0)
+        and theta[-1] > 0.0
+    )
+    accepted_history = bool(
+        history
+        and bool(history[-1].get("accepted", False))
+        and stop_reason in {"rel_dll", "scoring_step"}
+    )
+    if not valid_theta or not accepted_history:
+        raise RuntimeError(
+            f"{stage} did not return an accepted converged REML fit: "
+            f"theta={theta.tolist()}, history_rows={len(history)}, "
+            f"stop_reason={stop_reason!r}, "
+            f"last_accepted="
+            f"{bool(history[-1].get('accepted', False)) if history else False}."
+        )
+    return theta, stop_reason
+
+
+def _intercept_contrast_fixed_effect(n_samples: int) -> np.ndarray:
+    """Return the nuisance column whose REML contrasts remove the intercept."""
+    n_samples = int(n_samples)
+    if n_samples < 2:
+        raise ValueError("Intercept contrasts require at least two samples.")
+    return np.ones((n_samples, 1), dtype=np.float32)
+
+
+def _fit_intercept_contrast_residual_ml(
+    fitter,
+    residual_standardized: np.ndarray,
+    theta_init: np.ndarray,
+    *,
+    h2_init: float,
+):
+    """Fit the Lasso residual covariance through intercept REML contrasts."""
+    residual = np.asarray(residual_standardized, dtype=np.float32).reshape(-1)
+    theta = np.asarray(theta_init, dtype=np.float32).reshape(-1)
+    return fitter.fit_infinitesimal(
+        jnp.asarray(residual, dtype=jnp.float32),
+        jnp.asarray(
+            _intercept_contrast_fixed_effect(residual.size),
+            dtype=jnp.float32,
+        ),
+        h2_init=float(h2_init),
+        var_components_init=jnp.asarray(theta, dtype=jnp.float32),
+        standardize_y=False,
+    )
+
+
 def _require_pcg_converged(
     rel_res,
     *,
@@ -552,17 +616,19 @@ def _fixed_point_skip_reml(
     stable_rounds: int,
     support_stable_rounds: int,
 ) -> tuple[bool, int]:
-    """
-    Decide whether a repeated support under already-stable theta can skip REML.
+    """Legacy helper retained for downstream compatibility.
 
-    Returns (stop_now, stable_rounds_next).  If ``stop_now`` is False but
-    ``stable_rounds_next`` increased, the caller should continue to the next
-    outer iteration without a redundant REML refit.
+    The two-branch pipeline no longer calls this selected-span REML skip rule:
+    every penalized-ML outer round performs its residual-ML variance update,
+    and selected-span REML is run exactly once after that branch is frozen.
     """
     if not (support_same and theta_stable_prev and has_reml_refit):
         return False, stable_rounds
     stable_rounds_next = stable_rounds + 1
-    return stable_rounds_next >= max(1, int(support_stable_rounds)), stable_rounds_next
+    return (
+        stable_rounds_next >= max(1, int(support_stable_rounds)),
+        stable_rounds_next,
+    )
 
 
 def _chive_q_hat_given_active(
@@ -615,18 +681,202 @@ def _sparse_dense_h2(
 ) -> float:
     """Combine sparse, dense-background, and residual variance on one scale."""
     genetic = float(q_sparse_standardized) + float(background_genetic_variance)
-    return genetic / (genetic + float(residual_variance))
+    residual = float(residual_variance)
+    denominator = genetic + residual
+    if (
+        not np.isfinite(genetic)
+        or not np.isfinite(residual)
+        or not np.isfinite(denominator)
+        or denominator <= 0.0
+    ):
+        return float("nan")
+    return genetic / denominator
+
+
+def _finite_float_or_none(value: float) -> float | None:
+    """Return a JSON-safe finite scalar, or ``None`` when unavailable."""
+    value_f = float(value)
+    return value_f if np.isfinite(value_f) else None
+
+
+def _json_safe_value(value):
+    """Recursively replace non-finite numeric diagnostics by JSON ``null``."""
+    if isinstance(value, dict):
+        return {
+            str(key): _json_safe_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_value(item) for item in value]
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, float) and not np.isfinite(value):
+        return None
+    return value
+
+
+def _expand_selected_basis_coefficients(
+    *,
+    support_size: int,
+    basis_positions: np.ndarray,
+    basis_coefficients: np.ndarray,
+) -> np.ndarray:
+    """Map one full-rank selected-span coefficient back to the full support."""
+    size = int(support_size)
+    positions = np.asarray(basis_positions, dtype=np.int64).reshape(-1)
+    coefficients = np.asarray(
+        basis_coefficients, dtype=np.float64
+    ).reshape(-1)
+    if size < 0 or positions.size != coefficients.size:
+        raise ValueError("Selected-span basis coefficient shape mismatch.")
+    if (
+        positions.size > 0
+        and (
+            np.any(positions < 0)
+            or np.any(positions >= size)
+            or np.unique(positions).size != positions.size
+        )
+    ):
+        raise ValueError("Selected-span basis positions are invalid.")
+    expanded = np.zeros(size, dtype=np.float64)
+    expanded[positions] = coefficients
+    return expanded
+
+
+def _lasso_kkt_certificate_from_scores(
+    *,
+    score: np.ndarray,
+    beta: np.ndarray,
+    lam: float,
+    abs_tol: float,
+    rel_tol: float,
+) -> dict[str, float | bool]:
+    """Check all active and inactive Lasso KKT equations from score values."""
+    score_arr = np.asarray(score, dtype=np.float64).reshape(-1)
+    beta_arr = np.asarray(beta, dtype=np.float64).reshape(-1)
+    lam_f = float(lam)
+    tolerance = max(
+        float(abs_tol),
+        float(rel_tol) * max(1.0, abs(lam_f)),
+    )
+    if (
+        score_arr.shape != beta_arr.shape
+        or not np.all(np.isfinite(score_arr))
+        or not np.all(np.isfinite(beta_arr))
+        or not np.isfinite(lam_f)
+        or lam_f < 0.0
+    ):
+        return {
+            "passed": False,
+            "tolerance": tolerance,
+            "max_active_error": float("inf"),
+            "max_inactive_excess": float("inf"),
+        }
+
+    active = beta_arr != 0.0
+    if np.any(active):
+        max_active_error = float(
+            np.max(
+                np.abs(
+                    score_arr[active]
+                    - lam_f * np.sign(beta_arr[active])
+                )
+            )
+        )
+    else:
+        max_active_error = 0.0
+    if np.any(~active):
+        max_inactive_excess = float(
+            max(np.max(np.abs(score_arr[~active])) - lam_f, 0.0)
+        )
+    else:
+        max_inactive_excess = 0.0
+    return {
+        "passed": bool(
+            max_active_error <= tolerance
+            and max_inactive_excess <= tolerance
+        ),
+        "tolerance": tolerance,
+        "max_active_error": max_active_error,
+        "max_inactive_excess": max_inactive_excess,
+    }
+
+
+def _four_estimator_h2_from_branches(
+    *,
+    q_lasso_plugin_standardized: float,
+    q_lasso_calibrated_standardized: float,
+    q_selected_span_plugin_standardized: float,
+    q_selected_span_trace_standardized: float,
+    lasso_ml_background_variance: float,
+    lasso_ml_residual_variance: float,
+    selected_span_reml_background_variance: float,
+    selected_span_reml_residual_variance: float,
+) -> dict[str, float]:
+    """Map the four sparse quadratics to their two variance branches."""
+    return {
+        "h2_lasso_plugin": _sparse_dense_h2(
+            q_lasso_plugin_standardized,
+            lasso_ml_background_variance,
+            lasso_ml_residual_variance,
+        ),
+        "h2_chive": _sparse_dense_h2(
+            q_lasso_calibrated_standardized,
+            lasso_ml_background_variance,
+            lasso_ml_residual_variance,
+        ),
+        "h2_ss_gls_plugin": _sparse_dense_h2(
+            q_selected_span_plugin_standardized,
+            selected_span_reml_background_variance,
+            selected_span_reml_residual_variance,
+        ),
+        "h2_ss_gls_df_corrected": _sparse_dense_h2(
+            q_selected_span_trace_standardized,
+            selected_span_reml_background_variance,
+            selected_span_reml_residual_variance,
+        ),
+    }
+
+
+def _common_sparse_estimator_guard(
+    *,
+    alpha_theta_pair_certified: bool,
+    lasso_quadratics_available: bool,
+    selected_span_refit_ok: bool,
+    estimator_values: np.ndarray,
+) -> tuple[bool, bool, list[str]]:
+    """Apply one fail-closed acceptance rule to all four sparse estimators."""
+    values = np.asarray(estimator_values, dtype=np.float64).reshape(-1)
+    sparse_outputs_finite = bool(
+        values.size == 4 and np.all(np.isfinite(values))
+    )
+    reasons: list[str] = []
+    if not alpha_theta_pair_certified:
+        reasons.append("penalized_alpha_theta_pair_not_certified")
+    if not lasso_quadratics_available:
+        reasons.append("lasso_quadratic_unavailable")
+    if not selected_span_refit_ok:
+        reasons.append("selected_span_reml_gls_unavailable")
+    if not sparse_outputs_finite:
+        reasons.append("nonfinite_sparse_estimator")
+    accepted = bool(
+        alpha_theta_pair_certified
+        and lasso_quadratics_available
+        and selected_span_refit_ok
+        and sparse_outputs_finite
+    )
+    return accepted, sparse_outputs_finite, reasons
 
 
 def _primary_sparse_dense_h2(
     h2_penalized_chive: float,
     h2_post_gls_diagnostic: float,
 ) -> float:
-    """Define the primary estimator; post-selection GLS is diagnostic only.
+    """Define the primary estimator; CHIVE-at-post-GLS is diagnostic only.
 
     CHIVE calibration is designed around a sparse regularized initial estimate.
-    An unpenalized same-sample refit can add a degrees-of-freedom term to the
-    quadratic functional, so it is intentionally not the primary result.
+    Reapplying that formula to a post-selection GLS coefficient is not the
+    trace-corrected selected-span estimator and is intentionally not primary.
     """
     del h2_post_gls_diagnostic
     return float(h2_penalized_chive)
@@ -648,49 +898,104 @@ def _select_primary_h2_with_fallback(
     )
 
 
-def _gls_refit_on_support(
+def _selected_span_gls_quadratics(
+    *,
     y: np.ndarray,
     covar: np.ndarray | None,
     z_active: np.ndarray,
     Hinv_y: np.ndarray,
     Hinv_covar: np.ndarray | None,
     Hinv_z_active: np.ndarray,
-    ridge: float = 1e-6,
-) -> tuple[np.ndarray, np.ndarray]:
+    phenotype_scale: float,
+) -> dict[str, object]:
+    """Construct raw and trace-corrected quadratics after selected-span GLS.
+
+    The covariance operator represented by the ``Hinv_*`` arguments is on the
+    internally standardized phenotype scale.  GLS coefficients and the
+    squared fitted score are returned on the raw phenotype scale; the
+    fixed-span estimation-noise trace correction is reported on both scales.
+    Output field names retain ``df`` for backward compatibility.
     """
-    GLS refit on the final active support under fixed variance components.
-    Returns (beta_cov, beta_active).
-    """
-    y = np.asarray(y, dtype=np.float64).reshape(-1)
-    Zs = np.asarray(z_active, dtype=np.float64)
-    Hy = np.asarray(Hinv_y, dtype=np.float64).reshape(-1)
-    HZ = np.asarray(Hinv_z_active, dtype=np.float64)
+    y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
+    z_arr = np.asarray(z_active, dtype=np.float64)
+    hy = np.asarray(Hinv_y, dtype=np.float64).reshape(-1)
+    hz = np.asarray(Hinv_z_active, dtype=np.float64)
+    if (
+        z_arr.ndim != 2
+        or hz.shape != z_arr.shape
+        or z_arr.shape[0] != y_arr.size
+        or hy.size != y_arr.size
+    ):
+        raise ValueError("Selected-span GLS inputs have incompatible shapes.")
 
-    if Zs.ndim != 2 or HZ.shape != Zs.shape or Zs.shape[0] != y.size:
-        raise ValueError("GLS active-set inputs have incompatible shapes.")
+    merged, active_basis_idx = _merge_independent_fixed_effects(covar, z_arr)
+    if covar is None:
+        c_arr = np.empty((y_arr.size, 0), dtype=np.float64)
+        hc = np.empty((y_arr.size, 0), dtype=np.float64)
+    else:
+        c_arr = np.asarray(covar, dtype=np.float64)
+        hc = np.asarray(Hinv_covar, dtype=np.float64)
+        if c_arr.ndim != 2 or hc.shape != c_arr.shape:
+            raise ValueError("Covariate GLS inputs have incompatible shapes.")
 
-    k = Zs.shape[1]
-    if covar is None or covar.size == 0:
-        if k == 0:
-            return np.empty((0,), dtype=np.float64), np.empty((0,), dtype=np.float64)
-        A = 0.5 * ((Zs.T @ HZ) + (HZ.T @ Zs))
-        b = Zs.T @ Hy
-        beta_active = np.asarray(solve_spd(A, b, ridge=ridge), dtype=np.float64).reshape(-1)
-        return np.empty((0,), dtype=np.float64), beta_active
+    z_basis = z_arr[:, active_basis_idx]
+    hz_basis = hz[:, active_basis_idx]
+    hfixed = np.concatenate([hc, hz_basis], axis=1)
+    fixed = np.asarray(merged, dtype=np.float64)
+    if fixed.shape != hfixed.shape:
+        raise RuntimeError("Selected-span basis and inverse-covariance image disagree.")
 
-    C = np.asarray(covar, dtype=np.float64)
-    HC = np.asarray(Hinv_covar, dtype=np.float64)
-    if C.ndim != 2 or HC.ndim != 2 or C.shape != HC.shape or C.shape[0] != y.size:
-        raise ValueError("GLS covariate inputs have incompatible shapes.")
+    if fixed.shape[1] == 0:
+        return {
+            "active_basis_idx": active_basis_idx,
+            "beta_cov": np.empty((0,), dtype=np.float64),
+            "beta_active_basis": np.empty((0,), dtype=np.float64),
+            "q_plugin_raw": 0.0,
+            "q_plugin_standardized": 0.0,
+            "df_correction_raw": 0.0,
+            "df_correction_standardized": 0.0,
+            "q_df_corrected_raw": 0.0,
+            "q_df_corrected_standardized": 0.0,
+        }
 
-    X = np.concatenate([C, Zs], axis=1) if k > 0 else C
-    HX = np.concatenate([HC, HZ], axis=1) if k > 0 else HC
-    A = X.T @ HX
-    A = 0.5 * (A + A.T)
-    b = X.T @ Hy
-    beta = np.asarray(solve_spd(A, b, ridge=ridge), dtype=np.float64).reshape(-1)
-    p_c = C.shape[1]
-    return beta[:p_c], beta[p_c:]
+    gram = fixed.T @ hfixed
+    gram = 0.5 * (gram + gram.T)
+    try:
+        gram_inv = sla.inv(gram, check_finite=False)
+    except np.linalg.LinAlgError:
+        gram_inv = sla.pinvh(gram, rtol=1e-10, check_finite=False)
+    gram_inv = 0.5 * (gram_inv + gram_inv.T)
+    coef = gram_inv @ (fixed.T @ hy)
+    p_c = int(c_arr.shape[1])
+    beta_cov = np.asarray(coef[:p_c], dtype=np.float64)
+    beta_active = np.asarray(coef[p_c:], dtype=np.float64)
+    fitted_sparse = z_basis @ beta_active
+    n = float(y_arr.size)
+    q_plugin_raw = float(fitted_sparse @ fitted_sparse / n)
+
+    sparse_gram = z_basis.T @ z_basis / n
+    covariance_active_standardized = gram_inv[p_c:, p_c:]
+    df_standardized = float(
+        np.trace(sparse_gram @ covariance_active_standardized)
+    )
+    scale = float(phenotype_scale)
+    if not np.isfinite(scale) or scale <= 0.0:
+        raise ValueError("phenotype_scale must be positive and finite.")
+    scale_sq = scale * scale
+    q_plugin_standardized = q_plugin_raw / scale_sq
+    df_raw = df_standardized * scale_sq
+
+    return {
+        "active_basis_idx": active_basis_idx,
+        "beta_cov": beta_cov,
+        "beta_active_basis": beta_active,
+        "q_plugin_raw": q_plugin_raw,
+        "q_plugin_standardized": q_plugin_standardized,
+        "df_correction_raw": df_raw,
+        "df_correction_standardized": df_standardized,
+        "q_df_corrected_raw": q_plugin_raw - df_raw,
+        "q_df_corrected_standardized": q_plugin_standardized - df_standardized,
+    }
 
 
 def _lasso_residual(
@@ -747,6 +1052,12 @@ def main() -> None:
         raise SystemExit("screen-topk must be >= candidate-k.")
     if int(args.outer_max) < 1:
         raise SystemExit("outer-max must be >= 1.")
+    if int(args.minq_iter) < 1:
+        raise SystemExit("minq-iter must be >= 1 for both variance blocks.")
+    if int(args.support_stable_rounds) < 1:
+        raise SystemExit("support-stable-rounds must be >= 1.")
+    if float(args.vc_rel_tol) <= 0.0:
+        raise SystemExit("vc-rel-tol must be > 0.")
     if int(args.kkt_max_rounds) < 1:
         raise SystemExit("kkt-max-rounds must be >= 1.")
     if int(args.kkt_add_topk) < 1:
@@ -1042,7 +1353,6 @@ def main() -> None:
     support = np.array([], dtype=np.int64)
     stable_rounds = 0
     history: list[dict] = []
-    theta_stable_prev = False
 
     warm_screen = None
     warm_z_dict: dict[int, np.ndarray] = {}
@@ -1051,9 +1361,12 @@ def main() -> None:
     final_lasso = None
     theta_lasso = theta.copy()
     n_samples = y_np.shape[0]
-    has_reml_refit = False
+    ml_updates_completed = 0
     outer_converged = False
     outer_stop_reason = "outer_max"
+    verification_pending = False
+    lasso_ml_stop_reason = ""
+    penalized_failure_reason = None
 
     # ---- Precompute loop-invariant B_screen = [y | covar] on device --------
     screen_parts = [y_np[:, None]]
@@ -1063,7 +1376,11 @@ def main() -> None:
     B_screen_dev = jnp.asarray(B_screen_np, dtype=jnp.float32)
     n_screen = B_screen_np.shape[1]
 
-    for outer in range(1, int(args.outer_max) + 1):
+    outer = 0
+    while outer < int(args.outer_max) or verification_pending:
+        outer += 1
+        terminal_verification = bool(verification_pending)
+        verification_pending = False
         iter_t0 = time.time()
         theta_g = jnp.asarray(theta[:-1], dtype=jnp.float32)
         theta_e = jnp.asarray(theta[-1], dtype=jnp.float32)
@@ -1146,6 +1463,7 @@ def main() -> None:
         active_local = np.array([], dtype=np.int64)
         support_new = np.array([], dtype=np.int64)
         certified_kkt = False
+        penalized_block_failure = None
 
         max_kkt_rounds = int(args.kkt_max_rounds) if bool(args.kkt_check) else 1
         for kkt_round in range(1, max_kkt_rounds + 1):
@@ -1190,12 +1508,24 @@ def main() -> None:
             }
 
             p_for_ebic = int(candidate.size) if args.ebic_p_mode == "candidate" else grm_index.m_total
-            lasso = fit_weighted_lasso_with_covariates(
-                y=y_np, covar=covar_np, geno=Z_cand,
-                Hinv_y=Hinv_y_np, Hinv_covar=Hinv_covar_np,
-                Hinv_geno=sol_z_np, p_total=p_for_ebic,
-                cfg=path_cfg, ridge=args.lasso_ridge,
-            )
+            try:
+                lasso = fit_weighted_lasso_with_covariates(
+                    y=y_np, covar=covar_np, geno=Z_cand,
+                    Hinv_y=Hinv_y_np, Hinv_covar=Hinv_covar_np,
+                    Hinv_geno=sol_z_np, p_total=p_for_ebic,
+                    cfg=path_cfg, ridge=args.lasso_ridge,
+                )
+            except (
+                FloatingPointError,
+                RuntimeError,
+                ValueError,
+                np.linalg.LinAlgError,
+            ) as error:
+                penalized_block_failure = (
+                    "Weighted-LASSO solve failed: "
+                    f"{error}"
+                )
+                break
             theta_lasso = theta.copy()
 
             best_path = min(
@@ -1203,19 +1533,21 @@ def main() -> None:
                 key=lambda row: abs(float(row["lam"]) - float(lasso["lam"])),
             )
             if not bool(best_path.get("converged", False)):
-                raise RuntimeError(
+                penalized_block_failure = (
                     "Selected LASSO solution did not converge; KKT optimality cannot be certified. "
                     "Increase --lasso-cd-max-iter or loosen --lasso-cd-tol."
                 )
+                break
 
             active_local = np.asarray(lasso["active_idx"], dtype=np.int64)
             if active_local.size > int(args.max_active):
-                raise RuntimeError(
+                penalized_block_failure = (
                     "LASSO selected more active SNPs than max-active "
                     f"({active_local.size} > {int(args.max_active)}). "
                     "Refusing to truncate coefficients because that would violate KKT optimality; "
                     "increase --max-active or use stronger LASSO/EBIC settings."
                 )
+                break
             support_new = np.sort(candidate[active_local])
 
             if not bool(args.kkt_check):
@@ -1288,17 +1620,58 @@ def main() -> None:
 
             max_candidate = int(args.kkt_max_candidate)
             if max_candidate > 0 and candidate.size > max_candidate:
-                raise RuntimeError(
+                penalized_block_failure = (
                     "KKT refinement exceeded --kkt-max-candidate "
                     f"({candidate.size} > {max_candidate})."
                 )
+                break
 
-        if bool(args.kkt_check) and not certified_kkt:
-            raise RuntimeError(
+        if (
+            penalized_block_failure is None
+            and bool(args.kkt_check)
+            and not certified_kkt
+        ):
+            penalized_block_failure = (
                 "Failed to certify global LASSO KKT optimality within "
                 f"{int(args.kkt_max_rounds)} refinement rounds. "
                 "Increase --kkt-max-rounds/--kkt-add-topk or inspect the KKT trace."
             )
+
+        if penalized_block_failure is not None:
+            penalized_failure_reason = str(penalized_block_failure)
+            outer_stop_reason = "penalized_block_failed"
+            final_candidate = candidate
+            final_lasso = lasso
+            theta_lasso = theta.copy()
+            support = support_new
+            history.append(
+                {
+                    "outer": outer,
+                    "theta": theta.tolist(),
+                    "support_size": int(support_new.size),
+                    "lam": (
+                        float(lasso["lam"])
+                        if lasso is not None
+                        else None
+                    ),
+                    "best_ebic": (
+                        float(lasso["best_ebic"])
+                        if lasso is not None
+                        else None
+                    ),
+                    "kkt_certified": False,
+                    "kkt_trace": kkt_trace,
+                    "verification": terminal_verification,
+                    "variance_update": "not_run",
+                    "failure": penalized_failure_reason,
+                }
+            )
+            logger.warning(
+                "[WARN] penalized block rejected at outer=%s: %s",
+                outer,
+                penalized_failure_reason,
+            )
+            break
 
         if lasso is None:
             raise RuntimeError("Internal error: LASSO refinement loop did not run.")
@@ -1313,118 +1686,76 @@ def main() -> None:
                 bool(certified_kkt),
             )
 
-        # If no SNP is selected and support is already empty, covariates-only
-        # REML is redundant only after at least one REML refit has completed.
-        if active_local.size == 0 and support.size == 0 and has_reml_refit:
-            history.append({
-                "outer": outer,
-                "pcg_screen_iters": int(it_screen),
-                "pcg_screen_res": float(np.asarray(res_screen)),
-                "pcg_all_iters": int(it_all),
-                "pcg_all_res": float(np.asarray(res_all)),
-                "theta": theta.tolist(),
-                "support_size": 0,
-                "support_same": True,
-                "vc_rel": 0.0,
-                "lam": float(lasso["lam"]),
-                "best_ebic": float(lasso["best_ebic"]),
-                "kkt_certified": bool(certified_kkt),
-                "kkt_trace": kkt_trace,
-                "early_stop_no_snp": True,
-            })
+        # ---- Step 5: contrast residual-ML variance block ------------------
+        # Hold the complete Lasso mean fixed and maximize the Gaussian
+        # likelihood in the subspace orthogonal to the intercept, exactly as
+        # in the manuscript's m=n-1 contrast coordinates.  Passing a constant
+        # fixed-effect column to fit_infinitesimal is algebraically equivalent
+        # to that contrast likelihood.  Omitting it would retain a zero-energy
+        # constant mode of the centered GRM and spuriously drive residual
+        # variance toward its numerical floor.
+        beta_cov_current = np.asarray(
+            lasso.get("beta_cov", np.empty((0,))), dtype=np.float64
+        )
+        beta_snp_current = np.asarray(lasso["beta_snp"], dtype=np.float64)
+        residual_raw = _lasso_residual(
+            y=y_np,
+            covar=covar_np,
+            geno=Z_cand,
+            beta_cov=beta_cov_current,
+            beta_snp=beta_snp_current,
+        )
+        residual_standardized = residual_raw / float(phenotype_scale)
+        try:
+            ml_res = _fit_intercept_contrast_residual_ml(
+                fitter,
+                residual_standardized,
+                theta,
+                h2_init=_trace_weighted_h2(theta),
+            )
+            theta_new, lasso_ml_stop_reason = _accepted_reml_theta(
+                ml_res,
+                expected_components=n_grm + 1,
+                stage=f"outer {outer} Lasso residual-ML block",
+            )
+            ml_updates_completed += 1
+        except (FloatingPointError, RuntimeError, ValueError) as error:
+            penalized_failure_reason = str(error)
+            outer_stop_reason = "residual_ml_failed"
             support = support_new
             final_candidate = candidate
             final_lasso = lasso
-            logger.info(
-                "[INFO] stop at outer=%s: k_selected=0 and support already empty; "
-                "skip redundant REML refit.", outer,
+            history.append(
+                {
+                    "outer": outer,
+                    "theta": theta.tolist(),
+                    "support_size": int(support_new.size),
+                    "support_same": support_same,
+                    "lam": float(lasso["lam"]),
+                    "best_ebic": float(lasso["best_ebic"]),
+                    "kkt_certified": bool(certified_kkt),
+                    "kkt_trace": kkt_trace,
+                    "verification": terminal_verification,
+                    "variance_update": "failed",
+                    "failure": penalized_failure_reason,
+                }
             )
-            outer_converged = True
-            outer_stop_reason = "empty_support_fixed_point"
+            logger.warning(
+                "[WARN] residual-ML block rejected at outer=%s: %s",
+                outer,
+                penalized_failure_reason,
+            )
             break
-
-        # If theta was already stable from the previous outer iteration and
-        # this round's screening/LASSO reproduces the same support, then this
-        # support is a fixed point under the current theta and another REML
-        # refit would be redundant.
-        stop_now, stable_rounds_next = _fixed_point_skip_reml(
-            support_same=support_same,
-            theta_stable_prev=theta_stable_prev,
-            has_reml_refit=has_reml_refit,
-            stable_rounds=stable_rounds,
-            support_stable_rounds=int(args.support_stable_rounds),
-        )
-        if stable_rounds_next != stable_rounds:
-            stable_rounds = stable_rounds_next
-            history.append({
-                "outer": outer,
-                "pcg_screen_iters": int(it_screen),
-                "pcg_screen_res": float(np.asarray(res_screen)),
-                "pcg_all_iters": int(it_all),
-                "pcg_all_res": float(np.asarray(res_all)),
-                "theta": theta.tolist(),
-                "support_size": int(support_new.size),
-                "support_same": True,
-                "vc_rel": 0.0,
-                "lam": float(lasso["lam"]),
-                "best_ebic": float(lasso["best_ebic"]),
-                "kkt_certified": bool(certified_kkt),
-                "kkt_trace": kkt_trace,
-                "early_stop_fixed_point": True,
-            })
-            support = support_new
-            final_candidate = candidate
-            final_lasso = lasso
-            theta_stable_prev = True
-            if stop_now:
-                logger.info(
-                    "[INFO] stop at outer=%s: support repeated under stable theta; "
-                    "skip redundant REML refit.", outer,
-                )
-                outer_converged = True
-                outer_stop_reason = "support_theta_fixed_point"
-                break
-            if args.verbose:
-                logger.info(
-                    "[outer %s] fixed-point support repeated under stable theta; "
-                    "stable_rounds=%s/%s "
-                    "skip REML refit and continue.",
-                    outer, stable_rounds, int(args.support_stable_rounds),
-                )
-            continue
-
-        # ---- Step 5: REML re-fit with active SNPs as fixed effects ----
-        X_fixed = covar_np
-        active_fixed_local = np.empty((0,), dtype=np.int64)
-        if active_local.size > 0:
-            Z_active = Z_cand[:, active_local]
-            X_fixed, active_fixed_local = _merge_independent_fixed_effects(
-                X_fixed,
-                Z_active,
-            )
-            if active_fixed_local.size != active_local.size:
-                logger.info(
-                    "[outer %s] REML fixed effects retained %s/%s active SNP "
-                    "columns after removing numerical dependencies.",
-                    outer,
-                    int(active_fixed_local.size),
-                    int(active_local.size),
-                )
-
-        reml_res = fitter.fit_infinitesimal(
-            y_jax,
-            jnp.asarray(X_fixed, dtype=jnp.float32) if X_fixed is not None else None,
-            h2_init=_trace_weighted_h2(theta),
-            var_components_init=jnp.asarray(theta, dtype=jnp.float32),
-        )
         if args.verbose:
-            logger.info("[outer %s] reml_init_theta=%s", outer, theta.tolist())
-        theta_new = np.asarray(reml_res.var_components, dtype=np.float64)
-        has_reml_refit = True
+            logger.info(
+                "[outer %s] residual_ml_init_theta=%s stop=%s",
+                outer,
+                theta.tolist(),
+                lasso_ml_stop_reason,
+            )
 
         # ---- Convergence checks ----
         vc_rel = _max_rel_change(theta_new, theta)
-        theta_stable_now = bool(vc_rel < float(args.vc_rel_tol))
         if support_same and vc_rel < float(args.vc_rel_tol):
             stable_rounds += 1
         else:
@@ -1438,13 +1769,15 @@ def main() -> None:
             "pcg_all_res": float(np.asarray(res_all)),
             "theta": theta_new.tolist(),
             "support_size": int(support_new.size),
-            "active_fixed_effect_size": int(active_fixed_local.size),
             "support_same": support_same,
             "vc_rel": float(vc_rel),
             "lam": float(lasso["lam"]),
             "best_ebic": float(lasso["best_ebic"]),
             "kkt_certified": bool(certified_kkt),
             "kkt_trace": kkt_trace,
+            "verification": terminal_verification,
+            "variance_update": "intercept_contrast_residual_ml",
+            "variance_stop_reason": lasso_ml_stop_reason,
         })
 
         logger.info(
@@ -1462,179 +1795,617 @@ def main() -> None:
 
         theta = theta_new
         support = support_new
-        theta_stable_prev = theta_stable_now
         final_candidate = candidate
         final_lasso = lasso
 
-        if stable_rounds >= int(args.support_stable_rounds):
-            logger.info("[INFO] stop at outer=%s: support+variance stabilized.", outer)
+        stable_candidate = bool(
+            ml_updates_completed >= 2
+            and stable_rounds >= int(args.support_stable_rounds)
+        )
+        if terminal_verification and stable_candidate:
+            logger.info(
+                "[INFO] stop at outer=%s: terminal Lasso/KKT and residual-ML "
+                "verification passed at the returned covariance.",
+                outer,
+            )
             outer_converged = True
-            outer_stop_reason = "support_variance_stabilized"
+            outer_stop_reason = "terminal_verification_passed"
             break
+        if terminal_verification:
+            outer_stop_reason = "terminal_verification_failed"
+            logger.warning(
+                "[WARN] terminal verification changed support or variance "
+                "beyond tolerance at outer=%s; continuing if budget remains.",
+                outer,
+            )
+        elif stable_candidate:
+            verification_pending = True
+            logger.info(
+                "[INFO] outer=%s reached preliminary stability; scheduling "
+                "one complete Lasso/KKT plus residual-ML verification at the "
+                "returned covariance.",
+                outer,
+            )
+
+    # Freeze the penalized-ML branch before the downstream refit.  In
+    # particular, the selected-span REML result below is not fed back into the
+    # weighted Lasso or its residual-ML variance block.
+    theta_lasso_ml = np.asarray(theta, dtype=np.float64).copy()
+    lasso_ml_outer_converged = bool(outer_converged)
+    theta_lasso_to_lasso_ml_rel = _max_rel_change(
+        theta_lasso_ml, theta_lasso
+    )
+
+    # The terminal outer iteration solves the adaptive Lasso at the covariance
+    # entering that iteration and then updates the residual-ML covariance.
+    # Recompute the full-p KKT scores once at the returned covariance so the
+    # accepted pair is certified on the same finite-tolerance scale.
+    returned_covariance_kkt = {
+        "passed": False,
+        "tolerance": float("nan"),
+        "max_active_error": float("inf"),
+        "max_inactive_excess": float("inf"),
+    }
+    returned_covariance_kkt_error = None
+    if (
+        lasso_ml_outer_converged
+        and bool(args.kkt_check)
+        and final_lasso is not None
+    ):
+        try:
+            beta_snp_verify = np.asarray(
+                final_lasso["beta_snp"], dtype=np.float64
+            ).reshape(-1)
+            if beta_snp_verify.size != final_candidate.size:
+                raise RuntimeError(
+                    "Final Lasso coefficient/candidate sizes do not match."
+                )
+            z_verify = grm_index.extract_standardized_columns(
+                final_candidate
+            ).astype(np.float32, copy=False)
+            residual_verify = _lasso_residual(
+                y=y_np,
+                covar=covar_np,
+                geno=z_verify,
+                beta_cov=np.asarray(
+                    final_lasso.get("beta_cov", np.empty((0,))),
+                    dtype=np.float64,
+                ),
+                beta_snp=beta_snp_verify,
+            )
+            theta_g_verify = jnp.asarray(
+                theta_lasso_ml[:-1], dtype=jnp.float32
+            )
+            theta_e_verify = jnp.asarray(
+                theta_lasso_ml[-1], dtype=jnp.float32
+            )
+            hv_verify = fitter._make_hv(
+                ops, theta_g_verify, theta_e_verify
+            )
+            precond_verify = fitter._make_effect_precond(
+                ops, theta_g_verify, theta_e_verify
+            )
+            sol_verify, res_verify, it_verify = pcg_solve(
+                hv_verify,
+                jnp.asarray(residual_verify[:, None], dtype=jnp.float32),
+                M=precond_verify,
+                tol=args.pcg_tol,
+                maxiter=args.max_pcg_iters,
+            )
+            _require_pcg_converged(
+                res_verify,
+                tol=args.pcg_tol,
+                iters=it_verify,
+                maxiter=args.max_pcg_iters,
+                stage="returned-covariance full-p KKT verification",
+            )
+            score_verify = grm_index.xtv_all(
+                sol_verify[:, 0], normalize=False
+            )
+            beta_global_verify = np.zeros(
+                grm_index.m_total, dtype=np.float64
+            )
+            beta_global_verify[final_candidate] = beta_snp_verify
+            returned_covariance_kkt = _lasso_kkt_certificate_from_scores(
+                score=score_verify,
+                beta=beta_global_verify,
+                lam=float(final_lasso["lam"]),
+                abs_tol=float(args.kkt_tol),
+                rel_tol=float(args.kkt_rel_tol),
+            )
+        except (FloatingPointError, RuntimeError, ValueError) as error:
+            returned_covariance_kkt_error = str(error)
+
+    last_round_kkt_certified = bool(
+        history and history[-1].get("kkt_certified", False)
+    )
+    alpha_theta_fixed_point_coherent = bool(
+        lasso_ml_outer_converged
+        and bool(args.kkt_check)
+        and last_round_kkt_certified
+        and bool(returned_covariance_kkt["passed"])
+        and theta_lasso_to_lasso_ml_rel < float(args.vc_rel_tol)
+        and penalized_failure_reason is None
+    )
+
+    # ---- One selected-span REML refit -------------------------------------
+    Z_selected_for_reml = np.empty(
+        (n_samples, 0), dtype=np.float32
+    )
+    X_selected_span = covar_np
+    selected_span_basis_local = np.empty((0,), dtype=np.int64)
+    selected_span_reml_iterations = 0
+    selected_span_reml_stop_reason = ""
+    selected_span_refit_ok = False
+    selected_span_refit_error = None
+    theta_selected_span_reml = theta_lasso_ml.copy()
+    if alpha_theta_fixed_point_coherent:
+        try:
+            Z_selected_for_reml = (
+                grm_index.extract_standardized_columns(support)
+                .astype(np.float32, copy=False)
+            )
+            if support.size > 0:
+                X_selected_span, selected_span_basis_local = (
+                    _merge_independent_fixed_effects(
+                        X_selected_span,
+                        Z_selected_for_reml,
+                    )
+                )
+                if selected_span_basis_local.size != support.size:
+                    logger.info(
+                        "[refit] selected-span REML retained %s/%s active SNP "
+                        "columns after removing numerical dependencies.",
+                        int(selected_span_basis_local.size),
+                        int(support.size),
+                    )
+            selected_span_reml = fitter.fit_infinitesimal(
+                y_jax,
+                (
+                    jnp.asarray(X_selected_span, dtype=jnp.float32)
+                    if X_selected_span is not None
+                    else None
+                ),
+                h2_init=_trace_weighted_h2(theta_lasso_ml),
+                var_components_init=jnp.asarray(
+                    theta_lasso_ml, dtype=jnp.float32
+                ),
+            )
+            (
+                theta_selected_span_reml,
+                selected_span_reml_stop_reason,
+            ) = _accepted_reml_theta(
+                selected_span_reml,
+                expected_components=n_grm + 1,
+                stage="selected-span REML refit",
+            )
+            selected_span_reml_iterations = len(
+                selected_span_reml.history
+            )
+            selected_span_refit_ok = True
+        except (FloatingPointError, RuntimeError, ValueError) as error:
+            selected_span_refit_error = str(error)
+            logger.warning(
+                "[WARN] selected-span REML refit rejected; all guarded "
+                "estimators will use ordinary REML fallback: %s",
+                selected_span_refit_error,
+            )
+    else:
+        selected_span_refit_error = (
+            "skipped because the penalized-ML branch was not accepted"
+        )
 
     # ---- Output results ----
     out_dir = os.path.dirname(out_prefix)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
 
-    h2_background_reml = _trace_weighted_h2(theta)
-    # Compatibility alias.  Once sparse SNPs enter the REML fixed-effect
-    # design, this is background-only rather than total heritability.
-    h2_reml = h2_background_reml
-    h2_chive = h2_background_reml
-    h2_chive_at_lasso_theta = h2_background_reml
-    h2_chive_reml = h2_background_reml
-    h2_chive_post_gls = h2_background_reml
-    theta_final_sum = _trace_weighted_genetic_var(theta)
-    theta_e_final = float(theta[-1])
-    q_chive = 0.0
-    q_chive_standardized = 0.0
-    q_chive_reml = 0.0
-    q_chive_post_gls_standardized = 0.0
-    q_chive_term1 = 0.0
-    q_chive_term2 = 0.0
-    q_chive_term1_standardized = 0.0
-    q_chive_term2_standardized = 0.0
-    q_chive_reml_term1 = 0.0
-    q_chive_reml_term2 = 0.0
-    q_chive_post_gls_term1_standardized = 0.0
-    q_chive_post_gls_term2_standardized = 0.0
+    unavailable = float("nan")
+    theta_lasso_ml_sum = _trace_weighted_genetic_var(theta_lasso_ml)
+    theta_e_lasso_ml = float(theta_lasso_ml[-1])
+    theta_final_sum = (
+        _trace_weighted_genetic_var(theta_selected_span_reml)
+        if selected_span_refit_ok
+        else unavailable
+    )
+    theta_e_final = (
+        float(theta_selected_span_reml[-1])
+        if selected_span_refit_ok
+        else unavailable
+    )
+    q_chive = unavailable
+    q_chive_standardized = unavailable
+    q_chive_reml = unavailable
+    q_chive_post_gls_standardized = unavailable
+    q_chive_term1 = unavailable
+    q_chive_term2 = unavailable
+    q_chive_term1_standardized = unavailable
+    q_chive_term2_standardized = unavailable
+    q_chive_reml_term1 = unavailable
+    q_chive_reml_term2 = unavailable
+    q_chive_post_gls_term1_standardized = unavailable
+    q_chive_post_gls_term2_standardized = unavailable
+    q_ss_gls_plugin_raw = unavailable
+    q_ss_gls_plugin_standardized = unavailable
+    q_ss_gls_df_corrected_raw = unavailable
+    q_ss_gls_df_corrected_standardized = unavailable
+    ss_gls_df_correction_raw = unavailable
+    ss_gls_df_correction_standardized = unavailable
+    ss_gls_basis_size = 0
     beta_cov_lasso = np.empty((0,), dtype=np.float64)
     beta_cov_gls = np.empty((0,), dtype=np.float64)
     beta_gls_active = np.empty((0,), dtype=np.float64)
-
-    if final_lasso is not None and support.size > 0:
-        Z_support = grm_index.extract_standardized_columns(support).astype(np.float32, copy=False)
-        beta_snp_final = np.asarray(final_lasso["beta_snp"], dtype=np.float64)
-        beta_cov_lasso = np.asarray(final_lasso.get("beta_cov", np.empty((0,))), dtype=np.float64).reshape(-1)
-        cand_pos = {int(snp): i for i, snp in enumerate(final_candidate.tolist())}
-        beta_lasso_active = np.asarray(
-            [beta_snp_final[cand_pos[int(snp)]] for snp in support.tolist()],
-            dtype=np.float64,
-        )
-        y_chive = np.asarray(y_np, dtype=np.float64)
-        if covar_np is not None and covar_np.size > 0 and beta_cov_lasso.size > 0:
-            y_chive = y_chive - np.asarray(covar_np, dtype=np.float64) @ beta_cov_lasso
-        q_chive, q_chive_term1, q_chive_term2 = _chive_q_hat_given_active(
-            Z_support,
-            y_chive,
-            beta_lasso_active,
-        )
-        q_chive_standardized = _quadratic_variance_to_reml_scale(
-            q_chive, phenotype_scale
-        )
-        q_chive_term1_standardized = _quadratic_variance_to_reml_scale(
-            q_chive_term1, phenotype_scale
-        )
-        q_chive_term2_standardized = _quadratic_variance_to_reml_scale(
-            q_chive_term2, phenotype_scale
-        )
-        theta_g = jnp.asarray(theta[:-1], dtype=jnp.float32)
-        theta_e = jnp.asarray(theta[-1], dtype=jnp.float32)
-        hv_final = fitter._make_hv(ops, theta_g, theta_e)
-        precond_final = fitter._make_effect_precond(ops, theta_g, theta_e)
-
-        solve_parts = [y_np[:, None]]
-        n_covar = 0
-        if covar_np is not None:
-            solve_parts.append(covar_np)
-            n_covar = int(covar_np.shape[1])
-        solve_parts.append(Z_support)
-        B_final = np.concatenate(solve_parts, axis=1).astype(np.float32, copy=False)
-        sol_final, res_final, it_final = pcg_solve(
-            hv_final,
-            jnp.asarray(B_final, dtype=jnp.float32),
-            M=precond_final,
-            tol=args.pcg_tol,
-            maxiter=args.max_pcg_iters,
-        )
-        _require_pcg_converged(
-            res_final,
-            tol=args.pcg_tol,
-            iters=it_final,
-            maxiter=args.max_pcg_iters,
-            stage="final post-selection GLS",
-        )
-        sol_final_np = np.asarray(sol_final, dtype=np.float64)
-        Hinv_y_final = sol_final_np[:, 0]
-        Hinv_covar_final = None
-        if n_covar > 0:
-            Hinv_covar_final = sol_final_np[:, 1 : 1 + n_covar]
-        Hinv_Z_support = sol_final_np[:, 1 + n_covar :]
-
-        beta_cov_gls, beta_gls_active = _gls_refit_on_support(
-            y=y_np,
-            covar=covar_np,
-            z_active=Z_support,
-            Hinv_y=Hinv_y_final,
-            Hinv_covar=Hinv_covar_final,
-            Hinv_z_active=Hinv_Z_support,
-            ridge=args.proj_ridge,
-        )
-        y_chive_reml = np.asarray(y_np, dtype=np.float64)
-        if covar_np is not None and covar_np.size > 0 and beta_cov_gls.size > 0:
-            y_chive_reml = y_chive_reml - np.asarray(covar_np, dtype=np.float64) @ beta_cov_gls
-        q_chive_reml, q_chive_reml_term1, q_chive_reml_term2 = _chive_q_hat_given_active(
-            Z_support,
-            y_chive_reml,
-            beta_gls_active,
-        )
-        q_chive_post_gls_standardized = _quadratic_variance_to_reml_scale(
-            q_chive_reml, phenotype_scale
-        )
-        q_chive_post_gls_term1_standardized = _quadratic_variance_to_reml_scale(
-            q_chive_reml_term1, phenotype_scale
-        )
-        q_chive_post_gls_term2_standardized = _quadratic_variance_to_reml_scale(
-            q_chive_reml_term2, phenotype_scale
-        )
-        h2_chive_post_gls = _sparse_dense_h2(
-            q_chive_post_gls_standardized,
-            theta_final_sum,
-            theta_e_final,
-        )
-        # Compatibility alias for historical result readers.
-        h2_chive_reml = h2_chive_post_gls
-
-    # The primary penalized estimate is combined with the final REML variance
-    # components.  At a genuine outer fixed point this equals the value using
-    # theta_lasso; keeping both fields makes max-iteration exits auditable.
-    h2_chive_at_lasso_theta = _sparse_dense_h2(
-        q_chive_standardized,
-        _trace_weighted_genetic_var(theta_lasso),
-        float(theta_lasso[-1]),
+    beta_lasso_active = np.empty((0,), dtype=np.float64)
+    selected_span_basis_positions = np.empty((0,), dtype=np.int64)
+    lasso_quadratics_available = bool(
+        final_lasso is not None and penalized_failure_reason is None
     )
-    h2_chive = _sparse_dense_h2(
-        q_chive_standardized,
+    Z_support = np.empty((n_samples, 0), dtype=np.float32)
+
+    if final_lasso is not None:
+        beta_snp_final = np.asarray(final_lasso["beta_snp"], dtype=np.float64)
+        beta_cov_lasso = np.asarray(
+            final_lasso.get("beta_cov", np.empty((0,))),
+            dtype=np.float64,
+        ).reshape(-1)
+        try:
+            final_active_local = np.asarray(
+                final_lasso["active_idx"], dtype=np.int64
+            ).reshape(-1)
+            final_active_support = np.sort(
+                final_candidate[final_active_local]
+            )
+            if not np.array_equal(final_active_support, support):
+                lasso_quadratics_available = False
+                if penalized_failure_reason is None:
+                    penalized_failure_reason = (
+                        "Final Lasso active set does not match the exported "
+                        "support."
+                    )
+                alpha_theta_fixed_point_coherent = False
+                selected_span_refit_ok = False
+                selected_span_refit_error = (
+                    "invalidated because the final Lasso active set does not "
+                    "match the exported support"
+                )
+        except (IndexError, KeyError) as error:
+            lasso_quadratics_available = False
+            if penalized_failure_reason is None:
+                penalized_failure_reason = (
+                    "Final Lasso active-set validation failed: "
+                    f"{error}"
+                )
+            alpha_theta_fixed_point_coherent = False
+            selected_span_refit_ok = False
+            selected_span_refit_error = (
+                "invalidated by final Lasso active-set validation failure"
+            )
+        if support.size > 0:
+            Z_support = (
+                grm_index.extract_standardized_columns(support)
+                .astype(np.float32, copy=False)
+            )
+            cand_pos = {
+                int(snp): i for i, snp in enumerate(final_candidate.tolist())
+            }
+            try:
+                beta_lasso_active = np.asarray(
+                    [
+                        beta_snp_final[cand_pos[int(snp)]]
+                        for snp in support.tolist()
+                    ],
+                    dtype=np.float64,
+                )
+            except (IndexError, KeyError) as error:
+                lasso_quadratics_available = False
+                alpha_theta_fixed_point_coherent = False
+                penalized_failure_reason = (
+                    "Final Lasso support/coefficient mapping failed: "
+                    f"{error}"
+                )
+
+        if lasso_quadratics_available:
+            y_chive = np.asarray(y_np, dtype=np.float64)
+            if (
+                covar_np is not None
+                and covar_np.size > 0
+                and beta_cov_lasso.size > 0
+            ):
+                y_chive -= (
+                    np.asarray(covar_np, dtype=np.float64)
+                    @ beta_cov_lasso
+                )
+            q_chive, q_chive_term1, q_chive_term2 = (
+                _chive_q_hat_given_active(
+                    Z_support,
+                    y_chive,
+                    beta_lasso_active,
+                )
+            )
+            q_chive_standardized = _quadratic_variance_to_reml_scale(
+                q_chive, phenotype_scale
+            )
+            q_chive_term1_standardized = (
+                _quadratic_variance_to_reml_scale(
+                    q_chive_term1, phenotype_scale
+                )
+            )
+            q_chive_term2_standardized = (
+                _quadratic_variance_to_reml_scale(
+                    q_chive_term2, phenotype_scale
+                )
+            )
+
+    # Estimators 3 and 4, the post-GLS diagnostic, and exported refit
+    # coefficients all use this one selected-span REML--GLS solution.  The
+    # independent basis is mapped back to the selected support with zero
+    # coefficients for numerically dependent marker columns.
+    if selected_span_refit_ok:
+        q_ss_gls_plugin_raw = 0.0
+        q_ss_gls_plugin_standardized = 0.0
+        q_ss_gls_df_corrected_raw = 0.0
+        q_ss_gls_df_corrected_standardized = 0.0
+        ss_gls_df_correction_raw = 0.0
+        ss_gls_df_correction_standardized = 0.0
+        q_chive_reml = 0.0
+        q_chive_reml_term1 = 0.0
+        q_chive_reml_term2 = 0.0
+        q_chive_post_gls_standardized = 0.0
+        q_chive_post_gls_term1_standardized = 0.0
+        q_chive_post_gls_term2_standardized = 0.0
+        beta_gls_active = np.zeros(support.size, dtype=np.float64)
+
+    if selected_span_refit_ok and support.size > 0:
+        try:
+            theta_g = jnp.asarray(
+                theta_selected_span_reml[:-1], dtype=jnp.float32
+            )
+            theta_e = jnp.asarray(
+                theta_selected_span_reml[-1], dtype=jnp.float32
+            )
+            hv_final = fitter._make_hv(ops, theta_g, theta_e)
+            precond_final = fitter._make_effect_precond(
+                ops, theta_g, theta_e
+            )
+
+            solve_parts = [y_np[:, None]]
+            n_covar = 0
+            if covar_np is not None:
+                solve_parts.append(covar_np)
+                n_covar = int(covar_np.shape[1])
+            solve_parts.append(Z_support)
+            B_final = np.concatenate(
+                solve_parts, axis=1
+            ).astype(np.float32, copy=False)
+            sol_final, res_final, it_final = pcg_solve(
+                hv_final,
+                jnp.asarray(B_final, dtype=jnp.float32),
+                M=precond_final,
+                tol=args.pcg_tol,
+                maxiter=args.max_pcg_iters,
+            )
+            _require_pcg_converged(
+                res_final,
+                tol=args.pcg_tol,
+                iters=it_final,
+                maxiter=args.max_pcg_iters,
+                stage="final selected-span REML--GLS",
+            )
+            sol_final_np = np.asarray(sol_final, dtype=np.float64)
+            Hinv_y_final = sol_final_np[:, 0]
+            Hinv_covar_final = None
+            if n_covar > 0:
+                Hinv_covar_final = sol_final_np[:, 1 : 1 + n_covar]
+            Hinv_Z_support = sol_final_np[:, 1 + n_covar :]
+
+            ss_gls = _selected_span_gls_quadratics(
+                y=y_np,
+                covar=covar_np,
+                z_active=Z_support,
+                Hinv_y=Hinv_y_final,
+                Hinv_covar=Hinv_covar_final,
+                Hinv_z_active=Hinv_Z_support,
+                phenotype_scale=phenotype_scale,
+            )
+            selected_span_basis_positions = np.asarray(
+                ss_gls["active_basis_idx"], dtype=np.int64
+            )
+            if not np.array_equal(
+                selected_span_basis_positions,
+                selected_span_basis_local,
+            ):
+                raise RuntimeError(
+                    "Selected-span REML and GLS retained different marker "
+                    "bases."
+                )
+            q_ss_gls_plugin_raw = float(ss_gls["q_plugin_raw"])
+            q_ss_gls_plugin_standardized = float(
+                ss_gls["q_plugin_standardized"]
+            )
+            q_ss_gls_df_corrected_raw = float(
+                ss_gls["q_df_corrected_raw"]
+            )
+            q_ss_gls_df_corrected_standardized = float(
+                ss_gls["q_df_corrected_standardized"]
+            )
+            ss_gls_df_correction_raw = float(
+                ss_gls["df_correction_raw"]
+            )
+            ss_gls_df_correction_standardized = float(
+                ss_gls["df_correction_standardized"]
+            )
+            ss_gls_basis_size = int(
+                selected_span_basis_positions.size
+            )
+
+            beta_cov_gls = np.asarray(
+                ss_gls["beta_cov"], dtype=np.float64
+            ).reshape(-1)
+            beta_gls_active = _expand_selected_basis_coefficients(
+                support_size=int(support.size),
+                basis_positions=selected_span_basis_positions,
+                basis_coefficients=np.asarray(
+                    ss_gls["beta_active_basis"], dtype=np.float64
+                ),
+            )
+            y_chive_reml = np.asarray(y_np, dtype=np.float64)
+            if (
+                covar_np is not None
+                and covar_np.size > 0
+                and beta_cov_gls.size > 0
+            ):
+                y_chive_reml -= (
+                    np.asarray(covar_np, dtype=np.float64)
+                    @ beta_cov_gls
+                )
+            (
+                q_chive_reml,
+                q_chive_reml_term1,
+                q_chive_reml_term2,
+            ) = _chive_q_hat_given_active(
+                Z_support,
+                y_chive_reml,
+                beta_gls_active,
+            )
+            q_chive_post_gls_standardized = (
+                _quadratic_variance_to_reml_scale(
+                    q_chive_reml, phenotype_scale
+                )
+            )
+            q_chive_post_gls_term1_standardized = (
+                _quadratic_variance_to_reml_scale(
+                    q_chive_reml_term1, phenotype_scale
+                )
+            )
+            q_chive_post_gls_term2_standardized = (
+                _quadratic_variance_to_reml_scale(
+                    q_chive_reml_term2, phenotype_scale
+                )
+            )
+        except (FloatingPointError, RuntimeError, ValueError) as error:
+            selected_span_refit_ok = False
+            selected_span_refit_error = (
+                "Selected-span coefficient recovery failed: "
+                f"{error}"
+            )
+            logger.warning(
+                "[WARN] %s; all guarded estimators will use ordinary "
+                "REML fallback.",
+                selected_span_refit_error,
+            )
+            theta_final_sum = unavailable
+            theta_e_final = unavailable
+            q_ss_gls_plugin_raw = unavailable
+            q_ss_gls_plugin_standardized = unavailable
+            q_ss_gls_df_corrected_raw = unavailable
+            q_ss_gls_df_corrected_standardized = unavailable
+            ss_gls_df_correction_raw = unavailable
+            ss_gls_df_correction_standardized = unavailable
+            q_chive_reml = unavailable
+            q_chive_reml_term1 = unavailable
+            q_chive_reml_term2 = unavailable
+            q_chive_post_gls_standardized = unavailable
+            q_chive_post_gls_term1_standardized = unavailable
+            q_chive_post_gls_term2_standardized = unavailable
+            beta_cov_gls = np.empty((0,), dtype=np.float64)
+            beta_gls_active = np.empty((0,), dtype=np.float64)
+            selected_span_basis_positions = np.empty(
+                (0,), dtype=np.int64
+            )
+            ss_gls_basis_size = 0
+
+    # The two Lasso-row estimators use the residual-ML covariance from the
+    # penalized branch.  The two selected-span estimators above use the
+    # independent REML refit covariance.  ``theta_lasso`` is retained only as
+    # the covariance input to the last KKT-certified sparse solve.
+    h2_chive_at_lasso_theta = (
+        _sparse_dense_h2(
+            q_chive_standardized,
+            _trace_weighted_genetic_var(theta_lasso),
+            float(theta_lasso[-1]),
+        )
+        if lasso_quadratics_available
+        else unavailable
+    )
+    four_h2 = _four_estimator_h2_from_branches(
+        q_lasso_plugin_standardized=q_chive_term1_standardized,
+        q_lasso_calibrated_standardized=q_chive_standardized,
+        q_selected_span_plugin_standardized=q_ss_gls_plugin_standardized,
+        q_selected_span_trace_standardized=(
+            q_ss_gls_df_corrected_standardized
+        ),
+        lasso_ml_background_variance=theta_lasso_ml_sum,
+        lasso_ml_residual_variance=theta_e_lasso_ml,
+        selected_span_reml_background_variance=theta_final_sum,
+        selected_span_reml_residual_variance=theta_e_final,
+    )
+    h2_lasso_plugin = four_h2["h2_lasso_plugin"]
+    h2_chive = four_h2["h2_chive"]
+    h2_ss_gls_plugin = four_h2["h2_ss_gls_plugin"]
+    h2_ss_gls_df_corrected = four_h2["h2_ss_gls_df_corrected"]
+    h2_chive_post_gls = _sparse_dense_h2(
+        q_chive_post_gls_standardized,
         theta_final_sum,
         theta_e_final,
     )
-    theta_lasso_to_final_rel = _max_rel_change(theta, theta_lasso)
-    alpha_theta_fixed_point_coherent = bool(
-        outer_converged
-        and theta_lasso_to_final_rel < float(args.vc_rel_tol)
+    # Compatibility alias for historical result readers.
+    h2_chive_reml = h2_chive_post_gls
+
+    four_estimator_values = np.asarray(
+        [
+            h2_lasso_plugin,
+            h2_chive,
+            h2_ss_gls_plugin,
+            h2_ss_gls_df_corrected,
+        ],
+        dtype=np.float64,
     )
-    theta_primary = theta.copy()
+    (
+        guarded_sparse_fit_accepted,
+        sparse_outputs_finite,
+        sparse_fit_rejection_reasons,
+    ) = _common_sparse_estimator_guard(
+        alpha_theta_pair_certified=(
+            alpha_theta_fixed_point_coherent
+        ),
+        lasso_quadratics_available=lasso_quadratics_available,
+        selected_span_refit_ok=selected_span_refit_ok,
+        estimator_values=four_estimator_values,
+    )
+
+    theta_primary = theta_lasso_ml.copy()
     h2_covariates_only_reml_fallback = None
     primary_fallback_reml_iterations = 0
-    if not alpha_theta_fixed_point_coherent:
+    primary_fallback_reml_stop_reason = None
+    if not guarded_sparse_fit_accepted:
         logger.warning(
-            "[WARN] sparse outer loop did not finish at a matched alpha/theta fixed point: "
-            "stop=%s theta_lasso_to_final_rel=%.3e vc_rel_tol=%.3e. "
-            "The hybrid estimate is diagnostic only. Running a covariates-only REML "
-            "fallback for the primary h2; increase --outer-max or revise the sparse "
-            "model before publication analyses.",
+            "[WARN] common sparse-estimator guard rejected the fit: "
+            "reasons=%s stop=%s theta_lasso_to_lasso_ml_rel=%.3e "
+            "vc_rel_tol=%.3e. Running a covariates-only REML fallback.",
+            ",".join(sparse_fit_rejection_reasons),
             outer_stop_reason,
-            theta_lasso_to_final_rel,
+            theta_lasso_to_lasso_ml_rel,
             float(args.vc_rel_tol),
+        )
+        fallback_init = (
+            theta_selected_span_reml
+            if selected_span_refit_ok
+            else theta_lasso_ml
         )
         fallback_res = fitter.fit_infinitesimal(
             y_jax,
             jnp.asarray(covar_np, dtype=jnp.float32) if covar_np is not None else None,
-            h2_init=_trace_weighted_h2(theta),
-            var_components_init=jnp.asarray(theta, dtype=jnp.float32),
+            h2_init=_trace_weighted_h2(fallback_init),
+            var_components_init=jnp.asarray(fallback_init, dtype=jnp.float32),
         )
-        theta_primary = np.asarray(fallback_res.var_components, dtype=np.float64)
+        (
+            theta_primary,
+            primary_fallback_reml_stop_reason,
+        ) = _accepted_reml_theta(
+            fallback_res,
+            expected_components=n_grm + 1,
+            stage="covariates-only REML fallback",
+        )
         h2_covariates_only_reml_fallback = _trace_weighted_h2(theta_primary)
         primary_fallback_reml_iterations = len(fallback_res.history)
 
@@ -1647,17 +2418,69 @@ def main() -> None:
             (
                 h2_covariates_only_reml_fallback
                 if h2_covariates_only_reml_fallback is not None
-                else h2_background_reml
+                else _trace_weighted_h2(theta_selected_span_reml)
             ),
-            alpha_theta_fixed_point_coherent=alpha_theta_fixed_point_coherent,
+            alpha_theta_fixed_point_coherent=guarded_sparse_fit_accepted,
         )
     )
+    if primary_fallback:
+        primary_fallback_reason = "common_sparse_estimator_guard_rejected"
     primary_h2_method = (
         "covariates_only_reml_fallback"
         if primary_fallback
-        else "penalized_lasso_chive"
+        else "penalized_ml_lasso_chive"
+    )
+    h2_lasso_plugin_guarded = (
+        float(h2_covariates_only_reml_fallback)
+        if primary_fallback and h2_covariates_only_reml_fallback is not None
+        else float(h2_lasso_plugin)
+    )
+    h2_chive_guarded = float(h2)
+    h2_ss_gls_plugin_guarded = (
+        float(h2_covariates_only_reml_fallback)
+        if primary_fallback and h2_covariates_only_reml_fallback is not None
+        else float(h2_ss_gls_plugin)
+    )
+    h2_ss_gls_df_guarded = (
+        float(h2_covariates_only_reml_fallback)
+        if primary_fallback and h2_covariates_only_reml_fallback is not None
+        else float(h2_ss_gls_df_corrected)
+    )
+
+    # The legacy ``var_components`` field remains the selected-span REML
+    # covariance on accepted sparse fits.  If the common guard fails, it
+    # switches with all guarded estimators to the validated ordinary-REML
+    # fallback rather than exposing a placeholder as a fitted refit.
+    theta = (
+        theta_selected_span_reml.copy()
+        if guarded_sparse_fit_accepted
+        else theta_primary.copy()
+    )
+    var_components_compatibility_branch = (
+        "selected_span_reml"
+        if guarded_sparse_fit_accepted
+        else "covariates_only_reml_fallback"
+    )
+    h2_background_reml = _trace_weighted_h2(theta)
+    # Compatibility alias.  Once sparse SNPs enter the accepted fixed-effect
+    # design, this is background-only rather than total heritability.
+    h2_reml = h2_background_reml
+    h2_background_selected_span_reml = (
+        _trace_weighted_h2(theta_selected_span_reml)
+        if selected_span_refit_ok
+        else unavailable
+    )
+
+    print(f"[RESULT] var_components_lasso_ml={theta_lasso_ml.tolist()}")
+    print(
+        "[RESULT] var_components_selected_span_reml="
+        f"{theta_selected_span_reml.tolist() if selected_span_refit_ok else None}"
     )
     print(f"[RESULT] var_components={theta.tolist()}")
+    print(
+        "[RESULT] var_components_compatibility="
+        f"{var_components_compatibility_branch}"
+    )
     print(f"[RESULT] var_components_primary={theta_primary.tolist()}")
     print(f"[RESULT] h2={h2:.6f} (primary={primary_h2_method})")
     if primary_fallback:
@@ -1666,17 +2489,58 @@ def main() -> None:
             "(diagnostic only)"
         )
     print(f"[RESULT] h2_background_reml={h2_background_reml:.6f}")
+    print(
+        f"[RESULT] h2_lasso_plugin={h2_lasso_plugin:.6f} "
+        "(uncorrected penalized-LASSO plug-in)"
+    )
     print(f"[RESULT] h2_chive={h2_chive:.6f} (penalized LASSO calibration)")
     print(
         f"[RESULT] h2_chive_post_gls={h2_chive_post_gls:.6f} "
         "(diagnostic only)"
+    )
+    print(
+        f"[RESULT] h2_ss_gls_plugin={h2_ss_gls_plugin:.6f} "
+        "(selected-span GLS plug-in)"
+    )
+    print(
+        f"[RESULT] h2_ss_gls_df_corrected={h2_ss_gls_df_corrected:.6f} "
+        "(trace-corrected selected-span GLS)"
     )
     # Historical stdout labels retained for downstream parsers.
     print(f"[RESULT] h2_reml={h2_reml:.6f}")
     print(f"[RESULT] h2_chive_reml={h2_chive_reml:.6f}")
     print(f"[RESULT] support_size={int(support.size)}")
 
+    theta_lasso_to_selected_span_rel = (
+        _max_rel_change(theta_selected_span_reml, theta_lasso)
+        if selected_span_refit_ok
+        else None
+    )
+    theta_lasso_ml_to_selected_span_rel = (
+        _max_rel_change(theta_selected_span_reml, theta_lasso_ml)
+        if selected_span_refit_ok
+        else None
+    )
+    selected_span_basis_support_indices = (
+        support[selected_span_basis_positions].tolist()
+        if selected_span_refit_ok
+        else []
+    )
+    returned_covariance_kkt_summary = {
+        "passed": bool(returned_covariance_kkt["passed"]),
+        "tolerance": _finite_float_or_none(
+            float(returned_covariance_kkt["tolerance"])
+        ),
+        "max_active_error": _finite_float_or_none(
+            float(returned_covariance_kkt["max_active_error"])
+        ),
+        "max_inactive_excess": _finite_float_or_none(
+            float(returned_covariance_kkt["max_inactive_excess"])
+        ),
+    }
+
     summary = {
+        "sparse_output_schema_version": 2,
         "finished_at": datetime.now().isoformat(timespec="seconds"),
         "elapsed_sec": float(time.time() - t0),
         "n_samples": int(y_np.shape[0]),
@@ -1696,6 +2560,21 @@ def main() -> None:
             "snp_id" if component_variant_indices else "input_prefix"
         ),
         "var_components": theta.tolist(),
+        "var_components_compatibility_branch": (
+            var_components_compatibility_branch
+        ),
+        "var_components_lasso_ml": theta_lasso_ml.tolist(),
+        "var_components_selected_span_reml": (
+            theta_selected_span_reml.tolist()
+            if selected_span_refit_ok
+            else None
+        ),
+        "variance_component_branch_mapping": {
+            "h2_lasso_plugin": "var_components_lasso_ml",
+            "h2_chive": "var_components_lasso_ml",
+            "h2_ss_gls_plugin": "var_components_selected_span_reml",
+            "h2_ss_gls_df_corrected": "var_components_selected_span_reml",
+        },
         "var_components_primary": theta_primary.tolist(),
         "var_components_covariates_only_reml_fallback": (
             theta_primary.tolist() if primary_fallback else None
@@ -1708,54 +2587,153 @@ def main() -> None:
         "primary_fallback": primary_fallback,
         "primary_fallback_reason": primary_fallback_reason,
         "primary_fallback_reml_iterations": primary_fallback_reml_iterations,
-        "outer_converged": outer_converged,
+        "primary_fallback_reml_stop_reason": (
+            primary_fallback_reml_stop_reason
+        ),
+        "guarded_sparse_fit_accepted": guarded_sparse_fit_accepted,
+        "sparse_outputs_finite": sparse_outputs_finite,
+        "sparse_fit_rejection_reasons": sparse_fit_rejection_reasons,
+        "outer_converged": lasso_ml_outer_converged,
+        "lasso_ml_outer_converged": lasso_ml_outer_converged,
         "outer_stop_reason": outer_stop_reason,
+        "penalized_failure_reason": penalized_failure_reason,
+        "lasso_variance_update": "intercept_contrast_residual_ml",
+        "lasso_variance_contrast": "orthogonal_to_intercept",
+        "lasso_variance_analysis_dimension": int(y_np.shape[0] - 1),
+        "selected_span_reml_iterations": selected_span_reml_iterations,
+        "selected_span_reml_stop_reason": (
+            selected_span_reml_stop_reason or None
+        ),
+        "selected_span_refit_ok": selected_span_refit_ok,
+        "selected_span_refit_error": selected_span_refit_error,
+        "selected_span_basis_size": ss_gls_basis_size,
+        "selected_span_basis_support_positions": (
+            selected_span_basis_positions.tolist()
+        ),
+        "selected_span_basis_support_indices": (
+            selected_span_basis_support_indices
+        ),
         "alpha_theta_fixed_point_coherent": alpha_theta_fixed_point_coherent,
-        "theta_lasso_to_final_rel_change": theta_lasso_to_final_rel,
+        "returned_covariance_kkt": returned_covariance_kkt_summary,
+        "returned_covariance_kkt_error": returned_covariance_kkt_error,
+        "theta_lasso_to_lasso_ml_rel_change": (
+            theta_lasso_to_lasso_ml_rel
+        ),
+        # Deprecated compatibility key: preserve its historical comparison
+        # between the covariance entering the last Lasso and the final
+        # selected-span REML covariance.
+        "theta_lasso_to_final_rel_change": (
+            theta_lasso_to_selected_span_rel
+        ),
+        "theta_lasso_ml_to_selected_span_reml_rel_change": (
+            theta_lasso_ml_to_selected_span_rel
+        ),
+        "h2_background_lasso_ml": _trace_weighted_h2(theta_lasso_ml),
+        "h2_background_selected_span_reml": _finite_float_or_none(
+            h2_background_selected_span_reml
+        ),
         "h2_background_reml": h2_background_reml,
         "h2_reml_background_only": h2_background_reml,
         "h2_reml": h2_reml,
-        "h2_chive": h2_chive,
-        "h2_chive_penalized_lasso": h2_chive,
-        "h2_chive_at_lasso_theta": h2_chive_at_lasso_theta,
-        "h2_chive_reml": h2_chive_reml,
-        "h2_chive_post_gls": h2_chive_post_gls,
+        "h2_lasso_plugin": _finite_float_or_none(h2_lasso_plugin),
+        "h2_lasso_plugin_guarded": h2_lasso_plugin_guarded,
+        "h2_lasso_plugin_role": "uncorrected_lasso_ml_diagnostic",
+        "h2_chive": _finite_float_or_none(h2_chive),
+        "h2_chive_guarded": h2_chive_guarded,
+        "h2_chive_penalized_lasso": _finite_float_or_none(h2_chive),
+        "h2_chive_at_lasso_theta": _finite_float_or_none(
+            h2_chive_at_lasso_theta
+        ),
+        "h2_chive_reml": _finite_float_or_none(h2_chive_reml),
+        "h2_chive_post_gls": _finite_float_or_none(h2_chive_post_gls),
         "h2_chive_post_gls_role": "diagnostic_only",
-        "h2_sparse_dense_hybrid": h2_sparse_dense_hybrid,
+        "h2_ss_gls_plugin": _finite_float_or_none(h2_ss_gls_plugin),
+        "h2_ss_gls_plugin_guarded": h2_ss_gls_plugin_guarded,
+        "h2_ss_gls_df_corrected": _finite_float_or_none(
+            h2_ss_gls_df_corrected
+        ),
+        "h2_ss_gls_df_guarded": h2_ss_gls_df_guarded,
+        "h2_ss_gls_role": "selected_span_reml_secondary_estimator",
+        "h2_sparse_dense_hybrid": _finite_float_or_none(
+            h2_sparse_dense_hybrid
+        ),
         "h2_sparse_dense_unconverged": (
-            h2_sparse_dense_hybrid if primary_fallback else None
+            _finite_float_or_none(h2_sparse_dense_hybrid)
+            if primary_fallback
+            else None
         ),
         "h2_covariates_only_reml_fallback": h2_covariates_only_reml_fallback,
         "h2": h2,
         # Compatibility fields q_chive/q_chive_reml retain their historical
         # raw-phenotype units.  Explicit fields below provide both scales.
-        "q_chive": q_chive,
-        "q_chive_reml": q_chive_reml,
-        "q_chive_raw": q_chive,
-        "q_chive_standardized": q_chive_standardized,
-        "q_chive_post_gls_raw": q_chive_reml,
-        "q_chive_post_gls_standardized": q_chive_post_gls_standardized,
-        "q_chive_reml_standardized": q_chive_post_gls_standardized,
+        "q_chive": _finite_float_or_none(q_chive),
+        "q_chive_reml": _finite_float_or_none(q_chive_reml),
+        "q_lasso_plugin_raw": _finite_float_or_none(q_chive_term1),
+        "q_lasso_plugin_standardized": _finite_float_or_none(
+            q_chive_term1_standardized
+        ),
+        "q_chive_raw": _finite_float_or_none(q_chive),
+        "q_chive_standardized": _finite_float_or_none(
+            q_chive_standardized
+        ),
+        "q_chive_post_gls_raw": _finite_float_or_none(q_chive_reml),
+        "q_chive_post_gls_standardized": _finite_float_or_none(
+            q_chive_post_gls_standardized
+        ),
+        "q_chive_reml_standardized": _finite_float_or_none(
+            q_chive_post_gls_standardized
+        ),
         "q_chive_components": {
-            "term1_g2_over_n": q_chive_term1,
-            "term2_cross": q_chive_term2,
+            "term1_g2_over_n": _finite_float_or_none(q_chive_term1),
+            "term2_cross": _finite_float_or_none(q_chive_term2),
             "scale": "raw_phenotype_variance",
         },
         "q_chive_components_standardized": {
-            "term1_g2_over_n": q_chive_term1_standardized,
-            "term2_cross": q_chive_term2_standardized,
+            "term1_g2_over_n": _finite_float_or_none(
+                q_chive_term1_standardized
+            ),
+            "term2_cross": _finite_float_or_none(
+                q_chive_term2_standardized
+            ),
             "scale": "standardized_phenotype_variance",
         },
         "q_chive_reml_components": {
-            "term1_g2_over_n": q_chive_reml_term1,
-            "term2_cross": q_chive_reml_term2,
+            "term1_g2_over_n": _finite_float_or_none(
+                q_chive_reml_term1
+            ),
+            "term2_cross": _finite_float_or_none(
+                q_chive_reml_term2
+            ),
             "scale": "raw_phenotype_variance",
         },
         "q_chive_post_gls_components_standardized": {
-            "term1_g2_over_n": q_chive_post_gls_term1_standardized,
-            "term2_cross": q_chive_post_gls_term2_standardized,
+            "term1_g2_over_n": _finite_float_or_none(
+                q_chive_post_gls_term1_standardized
+            ),
+            "term2_cross": _finite_float_or_none(
+                q_chive_post_gls_term2_standardized
+            ),
             "scale": "standardized_phenotype_variance",
         },
+        "q_ss_gls_plugin_raw": _finite_float_or_none(
+            q_ss_gls_plugin_raw
+        ),
+        "q_ss_gls_plugin_standardized": _finite_float_or_none(
+            q_ss_gls_plugin_standardized
+        ),
+        "q_ss_gls_df_corrected_raw": _finite_float_or_none(
+            q_ss_gls_df_corrected_raw
+        ),
+        "q_ss_gls_df_corrected_standardized": _finite_float_or_none(
+            q_ss_gls_df_corrected_standardized
+        ),
+        "ss_gls_df_correction_raw": _finite_float_or_none(
+            ss_gls_df_correction_raw
+        ),
+        "ss_gls_df_correction_standardized": _finite_float_or_none(
+            ss_gls_df_correction_standardized
+        ),
+        "ss_gls_basis_size": ss_gls_basis_size,
         "support_size": int(support.size),
         "support_indices": support.tolist(),
         "support_source_indices": grm_index.source_variant_indices(support).tolist(),
@@ -1769,13 +2747,26 @@ def main() -> None:
         "kkt_certified": bool(
             args.kkt_check and history and bool(history[-1].get("kkt_certified", False))
         ),
+        "returned_covariance_kkt_certified": bool(
+            returned_covariance_kkt["passed"]
+        ),
         "outer_history": history,
     }
 
     with open(out_prefix + ".summary.json", "w") as f:
-        json.dump(summary, f, indent=2)
+        json.dump(
+            _json_safe_value(summary),
+            f,
+            indent=2,
+            allow_nan=False,
+        )
     with open(out_prefix + ".history.json", "w") as f:
-        json.dump(history, f, indent=2)
+        json.dump(
+            _json_safe_value(history),
+            f,
+            indent=2,
+            allow_nan=False,
+        )
 
     beta_map: dict[int, float] = {}
     beta_reml_map: dict[int, float] = {}
@@ -1812,8 +2803,15 @@ def main() -> None:
             for pos in _positions:
                 _snp_grm_map[int(support[pos])] = g
 
+    selected_span_basis_set = set(
+        int(v) for v in selected_span_basis_support_indices
+    )
     with open(out_prefix + ".selected_snps.tsv", "w") as f:
-        f.write("snp_index\tsource_snp_index\tgrm\tchr\tsnp_id\tcm\tbp\ta1\ta2\tbeta_lasso\tbeta_gls_reml\n")
+        f.write(
+            "snp_index\tsource_snp_index\tgrm\tchr\tsnp_id\tcm\tbp"
+            "\ta1\ta2\tbeta_lasso\tbeta_gls_reml"
+            "\tselected_span_basis\n"
+        )
         for snp_idx in support.tolist():
             chr_, snp_id, cm, bp, a1, a2 = bim_rows.get(
                 int(snp_idx),
@@ -1822,10 +2820,15 @@ def main() -> None:
             grm_id = _snp_grm_map.get(int(snp_idx), -1)
             source_snp_idx = source_index_map.get(int(snp_idx), int(snp_idx))
             beta_val = beta_map.get(int(snp_idx), 0.0)
-            beta_reml = beta_reml_map.get(int(snp_idx), 0.0)
+            beta_reml = (
+                beta_reml_map.get(int(snp_idx), 0.0)
+                if selected_span_refit_ok
+                else float("nan")
+            )
+            basis_member = int(int(snp_idx) in selected_span_basis_set)
             f.write(
                 f"{int(snp_idx)}\t{source_snp_idx}\t{grm_id}\t{chr_}\t{snp_id}\t{cm}\t{bp}\t{a1}\t{a2}\t"
-                f"{beta_val:.8e}\t{beta_reml:.8e}\n"
+                f"{beta_val:.8e}\t{beta_reml:.8e}\t{basis_member}\n"
             )
 
     logger.info("[INFO] done @ %s elapsed=%.1fs", datetime.now().isoformat(timespec='seconds'), time.time() - t0)

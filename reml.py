@@ -1289,19 +1289,18 @@ def fit_reml(
     verbose: bool = True,
     log_detail: str = "full",
     return_diagnostics: bool = False,
+    standardize_y: bool = True,
 ):
     """Fit single-trait Gaussian REML with AI/Fisher updates.
 
     Notes
     -----
-    The phenotype is standardized internally before optimization:
-    ``y_std = (y - mean(y)) / std(y)``.
-    The returned variance components and history therefore live on the
-    standardized phenotype scale. Higher-level wrappers are responsible for
-    carrying ``y_mean``/``y_scale`` when outputs need to be interpreted back on
-    the original phenotype scale. ``covar`` is used exactly as supplied;
-    low-level callers must include an intercept when it is part of the intended
-    fixed-effect model.
+    By default the phenotype is standardized internally before optimization:
+    ``y_std = (y - mean(y)) / std(y)``.  Set ``standardize_y=False`` only when
+    the caller has already put the response on the intended analysis scale.
+    In that mode the returned ``y_mean`` and ``y_scale`` diagnostics are zero
+    and one.  ``covar`` is used exactly as supplied; low-level callers must
+    include an intercept when it is part of the intended fixed-effect model.
     """
     y = jnp.asarray(y, dtype=jnp.float32).reshape(-1)
     n = int(y.shape[0])
@@ -1393,7 +1392,15 @@ def fit_reml(
         .astype(jnp.float32)
     )
 
-    y, y_mean, y_scale = standardize_response(y)
+    if standardize_y:
+        y, y_mean, y_scale = standardize_response(y)
+    else:
+        if not bool(jnp.all(jnp.isfinite(y))):
+            raise ValueError("Phenotype contains non-finite values.")
+        if not bool(jnp.isfinite(jnp.std(y))) or float(jnp.std(y)) <= 0.0:
+            raise ValueError("Phenotype must have positive finite variance.")
+        y_mean = jnp.asarray(0.0, dtype=y.dtype)
+        y_scale = jnp.asarray(1.0, dtype=y.dtype)
     y_mean_host, y_scale_host = jax.device_get((y_mean, y_scale))
 
     xmat = None if covar is None else jnp.asarray(covar, dtype=jnp.float32)

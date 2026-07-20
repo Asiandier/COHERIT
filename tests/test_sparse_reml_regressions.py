@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import os
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -55,6 +56,80 @@ def test_primary_h2_uses_penalized_chive_not_post_selection_gls():
     assert SPARSE._primary_sparse_dense_h2(0.31, 0.47) == 0.31
 
 
+def test_raw_lasso_plugin_is_chive_first_term_without_calibration():
+    rng = np.random.RandomState(1617)
+    z_active = rng.standard_normal((100, 5))
+    beta = rng.standard_normal(5) * 0.2
+    y = z_active @ beta + rng.standard_normal(100)
+
+    q_chive, q_lasso_plugin, correction = SPARSE._chive_q_hat_given_active(
+        z_active,
+        y,
+        beta,
+    )
+
+    expected_plugin = float(np.mean(np.square(z_active @ beta)))
+    assert np.isclose(q_lasso_plugin, expected_plugin)
+    assert np.isclose(q_chive, q_lasso_plugin + correction)
+
+
+def test_four_estimator_h2_uses_lasso_ml_and_reml_branches():
+    values = SPARSE._four_estimator_h2_from_branches(
+        q_lasso_plugin_standardized=0.07,
+        q_lasso_calibrated_standardized=0.13,
+        q_selected_span_plugin_standardized=0.19,
+        q_selected_span_trace_standardized=0.11,
+        lasso_ml_background_variance=0.17,
+        lasso_ml_residual_variance=0.71,
+        selected_span_reml_background_variance=0.43,
+        selected_span_reml_residual_variance=0.29,
+    )
+
+    assert np.isclose(
+        values["h2_lasso_plugin"],
+        SPARSE._sparse_dense_h2(0.07, 0.17, 0.71),
+    )
+    assert np.isclose(
+        values["h2_chive"],
+        SPARSE._sparse_dense_h2(0.13, 0.17, 0.71),
+    )
+    assert np.isclose(
+        values["h2_ss_gls_plugin"],
+        SPARSE._sparse_dense_h2(0.19, 0.43, 0.29),
+    )
+    assert np.isclose(
+        values["h2_ss_gls_df_corrected"],
+        SPARSE._sparse_dense_h2(0.11, 0.43, 0.29),
+    )
+    assert not np.isclose(
+        values["h2_chive"],
+        SPARSE._sparse_dense_h2(0.13, 0.43, 0.29),
+    )
+
+
+def test_common_guard_accepts_only_two_complete_finite_branches():
+    accepted, finite, reasons = SPARSE._common_sparse_estimator_guard(
+        alpha_theta_pair_certified=True,
+        lasso_quadratics_available=True,
+        selected_span_refit_ok=True,
+        estimator_values=np.asarray([0.2, 0.3, 0.4, -0.1]),
+    )
+    assert accepted is True
+    assert finite is True
+    assert reasons == []
+
+    accepted, finite, reasons = SPARSE._common_sparse_estimator_guard(
+        alpha_theta_pair_certified=True,
+        lasso_quadratics_available=True,
+        selected_span_refit_ok=False,
+        estimator_values=np.asarray([0.2, 0.3, np.nan, np.nan]),
+    )
+    assert accepted is False
+    assert finite is False
+    assert "selected_span_reml_gls_unavailable" in reasons
+    assert "nonfinite_sparse_estimator" in reasons
+
+
 def test_coherent_sparse_fixed_point_keeps_hybrid_as_primary():
     primary, fallback, reason = SPARSE._select_primary_h2_with_fallback(
         0.31,
@@ -81,6 +156,7 @@ def test_sparse_pipeline_ebic_defaults_to_full_model_space(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["gpu-reml-sparse"])
     args = SPARSE.parse_args()
     assert args.ebic_p_mode == "full"
+    assert args.minq_iter == 50
 
     monkeypatch.setattr(
         sys,
@@ -88,6 +164,153 @@ def test_sparse_pipeline_ebic_defaults_to_full_model_space(monkeypatch):
         ["gpu-reml-sparse", "--ebic-p-mode", "candidate"],
     )
     assert SPARSE.parse_args().ebic_p_mode == "candidate"
+
+
+def test_sparse_dense_h2_rejects_nonfinite_or_nonpositive_denominator():
+    assert np.isnan(SPARSE._sparse_dense_h2(np.nan, 0.2, 0.8))
+    assert np.isnan(SPARSE._sparse_dense_h2(-1.0, 0.2, 0.8))
+    assert np.isnan(SPARSE._sparse_dense_h2(np.inf, 0.2, 0.8))
+
+
+def test_json_safe_value_replaces_nested_nonfinite_diagnostics():
+    value = {
+        "finite": np.float64(0.4),
+        "nested": [np.nan, np.float32(np.inf), True],
+    }
+    assert SPARSE._json_safe_value(value) == {
+        "finite": 0.4,
+        "nested": [None, None, True],
+    }
+
+
+def test_reml_acceptance_requires_a_converged_accepted_iteration():
+    accepted = SimpleNamespace(
+        var_components=np.asarray([0.3, 0.7]),
+        history=[
+            {
+                "accepted": True,
+                "stop_reason": "rel_dll",
+            }
+        ],
+    )
+    theta, reason = SPARSE._accepted_reml_theta(
+        accepted,
+        expected_components=2,
+        stage="test",
+    )
+    assert np.array_equal(theta, np.asarray([0.3, 0.7]))
+    assert reason == "rel_dll"
+
+    for rejected in (
+        SimpleNamespace(
+            var_components=np.asarray([0.3, 0.7]),
+            history=[],
+        ),
+        SimpleNamespace(
+            var_components=np.asarray([0.3, 0.7]),
+            history=[
+                {
+                    "accepted": True,
+                    "stop_reason": "max_iter",
+                }
+            ],
+        ),
+        SimpleNamespace(
+            var_components=np.asarray([0.3, 0.7]),
+            history=[
+                {
+                    "accepted": False,
+                    "stop_reason": "ll_down",
+                }
+            ],
+        ),
+        SimpleNamespace(
+            var_components=np.asarray([np.nan, 0.7]),
+            history=[
+                {
+                    "accepted": True,
+                    "stop_reason": "rel_dll",
+                }
+            ],
+        ),
+    ):
+        with np.testing.assert_raises(RuntimeError):
+            SPARSE._accepted_reml_theta(
+                rejected,
+                expected_components=2,
+                stage="test",
+            )
+
+
+def test_full_score_kkt_certificate_checks_active_and_inactive_coordinates():
+    passed = SPARSE._lasso_kkt_certificate_from_scores(
+        score=np.asarray([0.5, -0.5, 0.49]),
+        beta=np.asarray([0.2, -0.1, 0.0]),
+        lam=0.5,
+        abs_tol=1e-8,
+        rel_tol=0.0,
+    )
+    assert passed["passed"] is True
+
+    active_failure = SPARSE._lasso_kkt_certificate_from_scores(
+        score=np.asarray([0.45, -0.5, 0.49]),
+        beta=np.asarray([0.2, -0.1, 0.0]),
+        lam=0.5,
+        abs_tol=1e-8,
+        rel_tol=0.0,
+    )
+    assert active_failure["passed"] is False
+    assert active_failure["max_active_error"] > 0.0
+
+    inactive_failure = SPARSE._lasso_kkt_certificate_from_scores(
+        score=np.asarray([0.5, -0.5, 0.51]),
+        beta=np.asarray([0.2, -0.1, 0.0]),
+        lam=0.5,
+        abs_tol=1e-8,
+        rel_tol=0.0,
+    )
+    assert inactive_failure["passed"] is False
+    assert inactive_failure["max_inactive_excess"] > 0.0
+
+
+def test_lasso_variance_block_uses_an_intercept_contrast_design():
+    design = SPARSE._intercept_contrast_fixed_effect(37)
+
+    assert design.shape == (37, 1)
+    assert design.dtype == np.float32
+    assert np.array_equal(design, np.ones((37, 1), dtype=np.float32))
+
+
+def test_residual_ml_helper_passes_intercept_and_disables_restandardization():
+    marker = object()
+
+    class RecordingFitter:
+        def fit_infinitesimal(self, y, covar, **kwargs):
+            self.y = np.asarray(y)
+            self.covar = np.asarray(covar)
+            self.kwargs = kwargs
+            return marker
+
+    fitter = RecordingFitter()
+    residual = np.linspace(-1.0, 1.0, 19, dtype=np.float32)
+    theta = np.asarray([0.31, 0.69], dtype=np.float32)
+    result = SPARSE._fit_intercept_contrast_residual_ml(
+        fitter,
+        residual,
+        theta,
+        h2_init=0.31,
+    )
+
+    assert result is marker
+    assert np.array_equal(fitter.y, residual)
+    assert np.array_equal(
+        fitter.covar, np.ones((residual.size, 1), dtype=np.float32)
+    )
+    assert fitter.kwargs["standardize_y"] is False
+    assert np.isclose(fitter.kwargs["h2_init"], 0.31)
+    assert np.array_equal(
+        np.asarray(fitter.kwargs["var_components_init"]), theta
+    )
 
 
 def test_empty_support_reduces_to_background_only_heritability():
@@ -115,3 +338,92 @@ def test_same_sample_ols_refit_makes_chive_cross_term_vanish():
     assert np.isclose(term2, 0.0, atol=1e-12)
     assert np.isclose(q_hat, term1, atol=1e-12)
     assert q_hat > 0.0
+
+
+def test_selected_span_gls_df_correction_matches_fixed_span_formula():
+    rng = np.random.RandomState(1618)
+    n, k = 70, 4
+    z_active = rng.standard_normal((n, k))
+    z_active -= z_active.mean(axis=0)
+    w = rng.standard_normal((n, n))
+    v = w @ w.T / n + 0.7 * np.eye(n)
+    vinv = np.linalg.inv(v)
+    phenotype_scale = 2.5
+    y = phenotype_scale * (
+        z_active @ rng.standard_normal(k) + rng.multivariate_normal(np.zeros(n), v)
+    )
+
+    out = SPARSE._selected_span_gls_quadratics(
+        y=y,
+        covar=None,
+        z_active=z_active,
+        Hinv_y=vinv @ y,
+        Hinv_covar=None,
+        Hinv_z_active=vinv @ z_active,
+        phenotype_scale=phenotype_scale,
+    )
+
+    gram_inv = np.linalg.inv(z_active.T @ vinv @ z_active)
+    sparse_gram = z_active.T @ z_active / n
+    expected_df_std = np.trace(sparse_gram @ gram_inv)
+    expected_plugin_std = float(out["q_plugin_raw"]) / phenotype_scale**2
+
+    assert np.isclose(out["df_correction_standardized"], expected_df_std)
+    assert np.isclose(out["q_plugin_standardized"], expected_plugin_std)
+    assert np.isclose(
+        out["q_df_corrected_standardized"],
+        expected_plugin_std - expected_df_std,
+    )
+
+
+def test_selected_span_gls_uses_independent_basis_for_duplicate_markers():
+    rng = np.random.RandomState(2719)
+    n = 60
+    z1 = rng.standard_normal(n)
+    z1 -= z1.mean()
+    z_active = np.column_stack([z1, z1])
+    covar = np.ones((n, 1))
+    v = np.eye(n)
+    y = 0.4 * z1 + rng.standard_normal(n)
+
+    out = SPARSE._selected_span_gls_quadratics(
+        y=y,
+        covar=covar,
+        z_active=z_active,
+        Hinv_y=y,
+        Hinv_covar=covar,
+        Hinv_z_active=z_active,
+        phenotype_scale=float(np.std(y)),
+    )
+
+    assert len(out["active_basis_idx"]) == 1
+    assert np.isfinite(out["q_df_corrected_standardized"])
+
+    beta_full = SPARSE._expand_selected_basis_coefficients(
+        support_size=z_active.shape[1],
+        basis_positions=out["active_basis_idx"],
+        basis_coefficients=out["beta_active_basis"],
+    )
+    fitted = z_active @ beta_full
+    assert np.count_nonzero(beta_full) == 1
+    assert np.isclose(
+        np.mean(np.square(fitted)),
+        out["q_plugin_raw"],
+        rtol=1e-12,
+        atol=1e-12,
+    )
+
+
+def test_selected_span_basis_expansion_rejects_invalid_positions():
+    with np.testing.assert_raises(ValueError):
+        SPARSE._expand_selected_basis_coefficients(
+            support_size=3,
+            basis_positions=np.asarray([1, 1]),
+            basis_coefficients=np.asarray([0.2, 0.3]),
+        )
+    with np.testing.assert_raises(ValueError):
+        SPARSE._expand_selected_basis_coefficients(
+            support_size=3,
+            basis_positions=np.asarray([3]),
+            basis_coefficients=np.asarray([0.2]),
+        )

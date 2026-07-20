@@ -1836,6 +1836,7 @@ class InfinitesimalREMLFitter:
         h2_init: float = 0.5,
         var_components_init: Optional[jnp.ndarray] = None,
         estimate_effects: bool = False,
+        standardize_y: bool = True,
     ) -> FitResult:
         if self.cfg.verbose:
             logger.info("fit_infinitesimal start @ %s", datetime.now().isoformat(timespec='seconds'))
@@ -1883,6 +1884,7 @@ class InfinitesimalREMLFitter:
                 ),
                 scoring_step_tol=self.cfg.smile_scoring_step_tol,
                 return_diagnostics=bool(self.cfg.capture_reml_diagnostics),
+                standardize_y=bool(standardize_y),
                 verbose=self.cfg.verbose,
             )
             if bool(self.cfg.capture_reml_diagnostics):

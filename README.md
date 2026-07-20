@@ -86,29 +86,62 @@ $$
 (\hat\alpha_\lambda,\hat b_\lambda)=\arg\min_{\alpha,b}\frac{1}{2}(y-C\alpha-Z_Sb)^TV(\theta)^{-1}(y-C\alpha-Z_Sb)+\lambda\|b\|_1.
 $$
 
-The sparse command alternates this weighted-LASSO selection step with REML
-conditional on the selected SNP span.  It is a selection--REML fixed-point
-procedure, not block coordinate optimization of one restricted likelihood.
-The default EBIC penalty uses the full eligible marker count, and the accepted
-LASSO solution is checked against genome-wide inactive-coordinate KKT
-conditions.
+The sparse command first alternates this weighted-LASSO step with Gaussian ML
+for the residual `y-C alpha-Z b` in the \(n-1\) dimensional space orthogonal
+to the intercept.  In the full sample space this is implemented by supplying
+an intercept to the REML routine; it prevents the zero-energy constant mode of
+a centered GRM from spuriously driving residual variance to its lower bound.
+This produces the penalized-ML branch `(alpha_L, theta_L)`.  A preliminary
+support/variance match schedules one complete terminal LASSO/KKT plus
+residual-ML round, and the returned covariance receives a signed,
+all-marker KKT check.  Only then is the selected span frozen and one separate
+REML--GLS refit used to produce `(zeta_R, theta_R)`; that refit is not fed back
+into the LASSO.  When EBIC is recomputed at every covariance update, the outer
+map is adaptive and is not a monotone optimization of one fixed-lambda
+objective.  The default EBIC penalty uses the full eligible marker count.
 
 Sparse-run output semantics are deliberately explicit:
 
-- `h2` is the primary total estimate.  At a coherent sparse--REML fixed point
-  it combines the penalized-LASSO calibrated quadratic with the final
-  trace-weighted background variance.
+- `var_components_lasso_ml` and
+  `var_components_selected_span_reml` expose the two variance branches.
+  Legacy `var_components` means the selected-span REML result on an accepted
+  sparse fit and the ordinary-REML result when the common guard falls back;
+  `var_components_compatibility_branch` records which one was emitted.
+- `h2` is the primary total estimate.  At an accepted penalized-ML fixed
+  point it combines the calibrated LASSO quadratic with the
+  `var_components_lasso_ml` background and residual components.
 - `h2_background_reml` (legacy alias `h2_reml`) is background-only once SNPs
   enter the fixed-effect design; it is not total heritability.
+- `h2_lasso_plugin` combines the uncorrected squared penalized-LASSO score
+  with the residual-ML LASSO-branch variance components.  Its guarded
+  counterpart is `h2_lasso_plugin_guarded`; it is a shrinkage-bias baseline,
+  not a recommended default.
+- `h2_chive_guarded` is the explicitly named guarded counterpart of
+  `h2_chive` and equals the top-level primary field `h2`.
 - `h2_chive_post_gls` (legacy alias `h2_chive_reml`) is a same-sample
-  post-selection GLS diagnostic and is not primary.
+  diagnostic obtained by inserting a post-selection GLS coefficient back
+  into the CHIVE formula; it is not primary.
+- `h2_ss_gls_plugin` is the uncorrected fitted-score plug-in after the
+  selected-span REML variance refit and final GLS coefficient recovery; its
+  guarded counterpart is `h2_ss_gls_plugin_guarded`.
+  `h2_ss_gls_df_corrected` subtracts the analytic fixed-span
+  estimation-noise trace term before adding the background; its guarded
+  counterpart is `h2_ss_gls_df_guarded`.  The field names retain `df` for
+  output compatibility, but the quantity has phenotype-variance units and is
+  not generally a dimension count.  The trace correction does not remove
+  same-sample selection bias, so this is a secondary estimator.
+- Estimators 3 and 4, the post-GLS diagnostic, and `beta_gls_reml` in
+  `selected_snps.tsv` use exactly the same full-rank selected-marker basis.
+  Numerically dependent selected columns receive coefficient zero and the
+  `selected_span_basis` column identifies retained basis markers.
 - Raw-scale sparse quadratic terms and standardized-phenotype REML components
   are never added directly.  The summary records both quadratic scales and the
   phenotype scale used for conversion.
-- If the outer loop does not produce a matched sparse coefficient/covariance
-  fixed point, the hybrid value is retained only as
-  `h2_sparse_dense_unconverged`; primary `h2` is recomputed by a genuine
-  covariates-only REML fallback, with `primary_fallback=true`.
+- A common guard requires the certified penalized pair, a converged
+  selected-span REML--GLS refit, and four finite estimator values.  If any
+  requirement fails, raw unavailable branch values are reported as JSON
+  `null`, while all guarded values and primary `h2` use a separately validated
+  covariates-only REML fallback with `primary_fallback=true`.
 
 ## Research Use Cases
 
