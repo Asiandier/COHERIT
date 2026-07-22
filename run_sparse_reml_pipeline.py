@@ -53,16 +53,29 @@ _precond_mod = importlib.import_module(f"{pkg_name}.precond")
 _common_mod = importlib.import_module(f"{pkg_name}.pipeline_common")
 _io_utils_mod = importlib.import_module(f"{pkg_name}.io_utils")
 _component_spec_mod = importlib.import_module(f"{pkg_name}.component_spec")
+_sparse_prediction_mod = importlib.import_module(
+    f"{pkg_name}.sparse_prediction"
+)
 
 InfinitesimalREMLFitter = _inf_mod.InfinitesimalREMLFitter
 FitConfig = _inf_mod.FitConfig
 standardize_response = _inf_mod.standardize_response
-load_pheno_covar_aligned = _data_mod.load_pheno_covar_aligned
+load_pheno_covar_aligned_with_transform = (
+    _data_mod.load_pheno_covar_aligned_with_transform
+)
+load_covar_aligned = _data_mod.load_covar_aligned
 LassoPathConfig = _lasso_mod.LassoPathConfig
 compute_projected_hinv_vector = _lasso_mod.compute_projected_hinv_vector
 fit_weighted_lasso_with_covariates = _lasso_mod.fit_weighted_lasso_with_covariates
 pcg_solve = _pcg_mod.pcg_solve
 load_component_specs = _component_spec_mod.load_component_specs
+predict_sparse_branch = _sparse_prediction_mod.predict_sparse_branch
+write_sparse_prediction_outputs = (
+    _sparse_prediction_mod.write_sparse_prediction_outputs
+)
+write_sparse_prediction_status = (
+    _sparse_prediction_mod.write_sparse_prediction_status
+)
 
 _source_mod = importlib.import_module(f"{pkg_name}.geno_source")
 PgenGenoSource = _source_mod.PgenGenoSource
@@ -416,6 +429,28 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--pheno-txt", default=env("PHENO_TXT", ""))
     p.add_argument("--covar-txt", default=env("COVAR_TXT", ""))
+    p.add_argument(
+        "--prediction-bed-prefix",
+        default=env("PREDICTION_BED_PREFIX", ""),
+        help="Prediction BED prefix (comma-separated for multiple GRMs).",
+    )
+    p.add_argument(
+        "--prediction-pgen-prefix",
+        default=env("PREDICTION_PGEN_PREFIX", ""),
+        help="Prediction PGEN prefix.",
+    )
+    p.add_argument(
+        "--prediction-covar-txt",
+        default=env("PREDICTION_COVAR_TXT", ""),
+        help=(
+            "Prediction covariates transformed with training-set parameters."
+        ),
+    )
+    p.add_argument(
+        "--prediction-keep-path",
+        default=env("PREDICTION_KEEP_PATH", ""),
+        help="Optional IID keep file selecting prediction samples.",
+    )
     p.add_argument("--keep-path", default=env("KEEP_PATH", ""))
     p.add_argument("--keep-out", default=env("KEEP_OUT", ""))
     p.add_argument("--dropped-out", default=env("DROPPED_OUT", ""))
@@ -449,6 +484,25 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--slq-m", type=int, default=int(env("SLQ_M", "50")))
     p.add_argument("--precond-type", choices=["projected_core"], default=env("PRECOND_TYPE", "projected_core"))
     p.add_argument("--minq-iter", type=int, default=int(env("MINQ_ITER", "50")))
+    p.add_argument(
+        "--reml-scoring-step-tol",
+        type=float,
+        default=float(env("REML_SCORING_STEP_TOL", "1e-4")),
+        help=(
+            "Projected-score/relative-step tolerance used by each strict REML "
+            "variance update. The default preserves the core REML default; "
+            "large stochastic fits may use a prespecified looser tolerance."
+        ),
+    )
+    p.add_argument(
+        "--reml-max-linesearch-trials",
+        type=int,
+        default=int(env("REML_MAX_LINESEARCH_TRIALS", "8")),
+        help=(
+            "Maximum strict REML backtracking trials. Eight trials permit "
+            "steps through 1/128 while preserving monotone acceptance."
+        ),
+    )
     p.add_argument("--pcg-tol", type=float, default=float(env("PCG_TOL", "5e-3")))
     p.add_argument("--pcg-ridge", type=float, default=float(env("PCG_RIDGE", "1e-6")))
     p.add_argument("--max-pcg-iters", type=int, default=int(env("MAX_PCG_ITERS", "400")))
@@ -546,16 +600,31 @@ def _accepted_reml_theta(
     )
     accepted_history = bool(
         history
-        and bool(history[-1].get("accepted", False))
-        and stop_reason in {"rel_dll", "scoring_step"}
+        and (
+            (
+                bool(history[-1].get("accepted", False))
+                and stop_reason in {"rel_dll", "scoring_step"}
+            )
+            or (
+                bool(history[-1].get("returned_state_accepted", False))
+                and bool(history[-1].get("converged", False))
+                and stop_reason == "projected_gradient"
+            )
+        )
     )
     if not valid_theta or not accepted_history:
+        last_history = history[-1] if history else {}
         raise RuntimeError(
             f"{stage} did not return an accepted converged REML fit: "
             f"theta={theta.tolist()}, history_rows={len(history)}, "
             f"stop_reason={stop_reason!r}, "
             f"last_accepted="
-            f"{bool(history[-1].get('accepted', False)) if history else False}."
+            f"{bool(history[-1].get('accepted', False)) if history else False}, "
+            f"returned_state_accepted="
+            f"{bool(last_history.get('returned_state_accepted', False))}, "
+            f"proj_grad_inf={last_history.get('proj_grad_inf')}, "
+            f"dll_true={last_history.get('dll_true')}, "
+            f"max_rel_dp={last_history.get('max_rel_dp')}."
         )
     return theta, stop_reason
 
@@ -1054,6 +1123,10 @@ def main() -> None:
         raise SystemExit("outer-max must be >= 1.")
     if int(args.minq_iter) < 1:
         raise SystemExit("minq-iter must be >= 1 for both variance blocks.")
+    if float(args.reml_scoring_step_tol) <= 0.0:
+        raise SystemExit("reml-scoring-step-tol must be > 0.")
+    if int(args.reml_max_linesearch_trials) < 1:
+        raise SystemExit("reml-max-linesearch-trials must be >= 1.")
     if int(args.support_stable_rounds) < 1:
         raise SystemExit("support-stable-rounds must be >= 1.")
     if float(args.vc_rel_tol) <= 0.0:
@@ -1080,6 +1153,15 @@ def main() -> None:
         if component_spec_source
         else []
     )
+    prediction_bed_list = [
+        value.strip()
+        for value in args.prediction_bed_prefix.split(",")
+        if value.strip()
+    ]
+    prediction_pgen_prefix = args.prediction_pgen_prefix.strip()
+    prediction_active = bool(
+        prediction_bed_list or prediction_pgen_prefix
+    )
 
     _n_formats = sum(bool(x) for x in [bed_list, pgen_prefix])
     if _n_formats == 0:
@@ -1090,6 +1172,21 @@ def main() -> None:
     if _n_formats > 1:
         raise SystemExit(
             "Specify only one of --bed-prefix / --pgen-prefix."
+        )
+    if prediction_active and sum(
+        bool(value)
+        for value in (prediction_bed_list, prediction_pgen_prefix)
+    ) != 1:
+        raise SystemExit(
+            "Prediction requires exactly one of --prediction-bed-prefix or "
+            "--prediction-pgen-prefix."
+        )
+    if (
+        args.prediction_covar_txt or args.prediction_keep_path
+    ) and not prediction_active:
+        raise SystemExit(
+            "Prediction covariate/keep inputs require a prediction BED or "
+            "PGEN prefix."
         )
     if component_variant_indices:
         if len(bed_list) > 1:
@@ -1116,7 +1213,13 @@ def main() -> None:
         keep_ids = read_keep_ids(args.keep_path)
 
     # Use first GRM's FAM as the reference for sample alignment.
-    y_np, covar_np, fam_keep, dropped = load_pheno_covar_aligned(
+    (
+        y_np,
+        covar_np,
+        fam_keep,
+        dropped,
+        covar_transform,
+    ) = load_pheno_covar_aligned_with_transform(
         fam_path=fam_path,
         pheno_path=args.pheno_txt,
         covar_path=args.covar_txt or None,
@@ -1253,6 +1356,8 @@ def main() -> None:
             n_rand_vec=args.n_rand_vec, minq_iter=args.minq_iter,
             slq_samples=args.slq_samples, slq_m=args.slq_m,
             precond_type=args.precond_type, precond_rank=plan.precond_rank,
+            smile_scoring_step_tol=args.reml_scoring_step_tol,
+            strict_max_linesearch_trials=args.reml_max_linesearch_trials,
             max_pcg_iters=args.max_pcg_iters, pcg_ridge=args.pcg_ridge,
             verbose=args.verbose,
         )
@@ -1269,6 +1374,8 @@ def main() -> None:
             n_rand_vec=args.n_rand_vec, minq_iter=args.minq_iter,
             slq_samples=args.slq_samples, slq_m=args.slq_m,
             precond_type=args.precond_type, precond_rank=plan.precond_rank,
+            smile_scoring_step_tol=args.reml_scoring_step_tol,
+            strict_max_linesearch_trials=args.reml_max_linesearch_trials,
             max_pcg_iters=args.max_pcg_iters, pcg_ridge=args.pcg_ridge,
             verbose=args.verbose,
         )
@@ -1936,6 +2043,7 @@ def main() -> None:
     selected_span_basis_local = np.empty((0,), dtype=np.int64)
     selected_span_reml_iterations = 0
     selected_span_reml_stop_reason = ""
+    selected_span_reml_history = []
     selected_span_refit_ok = False
     selected_span_refit_error = None
     theta_selected_span_reml = theta_lasso_ml.copy()
@@ -1971,6 +2079,7 @@ def main() -> None:
                     theta_lasso_ml, dtype=jnp.float32
                 ),
             )
+            selected_span_reml_history = list(selected_span_reml.history)
             (
                 theta_selected_span_reml,
                 selected_span_reml_stop_reason,
@@ -2155,7 +2264,7 @@ def main() -> None:
         q_chive_post_gls_term2_standardized = 0.0
         beta_gls_active = np.zeros(support.size, dtype=np.float64)
 
-    if selected_span_refit_ok and support.size > 0:
+    if selected_span_refit_ok:
         try:
             theta_g = jnp.asarray(
                 theta_selected_span_reml[:-1], dtype=jnp.float32
@@ -2539,6 +2648,282 @@ def main() -> None:
         ),
     }
 
+    prediction_summary = {
+        "requested": bool(prediction_active),
+        "status": "not_requested",
+    }
+    if prediction_active:
+        prediction_request_metadata = {
+            "test_phenotype_used": False,
+            "genotype_standardization_source": "training_samples_only",
+            "covariate_transform_source": "training_samples_only",
+            "prediction_keep_path": args.prediction_keep_path or None,
+            "prediction_genotype": {
+                "format": "pgen" if prediction_pgen_prefix else "bed",
+                "prefixes": (
+                    [prediction_pgen_prefix]
+                    if prediction_pgen_prefix
+                    else prediction_bed_list
+                ),
+            },
+            "scale_metadata": {
+                "variance_components": (
+                    "standardized_phenotype_variance"
+                ),
+                "fixed_effect_coefficients": (
+                    "raw_phenotype_units_per_training_transformed_design_unit"
+                ),
+                "fixed_snp_score": "raw_phenotype_units",
+                "background_blup": "raw_phenotype_units",
+                "genetic_score": (
+                    "raw_phenotype_units; "
+                    "fixed_snp_score_plus_background_blup"
+                ),
+                "phenotype_prediction": (
+                    "raw_phenotype_units; "
+                    "nuisance_fixed_score_plus_genetic_score"
+                ),
+                "phenotype_scale": float(phenotype_scale),
+                "phenotype_mean": float(phenotype_mean),
+            },
+        }
+        if not guarded_sparse_fit_accepted:
+            metadata_path = write_sparse_prediction_status(
+                out_prefix=out_prefix,
+                status="not_emitted_fallback",
+                metadata={
+                    **prediction_request_metadata,
+                    "reason": "common_sparse_estimator_guard_rejected",
+                    "sparse_fit_rejection_reasons": list(
+                        sparse_fit_rejection_reasons
+                    ),
+                    "ordinary_reml_fallback_available": True,
+                    "branch_outputs_emitted": False,
+                },
+            )
+            prediction_summary = {
+                "requested": True,
+                "status": "not_emitted_fallback",
+                "metadata_path": metadata_path,
+            }
+        else:
+            write_sparse_prediction_status(
+                out_prefix=out_prefix,
+                status="preparing",
+                metadata={
+                    **prediction_request_metadata,
+                    "branch_outputs_emitted": False,
+                },
+            )
+            standardization_overrides = []
+            for streamer in fitter.streamers:
+                if (
+                    streamer._means_host is None
+                    or streamer._inv_sds_host is None
+                ):
+                    raise RuntimeError(
+                        "Sparse prediction requires retained training SNP "
+                        "standardization statistics."
+                    )
+                standardization_overrides.append(
+                    (streamer._means_host, streamer._inv_sds_host)
+                )
+
+            prediction_temp_paths: list[str] = []
+            if prediction_pgen_prefix:
+                prediction_fam_path = make_nonbed_input_fam(
+                    pgen_prefix=prediction_pgen_prefix
+                )
+                prediction_temp_paths.append(prediction_fam_path)
+            else:
+                prediction_fam_path = prediction_bed_list[0] + ".fam"
+            for path in prediction_temp_paths:
+                atexit.register(cleanup_path, path)
+
+            requested_prediction_ids = None
+            if args.prediction_keep_path:
+                if not os.path.exists(args.prediction_keep_path):
+                    raise SystemExit(
+                        "--prediction-keep-path does not exist: "
+                        f"{args.prediction_keep_path}"
+                    )
+                requested_prediction_ids = read_keep_ids(
+                    args.prediction_keep_path
+                )
+            (
+                prediction_covar,
+                prediction_ids,
+                prediction_dropped,
+            ) = load_covar_aligned(
+                prediction_fam_path,
+                args.prediction_covar_txt or None,
+                transform=covar_transform,
+                keep_ids=requested_prediction_ids,
+            )
+            logger.info(
+                "[prediction] loaded %s samples; dropped %s",
+                len(prediction_ids),
+                len(prediction_dropped),
+            )
+
+            prediction_sources = None
+            prediction_sample_mask = None
+            if prediction_pgen_prefix:
+                prediction_sample_mask = compute_sample_mask(
+                    prediction_fam_path, prediction_ids
+                )
+                prediction_sources = [
+                    PgenGenoSource(
+                        prediction_pgen_prefix,
+                        sample_mask=prediction_sample_mask,
+                    )
+                ]
+                prediction_sample_mask = None
+            else:
+                n_prediction_bed = _bed_count(
+                    prediction_bed_list[0] + ".bed", "iid_count"
+                )
+                if n_prediction_bed != len(prediction_ids):
+                    prediction_sample_mask = compute_sample_mask(
+                        prediction_fam_path, prediction_ids
+                    )
+
+            prediction_cfg_kwargs = dict(
+                device=args.device,
+                sample_mask=prediction_sample_mask,
+                component_variant_indices=(
+                    component_variant_indices or None
+                ),
+                standardization_overrides=standardization_overrides,
+                call_width=call_width,
+                # Needed only to extract the selected fixed-SNP columns; the
+                # retained values are supplied training overrides, not moments
+                # estimated from prediction samples.
+                keep_host_stats=True,
+                cpu_threads=cpu_threads,
+                gpu_budget_bytes=gpu_budget_bytes,
+                ring_depth=plan.ring_depth,
+                n_rand_vec=args.n_rand_vec,
+                minq_iter=args.minq_iter,
+                slq_samples=args.slq_samples,
+                slq_m=args.slq_m,
+                precond_type=args.precond_type,
+                precond_rank=0,
+                max_pcg_iters=args.max_pcg_iters,
+                pcg_ridge=args.pcg_ridge,
+                verbose=args.verbose,
+            )
+            if prediction_sources is not None:
+                prediction_fitter = InfinitesimalREMLFitter(
+                    FitConfig(
+                        sources=prediction_sources,
+                        **prediction_cfg_kwargs,
+                    )
+                )
+            else:
+                prediction_fitter = InfinitesimalREMLFitter(
+                    FitConfig(
+                        bed_prefix=prediction_bed_list,
+                        **prediction_cfg_kwargs,
+                    )
+                )
+            try:
+                prediction_grm_index = MultiGRMIndex(
+                    prediction_fitter.streamers,
+                    call_plan=prediction_fitter._multi_call_plan,
+                    component_variant_indices=(
+                        component_variant_indices or None
+                    ),
+                )
+                prediction_support = (
+                    prediction_grm_index.extract_standardized_columns(
+                        support
+                    ).astype(np.float32, copy=False)
+                )
+                lasso_prediction = predict_sparse_branch(
+                    name="lasso",
+                    fitter=fitter,
+                    test_fitter=prediction_fitter,
+                    y_train_raw=y_np,
+                    train_covar=covar_np,
+                    test_covar=prediction_covar,
+                    train_active_geno=Z_support,
+                    test_active_geno=prediction_support,
+                    beta_cov_raw=beta_cov_lasso,
+                    beta_active_raw=beta_lasso_active,
+                    theta_standardized=theta_lasso_ml,
+                    phenotype_scale=phenotype_scale,
+                    pcg_tol=args.pcg_tol,
+                    max_pcg_iters=args.max_pcg_iters,
+                )
+                selected_span_prediction = predict_sparse_branch(
+                    name="selected_span",
+                    fitter=fitter,
+                    test_fitter=prediction_fitter,
+                    y_train_raw=y_np,
+                    train_covar=covar_np,
+                    test_covar=prediction_covar,
+                    train_active_geno=Z_support,
+                    test_active_geno=prediction_support,
+                    beta_cov_raw=beta_cov_gls,
+                    beta_active_raw=beta_gls_active,
+                    theta_standardized=theta_selected_span_reml,
+                    phenotype_scale=phenotype_scale,
+                    pcg_tol=args.pcg_tol,
+                    max_pcg_iters=args.max_pcg_iters,
+                )
+            finally:
+                prediction_fitter.close()
+
+            branch_metadata = {
+                "lasso": {
+                    "mean_estimator": "final_weighted_lasso",
+                    "covariance_estimator": "lasso_residual_ml",
+                    "theta_standardized": theta_lasso_ml.tolist(),
+                    "residual": (
+                        "(y-X_beta_cov_lasso-Z_support_beta_lasso)"
+                        "/phenotype_scale"
+                    ),
+                    "support_size": int(support.size),
+                    "pcg_rel_res": lasso_prediction.pcg_rel_res,
+                    "pcg_iters": lasso_prediction.pcg_iters,
+                },
+                "selected_span": {
+                    "mean_estimator": "selected_span_gls",
+                    "covariance_estimator": "selected_span_reml",
+                    "theta_standardized": (
+                        theta_selected_span_reml.tolist()
+                    ),
+                    "residual": (
+                        "(y-X_beta_cov_gls-Z_support_beta_gls)"
+                        "/phenotype_scale"
+                    ),
+                    "support_size": int(support.size),
+                    "independent_basis_size": int(ss_gls_basis_size),
+                    "pcg_rel_res": (
+                        selected_span_prediction.pcg_rel_res
+                    ),
+                    "pcg_iters": selected_span_prediction.pcg_iters,
+                },
+            }
+            prediction_paths = write_sparse_prediction_outputs(
+                out_prefix=out_prefix,
+                sample_ids=prediction_ids,
+                lasso=lasso_prediction,
+                selected_span=selected_span_prediction,
+                metadata={
+                    **prediction_request_metadata,
+                    "branch_outputs_emitted": True,
+                    "branches": branch_metadata,
+                },
+            )
+            prediction_summary = {
+                "requested": True,
+                "status": "emitted",
+                "n_samples": len(prediction_ids),
+                "paths": prediction_paths,
+            }
+
     summary = {
         "sparse_output_schema_version": 2,
         "finished_at": datetime.now().isoformat(timespec="seconds"),
@@ -2601,11 +2986,16 @@ def main() -> None:
         "lasso_variance_contrast": "orthogonal_to_intercept",
         "lasso_variance_analysis_dimension": int(y_np.shape[0] - 1),
         "selected_span_reml_iterations": selected_span_reml_iterations,
+        "selected_span_reml_history": selected_span_reml_history,
         "selected_span_reml_stop_reason": (
             selected_span_reml_stop_reason or None
         ),
         "selected_span_refit_ok": selected_span_refit_ok,
         "selected_span_refit_error": selected_span_refit_error,
+        "reml_scoring_step_tol": float(args.reml_scoring_step_tol),
+        "reml_max_linesearch_trials": int(
+            args.reml_max_linesearch_trials
+        ),
         "selected_span_basis_size": ss_gls_basis_size,
         "selected_span_basis_support_positions": (
             selected_span_basis_positions.tolist()
@@ -2751,6 +3141,7 @@ def main() -> None:
             returned_covariance_kkt["passed"]
         ),
         "outer_history": history,
+        "sparse_prediction": prediction_summary,
     }
 
     with open(out_prefix + ".summary.json", "w") as f:

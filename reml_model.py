@@ -50,6 +50,7 @@ class FitConfig:
     smile_w_device_cache_bytes: float | None = None
     smile_optimizer: str = "strict"
     smile_scoring_step_tol: float = 1e-4
+    strict_max_linesearch_trials: int = 3
     admix_weights: np.ndarray | None = None
     admix_component_names: Sequence[str] | None = None
     admix_residual_mode: str = "shared"
@@ -1883,6 +1884,7 @@ class InfinitesimalREMLFitter:
                     if self._smile_operators else "strict"
                 ),
                 scoring_step_tol=self.cfg.smile_scoring_step_tol,
+                max_linesearch_trials=self.cfg.strict_max_linesearch_trials,
                 return_diagnostics=bool(self.cfg.capture_reml_diagnostics),
                 standardize_y=bool(standardize_y),
                 verbose=self.cfg.verbose,

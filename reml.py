@@ -669,12 +669,11 @@ def _eval_once(
 
     # Use Python flag — avoids GPU→CPU sync that jnp.isfinite() would cause.
     if warm_ready:
-        if M_cur is not None:
-            main_resid = rhs_all - Hv(warm_all)
-            X0_all = warm_all + M_cur(main_resid)
-            del main_resid
-        else:
-            X0_all = warm_all
+        # Let PCG test and, when necessary, improve the accepted-state warm
+        # solution itself.  An unconditional Richardson correction here made
+        # repeated evaluations at the same parameter return different
+        # approximate likelihoods even when PCG reported zero iterations.
+        X0_all = warm_all
     elif M_cur is not None:
         X0_all = M_cur(rhs_all)
     else:
@@ -761,12 +760,7 @@ def _eval_once(
     fisher_stats.frozen_genetic = 0
     GPy_cols = jnp.swapaxes(GPy_stack[:, :, 0], 0, 1)  # (n, G+E)
     if warm_ai_ready and warm_ai is not None and warm_ai.shape[1] == ctx.G + ctx.E:
-        if M_cur is not None:
-            ai_resid = GPy_cols - Hv(warm_ai)
-            X0_ai = warm_ai + M_cur(ai_resid)
-            del ai_resid
-        else:
-            X0_ai = warm_ai
+        X0_ai = warm_ai
     elif M_cur is not None:
         X0_ai = M_cur(GPy_cols)
     else:
@@ -1618,12 +1612,57 @@ def fit_reml(
         logger.info("[REML] warmup: ll=%.6e pcg=%d ai_pcg=%d", ll0_host, int(k_pcg0), ai_pcg0)
 
     stop_reason = "max_iter"
+    state_eval_tol = float(warmup_pcg_tol)
     history: list[dict] = []
     for it in range(minq_iter):
         tol_cur = _pcg_tol(it)
         iter_t0 = time.time()
         iter_precond_refreshed = False
         trial_count = 0
+
+        # The accepted state's objective, score and AI must be evaluated at
+        # the same PCG tolerance as its line-search candidates.  Otherwise a
+        # scheduled tolerance tightening can create a likelihood jump that is
+        # independent of the candidate step and falsely reject every trial.
+        if not math.isclose(
+            float(tol_cur),
+            float(state_eval_tol),
+            rel_tol=0.0,
+            abs_tol=0.0,
+        ):
+            (
+                ll,
+                grad,
+                FI,
+                _k_state,
+                warm_all,
+                warm_ai,
+                tr_Hinv_R_cached,
+                tr_Hinv_K_cached,
+                logdet_cached,
+            ) = _run_eval(
+                param,
+                warm_all,
+                warm_ai,
+                tol_cur,
+                True,
+                True,
+                compute_traces=True,
+            )
+            state_eval_tol = float(tol_cur)
+            fi_finite = bool(
+                jnp.all(jnp.isfinite(FI.mat))
+                if isinstance(FI, AverageInfoMatrix)
+                else jnp.all(jnp.isfinite(FI))
+            )
+            if not bool(
+                jnp.isfinite(ll)
+                and jnp.all(jnp.isfinite(grad))
+                and fi_finite
+            ):
+                raise FloatingPointError(
+                    "Non-finite REML state after PCG tolerance refresh."
+                )
 
         def _log_workset_resolve(info: dict[str, object]) -> None:
             if not full_log:
@@ -1789,10 +1828,11 @@ def fit_reml(
                 eval_ai_pcg = ai_pcg_trial
                 use_taylor = trial_use_taylor
                 break
-            trial_warm = warm_try
-            trial_warm_ai = warm_ai_try
-            trial_warm_ready = True
-            trial_warm_ai_ready = True
+            # Every backtracking candidate must be evaluated from the same
+            # accepted-state solver anchors.  Carrying a rejected candidate's
+            # approximate PCG solution into the next trial makes the computed
+            # likelihood path-dependent (and can produce a nonzero likelihood
+            # jump even as the trial step tends to zero).
             alpha_try *= 0.5
 
         (
@@ -1822,10 +1862,40 @@ def fit_reml(
         )
         dll = float(ll_new_host - ll_host)
         rel_improve = dll / max(abs(float(ll_host)), 1e-12)
+        stationary_at_returned_state = False
+        proj_grad_returned_host = float(proj_grad_host)
+        param_returned_host = param_updated_host
         if accepted:
             status = "accept" if dll >= 0.0 else "accept_downhill"
         else:
-            status = "ll_down"
+            # A failed line search does not by itself invalidate the last
+            # accepted parameter vector.  In particular, close to a stationary
+            # point every finite-precision trial can be microscopically
+            # downhill.  Certify that case from the projected score evaluated
+            # at the parameter vector that will actually be returned.  Keep a
+            # genuine nonstationary line-search failure as ``ll_down``.
+            proj_grad_returned_host, param_returned_host = jax.device_get(
+                (
+                    _projected_gradient_inf_norm_split(
+                        param,
+                        grad,
+                        n_genetic=G,
+                        zero_tol=genetic_zero_tol,
+                        residual_floor=residual_floor,
+                    ),
+                    param,
+                )
+            )
+            proj_grad_returned_host = float(proj_grad_returned_host)
+            stationary_at_returned_state = bool(
+                math.isfinite(proj_grad_returned_host)
+                and proj_grad_returned_host < scoring_step_tol
+            )
+            status = (
+                "converged_projected_gradient"
+                if stationary_at_returned_state
+                else "ll_down"
+            )
         if accepted:
             if optimizer == "smile_scoring":
                 should_stop = (not math.isfinite(rel_improve)) or (max_rel_dp < scoring_step_tol)
@@ -1866,8 +1936,12 @@ def fit_reml(
             "iter": it + 1,
             "status": status,
             "accepted": accepted,
+            "returned_state_accepted": bool(
+                accepted or stationary_at_returned_state
+            ),
+            "converged": bool(should_stop or stationary_at_returned_state),
             "grad_norm": float(grad_norm_host),
-            "proj_grad_inf": float(proj_grad_host),
+            "proj_grad_inf": float(proj_grad_returned_host),
             "loglik": float(ll_new_host),
             "loglik_prev": float(ll_host),
             "dll_true": dll,
@@ -1879,11 +1953,29 @@ def fit_reml(
             "step_alpha": alpha_used,
             "alpha_max": alpha_max,
             "line_search_trials": trial_count,
+            "line_search_trace": [
+                {
+                    "alpha": float(alpha_i),
+                    "dll": float(dll_i),
+                    "accepted": bool(ok_i),
+                    "pcg_iters": int(pcg_i),
+                    "ai_pcg_iters": int(ai_pcg_i),
+                    "used_taylor": bool(taylor_i),
+                }
+                for (
+                    alpha_i,
+                    dll_i,
+                    ok_i,
+                    pcg_i,
+                    ai_pcg_i,
+                    taylor_i,
+                ) in ls_trace
+            ],
             "n_freeze": int(n_frozen_host),
             "eval_ai_pcg_iters": int(eval_ai_pcg),
             "eval_sec": eval_elapsed,
             "iter_sec": time.time() - iter_t0,
-            "params": [float(v) for v in np.asarray(param_updated_host).reshape(-1)],
+            "params": [float(v) for v in np.asarray(param_returned_host).reshape(-1)],
             "slq_taylor": use_taylor,
             "max_rel_dp": max_rel_dp,
             "precond_refreshed": iter_precond_refreshed,
@@ -1965,6 +2057,9 @@ def fit_reml(
             if should_stop:
                 stop_reason = "scoring_step" if optimizer == "smile_scoring" else "rel_dll"
                 break
+        elif stationary_at_returned_state:
+            stop_reason = "projected_gradient"
+            break
         else:
             stop_reason = "ll_down"
             break

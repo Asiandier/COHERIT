@@ -11,7 +11,7 @@ Assumptions:
 from __future__ import annotations
 import dataclasses
 import logging
-from typing import Optional
+from typing import Optional, Sequence
 import numpy as np
 import polars as pl
 
@@ -417,6 +417,7 @@ def load_covar_aligned(
     covar_path: Optional[str],
     *,
     transform: CovariateTransform,
+    keep_ids: Optional[Sequence[str]] = None,
 ) -> tuple[Optional[np.ndarray], list[str], list[str]]:
     fam_df = _read_fam_df(fam_path)
     joined = fam_df
@@ -438,6 +439,15 @@ def load_covar_aligned(
 
     dropped_df = joined.filter(~valid_mask).select("iid")
     kept_df = joined.filter(valid_mask)
+    if keep_ids is not None:
+        keep_set = set(keep_ids)
+        keep_expr = pl.col("iid").is_in(list(keep_set))
+        extra_dropped_df = kept_df.filter(~keep_expr).select("iid")
+        if extra_dropped_df.height > 0:
+            dropped_df = pl.concat(
+                [dropped_df, extra_dropped_df], how="vertical"
+            )
+        kept_df = kept_df.filter(keep_expr)
     keep_ids = kept_df["iid"].to_list()
     dropped = dropped_df["iid"].to_list()
 

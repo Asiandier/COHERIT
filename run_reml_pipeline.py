@@ -301,6 +301,14 @@ def parse_args():
                    help="Prediction PGEN prefix.")
     p.add_argument("--prediction-covar-txt", default=env("PREDICTION_COVAR_TXT", ""),
                    help="Prediction covariate file aligned to the prediction genotype FAM order.")
+    p.add_argument(
+        "--prediction-keep-path",
+        default=env("PREDICTION_KEEP_PATH", ""),
+        help=(
+            "Optional IID keep file selecting prediction samples from the "
+            "prediction genotype."
+        ),
+    )
     p.add_argument("--keep-path", default=env("KEEP_PATH", ""))
     p.add_argument("--keep-out", default=env("KEEP_OUT", ""))
     p.add_argument("--dropped-out", default=env("DROPPED_OUT", ""))
@@ -957,10 +965,19 @@ def main():
         for path in pred_temp_paths:
             atexit.register(cleanup_path, path)
 
+        prediction_keep_ids = None
+        if args.prediction_keep_path:
+            if not os.path.exists(args.prediction_keep_path):
+                raise SystemExit(
+                    "--prediction-keep-path does not exist: "
+                    f"{args.prediction_keep_path}"
+                )
+            prediction_keep_ids = read_keep_ids(args.prediction_keep_path)
         pred_X_np, pred_keep_ids, pred_dropped = load_covar_aligned(
             pred_fam_path,
             args.prediction_covar_txt or None,
             transform=covar_transform,
+            keep_ids=prediction_keep_ids,
         )
         logger.info("Prediction set loaded %d samples; dropped %d", len(pred_keep_ids), len(pred_dropped))
 

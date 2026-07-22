@@ -17,6 +17,7 @@ if PARENT not in sys.path:
 
 PKG = os.path.basename(REPO_ROOT)
 SPARSE = importlib.import_module(f"{PKG}.run_sparse_reml_pipeline")
+REML = importlib.import_module(f"{PKG}.reml")
 
 
 def test_sparse_dense_h2_is_invariant_to_phenotype_rescaling():
@@ -200,6 +201,25 @@ def test_reml_acceptance_requires_a_converged_accepted_iteration():
     )
     assert np.array_equal(theta, np.asarray([0.3, 0.7]))
     assert reason == "rel_dll"
+
+    stationary = SimpleNamespace(
+        var_components=np.asarray([0.3, 0.7]),
+        history=[
+            {
+                "accepted": False,
+                "returned_state_accepted": True,
+                "converged": True,
+                "stop_reason": "projected_gradient",
+            }
+        ],
+    )
+    theta, reason = SPARSE._accepted_reml_theta(
+        stationary,
+        expected_components=2,
+        stage="test",
+    )
+    assert np.array_equal(theta, np.asarray([0.3, 0.7]))
+    assert reason == "projected_gradient"
 
     for rejected in (
         SimpleNamespace(
@@ -414,6 +434,30 @@ def test_selected_span_gls_uses_independent_basis_for_duplicate_markers():
     )
 
 
+def test_selected_span_gls_recovers_covariates_with_empty_support():
+    rng = np.random.RandomState(2720)
+    n = 50
+    covar = np.ones((n, 1), dtype=np.float64)
+    y = 1.25 + rng.standard_normal(n)
+    z_active = np.empty((n, 0), dtype=np.float64)
+
+    out = SPARSE._selected_span_gls_quadratics(
+        y=y,
+        covar=covar,
+        z_active=z_active,
+        Hinv_y=y,
+        Hinv_covar=covar,
+        Hinv_z_active=z_active,
+        phenotype_scale=float(np.std(y)),
+    )
+
+    assert out["beta_cov"].shape == (1,)
+    assert out["beta_active_basis"].shape == (0,)
+    assert out["active_basis_idx"].shape == (0,)
+    assert out["q_plugin_raw"] == 0.0
+    assert out["q_df_corrected_raw"] == 0.0
+
+
 def test_selected_span_basis_expansion_rejects_invalid_positions():
     with np.testing.assert_raises(ValueError):
         SPARSE._expand_selected_basis_coefficients(
@@ -427,3 +471,67 @@ def test_selected_span_basis_expansion_rejects_invalid_positions():
             basis_positions=np.asarray([3]),
             basis_coefficients=np.asarray([0.2]),
         )
+
+
+def test_reml_backtracking_reuses_the_accepted_state_warm_anchor(
+    monkeypatch,
+):
+    """Rejected PCG states must not make the line search path-dependent."""
+    jnp = REML.jnp
+    calls = {"eval": 0, "candidate_warm_means": []}
+
+    def fake_eval_once(ctx, pvec, warm_all, **_kwargs):
+        call_idx = calls["eval"]
+        calls["eval"] += 1
+        if call_idx > 0:
+            calls["candidate_warm_means"].append(
+                float(np.asarray(warm_all).mean())
+            )
+        ll = jnp.asarray(0.0 if call_idx == 0 else -1e-3)
+        grad = jnp.asarray([5e-5, 0.0], dtype=jnp.float32)
+        warm_token = jnp.full(
+            (ctx.n, 1), 10.0 + call_idx, dtype=jnp.float32
+        )
+        return (
+            ll,
+            grad,
+            jnp.eye(2, dtype=jnp.float32),
+            0,
+            warm_token,
+            jnp.zeros((ctx.n, 2), dtype=jnp.float32),
+            jnp.ones((1,), dtype=jnp.float32),
+            jnp.ones((1,), dtype=jnp.float32),
+            jnp.asarray(0.0, dtype=jnp.float32),
+        )
+
+    monkeypatch.setattr(REML, "_eval_once", fake_eval_once)
+    monkeypatch.setattr(
+        REML,
+        "_compute_traces_from_pcg",
+        lambda _warm, _ctx: (
+            jnp.ones((1,), dtype=jnp.float32),
+            jnp.ones((1,), dtype=jnp.float32),
+        ),
+    )
+
+    theta, history = REML.fit_reml(
+        y=jnp.asarray([0.5, -0.1, 1.2, 0.3], dtype=jnp.float32),
+        K_mvs=[lambda value: value],
+        diag_list=[jnp.ones((4,), dtype=jnp.float32)],
+        covar=None,
+        n_rand_vec=2,
+        maxiter=8,
+        minq_iter=1,
+        slq_samples=2,
+        slq_m=3,
+        precond_conf=None,
+        param_init=jnp.asarray([0.5, 0.5], dtype=jnp.float32),
+        max_linesearch_trials=3,
+        scoring_step_tol=1e-4,
+        verbose=False,
+    )
+
+    assert np.allclose(np.asarray(theta), [0.5, 0.5])
+    assert history[-1]["stop_reason"] == "projected_gradient"
+    assert history[-1]["line_search_trials"] == 3
+    assert calls["candidate_warm_means"] == [10.0, 10.0, 10.0]
