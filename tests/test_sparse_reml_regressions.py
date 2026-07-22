@@ -131,6 +131,26 @@ def test_common_guard_accepts_only_two_complete_finite_branches():
     assert "nonfinite_sparse_estimator" in reasons
 
 
+def test_terminal_sparse_pair_stops_only_after_returned_full_p_kkt():
+    common = {
+        "terminal_verification": True,
+        "stable_candidate": True,
+    }
+    assert not SPARSE._terminal_sparse_pair_may_stop(
+        **common,
+        returned_covariance_kkt={"passed": False},
+    )
+    assert SPARSE._terminal_sparse_pair_may_stop(
+        **common,
+        returned_covariance_kkt={"passed": True},
+    )
+    assert not SPARSE._terminal_sparse_pair_may_stop(
+        terminal_verification=False,
+        stable_candidate=True,
+        returned_covariance_kkt={"passed": True},
+    )
+
+
 def test_coherent_sparse_fixed_point_keeps_hybrid_as_primary():
     primary, fallback, reason = SPARSE._select_primary_h2_with_fallback(
         0.31,

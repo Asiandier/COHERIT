@@ -398,21 +398,74 @@ def _affine_slq_logdet(
     cache: AffineSLQCache,
     theta_g: Array,
     theta_e: Array,
-) -> Array:
+    *,
+    return_derivatives: bool = False,
+) -> Array | tuple[Array, Array]:
     """Evaluate cached SLQ for ``theta_g K + theta_e I``.
 
     Krylov shift/scale invariance gives ``T_H = theta_g T_K + theta_e I``.
     Therefore this is the same raw-SLQ quadrature as rerunning Lanczos on H,
     up to floating-point recurrence roundoff.
+
+    When ``return_derivatives`` is true, also return the analytic derivatives
+    of this *same fixed-probe quadrature* with respect to ``(theta_g,
+    theta_e)``.  These derivatives, rather than an independent Hutchinson
+    trace, are required for a line search on the cached-SLQ objective.
     """
     scale = jnp.asarray(theta_g).reshape(())
     shift = jnp.asarray(theta_e).reshape(())
-    return _slq_tridiag_logdet_jit(
-        scale * cache.alphas_k + shift,
-        scale * cache.betas_k,
+    if not return_derivatives:
+        return _slq_tridiag_logdet_jit(
+            scale * cache.alphas_k + shift,
+            scale * cache.betas_k,
+            cache.z_norm_sq,
+            cache.nsamples_f,
+        )
+    return _affine_slq_logdet_derivatives_jit(
+        cache.alphas_k,
+        cache.betas_k,
         cache.z_norm_sq,
         cache.nsamples_f,
+        scale,
+        shift,
     )
+
+
+@jax.jit
+def _affine_slq_logdet_derivatives_jit(
+    alphas: Array,
+    betas: Array,
+    z_norm_sq: Array,
+    nsamples_f: Array,
+    scale: Array,
+    shift: Array,
+) -> tuple[Array, Array]:
+    """Return cached affine-SLQ logdet and its two exact derivatives."""
+    m = alphas.shape[0]
+    T_batch = jnp.zeros((alphas.shape[1], m, m), dtype=alphas.dtype)
+    idx = jnp.arange(m)
+    T_batch = T_batch.at[:, idx, idx].set(alphas.T)
+    if m > 1:
+        off_idx = jnp.arange(m - 1)
+        off = betas.T
+        T_batch = T_batch.at[:, off_idx + 1, off_idx].set(off)
+        T_batch = T_batch.at[:, off_idx, off_idx + 1].set(off)
+
+    evals_k, evecs_k = jnp.linalg.eigh(T_batch)
+    weights = evecs_k[:, 0, :] ** 2
+    evals_h_raw = scale * evals_k + shift
+    eval_floor = jnp.asarray(
+        max(float(jnp.finfo(alphas.dtype).eps) * float(m), 1e-6),
+        dtype=alphas.dtype,
+    )
+    evals_h = jnp.clip(evals_h_raw, eval_floor)
+    active = (evals_h_raw > eval_floor).astype(alphas.dtype)
+    factor = z_norm_sq / nsamples_f
+
+    logdet = factor * jnp.sum(weights * jnp.log(evals_h))
+    d_scale = factor * jnp.sum(weights * active * evals_k / evals_h)
+    d_shift = factor * jnp.sum(weights * active / evals_h)
+    return logdet, jnp.stack([d_scale, d_shift])
 
 
 def _slq_logdet_projected_core_residual(
@@ -738,11 +791,35 @@ def _eval_once(
     if taylor_logdet is not None:
         logdet = taylor_logdet
     elif ctx.affine_slq_cache is not None:
-        logdet = _affine_slq_logdet(
+        logdet, affine_logdet_derivatives = _affine_slq_logdet(
             ctx.affine_slq_cache,
             theta_g[0],
             theta_e[0],
+            return_derivatives=True,
         )
+        # Make the score the derivative of the same fixed-probe affine-SLQ
+        # restricted likelihood used by the strict line search.  For
+        # A=X' H^{-1} X and U=H^{-1}X,
+        #
+        #   d log|A| / d theta_i = -tr(A^{-1} U' K_i U),
+        #
+        # so d(log|H|+log|A|) is the SLQ logdet derivative minus this
+        # low-dimensional fixed-effect correction.  With no fixed effects the
+        # correction is zero.  Multi-GRM/non-affine paths retain the direct
+        # Hutchinson estimate computed above.
+        if ctx.xmat is not None and ctx.xmat.shape[1] > 0:
+            K_HinvX = _apply_genetic_stack(ctx, HinvX)[0]
+            correction_rhs = jnp.stack(
+                [HinvX.T @ K_HinvX, HinvX.T @ HinvX], axis=0
+            )
+            correction = jax.vmap(
+                lambda rhs: jnp.trace(
+                    jsp.linalg.cho_solve(chol, rhs, check_finite=False)
+                )
+            )(correction_rhs)
+        else:
+            correction = jnp.zeros((2,), dtype=pvec.dtype)
+        trace_pg_sel = affine_logdet_derivatives - correction
     elif use_residual_slq and precond_runtime is not None:
         logdet = _slq_logdet_projected_core_residual(
             Hv,
@@ -1900,9 +1977,11 @@ def fit_reml(
             if optimizer == "smile_scoring":
                 should_stop = (not math.isfinite(rel_improve)) or (max_rel_dp < scoring_step_tol)
             else:
+                # A damped/backtracked step can be arbitrarily small while
+                # the returned point is still far from a KKT point.  Only the
+                # projected score certifies first-order convergence.
                 first_order_converged = (
                     float(proj_grad_host) < scoring_step_tol
-                    or max_rel_dp < scoring_step_tol
                 )
                 should_stop = (not math.isfinite(rel_improve)) or (
                     rel_improve < rel_dll_tol and first_order_converged

@@ -871,6 +871,20 @@ def _lasso_kkt_certificate_from_scores(
     }
 
 
+def _terminal_sparse_pair_may_stop(
+    *,
+    terminal_verification: bool,
+    stable_candidate: bool,
+    returned_covariance_kkt: dict[str, float | bool],
+) -> bool:
+    """Require all terminal fixed-point and full-p KKT certificates."""
+    return bool(
+        terminal_verification
+        and stable_candidate
+        and returned_covariance_kkt.get("passed", False)
+    )
+
+
 def _four_estimator_h2_from_branches(
     *,
     q_lasso_plugin_standardized: float,
@@ -1356,6 +1370,7 @@ def main() -> None:
             n_rand_vec=args.n_rand_vec, minq_iter=args.minq_iter,
             slq_samples=args.slq_samples, slq_m=args.slq_m,
             precond_type=args.precond_type, precond_rank=plan.precond_rank,
+            reml_pcg_tol=args.pcg_tol,
             smile_scoring_step_tol=args.reml_scoring_step_tol,
             strict_max_linesearch_trials=args.reml_max_linesearch_trials,
             max_pcg_iters=args.max_pcg_iters, pcg_ridge=args.pcg_ridge,
@@ -1374,6 +1389,7 @@ def main() -> None:
             n_rand_vec=args.n_rand_vec, minq_iter=args.minq_iter,
             slq_samples=args.slq_samples, slq_m=args.slq_m,
             precond_type=args.precond_type, precond_rank=plan.precond_rank,
+            reml_pcg_tol=args.pcg_tol,
             smile_scoring_step_tol=args.reml_scoring_step_tol,
             strict_max_linesearch_trials=args.reml_max_linesearch_trials,
             max_pcg_iters=args.max_pcg_iters, pcg_ridge=args.pcg_ridge,
@@ -1482,6 +1498,97 @@ def main() -> None:
     B_screen_np = np.concatenate(screen_parts, axis=1).astype(np.float32, copy=False)
     B_screen_dev = jnp.asarray(B_screen_np, dtype=jnp.float32)
     n_screen = B_screen_np.shape[1]
+
+    def _certify_returned_lasso_pair(
+        theta_values: np.ndarray,
+        candidate_indices: np.ndarray,
+        lasso_fit: dict,
+        *,
+        stage: str,
+    ) -> tuple[dict[str, float | bool], str | None]:
+        """Certify the fitted Lasso coefficients at the supplied covariance."""
+        failed = {
+            "passed": False,
+            "tolerance": float("nan"),
+            "max_active_error": float("inf"),
+            "max_inactive_excess": float("inf"),
+        }
+        try:
+            candidate_arr = np.asarray(
+                candidate_indices, dtype=np.int64
+            ).reshape(-1)
+            beta_snp = np.asarray(
+                lasso_fit["beta_snp"], dtype=np.float64
+            ).reshape(-1)
+            if beta_snp.size != candidate_arr.size:
+                raise RuntimeError(
+                    "Final Lasso coefficient/candidate sizes do not match."
+                )
+            z_candidate = grm_index.extract_standardized_columns(
+                candidate_arr
+            ).astype(np.float32, copy=False)
+            residual = _lasso_residual(
+                y=y_np,
+                covar=covar_np,
+                geno=z_candidate,
+                beta_cov=np.asarray(
+                    lasso_fit.get("beta_cov", np.empty((0,))),
+                    dtype=np.float64,
+                ),
+                beta_snp=beta_snp,
+            )
+            theta_arr = np.asarray(
+                theta_values, dtype=np.float64
+            ).reshape(-1)
+            hv_returned = fitter._make_hv(
+                ops,
+                jnp.asarray(theta_arr[:-1], dtype=jnp.float32),
+                jnp.asarray(theta_arr[-1], dtype=jnp.float32),
+            )
+            precond_returned = fitter._make_effect_precond(
+                ops,
+                jnp.asarray(theta_arr[:-1], dtype=jnp.float32),
+                jnp.asarray(theta_arr[-1], dtype=jnp.float32),
+            )
+            sol, rel_res, iters = pcg_solve(
+                hv_returned,
+                jnp.asarray(residual[:, None], dtype=jnp.float32),
+                M=precond_returned,
+                tol=args.pcg_tol,
+                maxiter=args.max_pcg_iters,
+            )
+            _require_pcg_converged(
+                rel_res,
+                tol=args.pcg_tol,
+                iters=iters,
+                maxiter=args.max_pcg_iters,
+                stage=stage,
+            )
+            score = grm_index.xtv_all(sol[:, 0], normalize=False)
+            beta_global = np.zeros(
+                grm_index.m_total, dtype=np.float64
+            )
+            beta_global[candidate_arr] = beta_snp
+            return (
+                _lasso_kkt_certificate_from_scores(
+                    score=score,
+                    beta=beta_global,
+                    lam=float(lasso_fit["lam"]),
+                    abs_tol=float(args.kkt_tol),
+                    rel_tol=float(args.kkt_rel_tol),
+                ),
+                None,
+            )
+        except (FloatingPointError, RuntimeError, ValueError) as error:
+            return failed, str(error)
+
+    returned_covariance_kkt = {
+        "passed": False,
+        "tolerance": float("nan"),
+        "max_active_error": float("inf"),
+        "max_inactive_excess": float("inf"),
+    }
+    returned_covariance_kkt_error = None
 
     outer = 0
     while outer < int(args.outer_max) or verification_pending:
@@ -1910,14 +2017,57 @@ def main() -> None:
             and stable_rounds >= int(args.support_stable_rounds)
         )
         if terminal_verification and stable_candidate:
+            (
+                returned_covariance_kkt,
+                returned_covariance_kkt_error,
+            ) = _certify_returned_lasso_pair(
+                theta_new,
+                candidate,
+                lasso,
+                stage=(
+                    f"outer {outer} returned-covariance full-p KKT "
+                    "verification"
+                ),
+            )
+            history[-1]["returned_covariance_kkt"] = dict(
+                returned_covariance_kkt
+            )
+            history[-1]["returned_covariance_kkt_error"] = (
+                returned_covariance_kkt_error
+            )
             logger.info(
-                "[INFO] stop at outer=%s: terminal Lasso/KKT and residual-ML "
-                "verification passed at the returned covariance.",
+                "[outer %s returned covariance KKT] lambda=%.6e "
+                "tolerance=%.6e max_active_error=%.6e "
+                "max_inactive_excess=%.6e passed=%s error=%s",
+                outer,
+                float(lasso["lam"]),
+                float(returned_covariance_kkt["tolerance"]),
+                float(returned_covariance_kkt["max_active_error"]),
+                float(returned_covariance_kkt["max_inactive_excess"]),
+                bool(returned_covariance_kkt["passed"]),
+                returned_covariance_kkt_error,
+            )
+            if _terminal_sparse_pair_may_stop(
+                terminal_verification=terminal_verification,
+                stable_candidate=stable_candidate,
+                returned_covariance_kkt=returned_covariance_kkt,
+            ):
+                logger.info(
+                    "[INFO] stop at outer=%s: terminal Lasso/KKT, "
+                    "residual-ML, and returned-covariance full-p KKT "
+                    "verification passed.",
+                    outer,
+                )
+                outer_converged = True
+                outer_stop_reason = "terminal_verification_passed"
+                break
+            outer_stop_reason = "returned_covariance_kkt_failed"
+            logger.warning(
+                "[WARN] terminal returned-covariance full-p KKT failed at "
+                "outer=%s; continuing from the returned covariance.",
                 outer,
             )
-            outer_converged = True
-            outer_stop_reason = "terminal_verification_passed"
-            break
+            continue
         if terminal_verification:
             outer_stop_reason = "terminal_verification_failed"
             logger.warning(
@@ -1947,81 +2097,35 @@ def main() -> None:
     # entering that iteration and then updates the residual-ML covariance.
     # Recompute the full-p KKT scores once at the returned covariance so the
     # accepted pair is certified on the same finite-tolerance scale.
-    returned_covariance_kkt = {
-        "passed": False,
-        "tolerance": float("nan"),
-        "max_active_error": float("inf"),
-        "max_inactive_excess": float("inf"),
-    }
-    returned_covariance_kkt_error = None
     if (
         lasso_ml_outer_converged
         and bool(args.kkt_check)
         and final_lasso is not None
+        and not bool(returned_covariance_kkt["passed"])
     ):
-        try:
-            beta_snp_verify = np.asarray(
-                final_lasso["beta_snp"], dtype=np.float64
-            ).reshape(-1)
-            if beta_snp_verify.size != final_candidate.size:
-                raise RuntimeError(
-                    "Final Lasso coefficient/candidate sizes do not match."
-                )
-            z_verify = grm_index.extract_standardized_columns(
-                final_candidate
-            ).astype(np.float32, copy=False)
-            residual_verify = _lasso_residual(
-                y=y_np,
-                covar=covar_np,
-                geno=z_verify,
-                beta_cov=np.asarray(
-                    final_lasso.get("beta_cov", np.empty((0,))),
-                    dtype=np.float64,
-                ),
-                beta_snp=beta_snp_verify,
-            )
-            theta_g_verify = jnp.asarray(
-                theta_lasso_ml[:-1], dtype=jnp.float32
-            )
-            theta_e_verify = jnp.asarray(
-                theta_lasso_ml[-1], dtype=jnp.float32
-            )
-            hv_verify = fitter._make_hv(
-                ops, theta_g_verify, theta_e_verify
-            )
-            precond_verify = fitter._make_effect_precond(
-                ops, theta_g_verify, theta_e_verify
-            )
-            sol_verify, res_verify, it_verify = pcg_solve(
-                hv_verify,
-                jnp.asarray(residual_verify[:, None], dtype=jnp.float32),
-                M=precond_verify,
-                tol=args.pcg_tol,
-                maxiter=args.max_pcg_iters,
-            )
-            _require_pcg_converged(
-                res_verify,
-                tol=args.pcg_tol,
-                iters=it_verify,
-                maxiter=args.max_pcg_iters,
-                stage="returned-covariance full-p KKT verification",
-            )
-            score_verify = grm_index.xtv_all(
-                sol_verify[:, 0], normalize=False
-            )
-            beta_global_verify = np.zeros(
-                grm_index.m_total, dtype=np.float64
-            )
-            beta_global_verify[final_candidate] = beta_snp_verify
-            returned_covariance_kkt = _lasso_kkt_certificate_from_scores(
-                score=score_verify,
-                beta=beta_global_verify,
-                lam=float(final_lasso["lam"]),
-                abs_tol=float(args.kkt_tol),
-                rel_tol=float(args.kkt_rel_tol),
-            )
-        except (FloatingPointError, RuntimeError, ValueError) as error:
-            returned_covariance_kkt_error = str(error)
+        (
+            returned_covariance_kkt,
+            returned_covariance_kkt_error,
+        ) = _certify_returned_lasso_pair(
+            theta_lasso_ml,
+            final_candidate,
+            final_lasso,
+            stage="returned-covariance full-p KKT verification",
+        )
+
+    if args.verbose and final_lasso is not None:
+        logger.info(
+            "[returned covariance KKT] lambda=%.6e tolerance=%.6e "
+            "max_active_error=%.6e max_inactive_excess=%.6e passed=%s "
+            "theta_lasso_to_ml_rel=%.6e error=%s",
+            float(final_lasso["lam"]),
+            float(returned_covariance_kkt["tolerance"]),
+            float(returned_covariance_kkt["max_active_error"]),
+            float(returned_covariance_kkt["max_inactive_excess"]),
+            bool(returned_covariance_kkt["passed"]),
+            float(theta_lasso_to_lasso_ml_rel),
+            returned_covariance_kkt_error,
+        )
 
     last_round_kkt_certified = bool(
         history and history[-1].get("kkt_certified", False)

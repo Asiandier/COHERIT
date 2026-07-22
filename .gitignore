@@ -23,6 +23,7 @@ effect_estimate/
 tests/*
 !tests/test_sparse_reml_regressions.py
 !tests/test_sparse_prediction.py
+!tests/test_affine_slq_score_consistency.py
 
 # Local backup snapshot
 bolt_jax_副本 22-47-38-277/

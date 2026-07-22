@@ -349,6 +349,12 @@ def parse_args():
     )
     p.add_argument("--precond-type", choices=["projected_core"], default="projected_core")
     p.add_argument("--minq-iter", type=int, default=int(env("MINQ_ITER", "10")))
+    p.add_argument(
+        "--reml-pcg-tol",
+        type=float,
+        default=float(env("REML_PCG_TOL", "1e-3")),
+        help="PCG tolerance used consistently for every strict REML evaluation.",
+    )
     p.add_argument("--compute-effects", action="store_true",
                    default=env("COMPUTE_EFFECTS", "").strip().lower() in {"1", "true", "yes", "on"},
                    help="After variance-component estimation, compute and write fixed/random/SNP effects.")
@@ -379,6 +385,8 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.reml_pcg_tol <= 0.0:
+        raise SystemExit("--reml-pcg-tol must be > 0.")
     if args.merge:
         merge_mod = importlib.import_module(f"{pkg_name}.zscore_merge")
         merge_mod.run_from_pipeline_args(args)
@@ -724,6 +732,7 @@ def main():
             ring_depth=plan.ring_depth,
             source_build_chunk_width=planned_source_build_chunk_width,
             n_rand_vec=args.n_rand_vec, minq_iter=args.minq_iter, seed=args.seed,
+            reml_pcg_tol=args.reml_pcg_tol,
             slq_samples=args.slq_samples, slq_m=args.slq_m, slq_mode=args.slq_mode,
             precond_refresh_reldp=args.precond_refresh_reldp,
             precond_type=args.precond_type, precond_rank=precond_rank,
@@ -754,6 +763,7 @@ def main():
             ring_depth=plan.ring_depth,
             source_build_chunk_width=planned_source_build_chunk_width,
             n_rand_vec=args.n_rand_vec, minq_iter=args.minq_iter, seed=args.seed,
+            reml_pcg_tol=args.reml_pcg_tol,
             slq_samples=args.slq_samples, slq_m=args.slq_m, slq_mode=args.slq_mode,
             precond_refresh_reldp=args.precond_refresh_reldp,
             precond_type=args.precond_type, precond_rank=precond_rank,

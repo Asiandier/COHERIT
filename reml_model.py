@@ -71,6 +71,7 @@ class FitConfig:
     precond_rank: int = 500
     precond_refresh_reldp: float = 0.20
     pcg_ridge: float = 1e-6
+    reml_pcg_tol: float = 1e-3
     effect_pcg_tol: float = 1e-3
     n_reml_reps: int = 1
     ring_depth: int | None = None
@@ -1883,6 +1884,9 @@ class InfinitesimalREMLFitter:
                     self.cfg.smile_optimizer
                     if self._smile_operators else "strict"
                 ),
+                warmup_pcg_tol=self.cfg.reml_pcg_tol,
+                early_pcg_tol=self.cfg.reml_pcg_tol,
+                default_pcg_tol=self.cfg.reml_pcg_tol,
                 scoring_step_tol=self.cfg.smile_scoring_step_tol,
                 max_linesearch_trials=self.cfg.strict_max_linesearch_trials,
                 return_diagnostics=bool(self.cfg.capture_reml_diagnostics),
