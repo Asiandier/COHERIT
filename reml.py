@@ -2015,9 +2015,11 @@ def fit_reml(
             "iter": it + 1,
             "status": status,
             "accepted": accepted,
-            "returned_state_accepted": bool(
-                accepted or stationary_at_returned_state
-            ),
+            # ``accepted`` describes the candidate step.  Even when every
+            # candidate is rejected, the routine returns the previous
+            # accepted parameter vector rather than the downhill candidate.
+            # Keep that state-validity fact separate from convergence.
+            "returned_state_accepted": True,
             "converged": bool(should_stop or stationary_at_returned_state),
             "grad_norm": float(grad_norm_host),
             "proj_grad_inf": float(proj_grad_returned_host),

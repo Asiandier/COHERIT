@@ -534,9 +534,16 @@ def parse_args() -> argparse.Namespace:
             "'candidate' is retained only for screened-EBIC sensitivity analyses."
         ),
     )
-    p.add_argument("--kkt-check", action="store_true")
-    p.add_argument("--no-kkt-check", dest="kkt_check", action="store_false")
-    p.set_defaults(kkt_check=True)
+    # Full-p KKT certification is part of the sparse estimator definition.
+    # Retain the positive spelling for command-line compatibility, but do not
+    # expose the former ``--no-kkt-check`` mode: the final estimator contract
+    # can never certify a run in which this check was disabled.
+    p.add_argument(
+        "--kkt-check",
+        action="store_true",
+        default=True,
+        help="Mandatory full-marker KKT certification (always enabled).",
+    )
     p.add_argument(
         "--kkt-tol",
         type=float,
@@ -585,8 +592,16 @@ def _accepted_reml_theta(
     *,
     expected_components: int,
     stage: str,
+    allow_step_rejection: bool = False,
 ) -> tuple[np.ndarray, str]:
-    """Return a numerically accepted REML result or fail closed."""
+    """Return a valid REML state without accepting a downhill candidate.
+
+    ``fit_reml`` returns the last accepted parameter vector when all
+    line-search candidates are downhill.  For an intermediate BCD block that
+    is a legitimate no-update result, not an invalid covariance estimate.
+    ``allow_step_rejection`` controls whether that non-converged but valid
+    returned state may be used by the caller.
+    """
     theta = np.asarray(fit_result.var_components, dtype=np.float64).reshape(-1)
     history = list(fit_result.history)
     stop_reason = (
@@ -598,7 +613,8 @@ def _accepted_reml_theta(
         and np.all(theta[:-1] >= 0.0)
         and theta[-1] > 0.0
     )
-    accepted_history = bool(
+    last_history = history[-1] if history else {}
+    converged_history = bool(
         history
         and (
             (
@@ -612,10 +628,18 @@ def _accepted_reml_theta(
             )
         )
     )
-    if not valid_theta or not accepted_history:
-        last_history = history[-1] if history else {}
+    rejected_step_with_valid_return = bool(
+        history
+        and allow_step_rejection
+        and stop_reason == "ll_down"
+        and not bool(last_history.get("accepted", False))
+        and bool(last_history.get("returned_state_accepted", False))
+        and not bool(last_history.get("converged", False))
+    )
+    usable_history = bool(converged_history or rejected_step_with_valid_return)
+    if not valid_theta or not usable_history:
         raise RuntimeError(
-            f"{stage} did not return an accepted converged REML fit: "
+            f"{stage} did not return a usable REML state: "
             f"theta={theta.tolist()}, history_rows={len(history)}, "
             f"stop_reason={stop_reason!r}, "
             f"last_accepted="
@@ -624,7 +648,8 @@ def _accepted_reml_theta(
             f"{bool(last_history.get('returned_state_accepted', False))}, "
             f"proj_grad_inf={last_history.get('proj_grad_inf')}, "
             f"dll_true={last_history.get('dll_true')}, "
-            f"max_rel_dp={last_history.get('max_rel_dp')}."
+            f"max_rel_dp={last_history.get('max_rel_dp')}, "
+            f"allow_step_rejection={bool(allow_step_rejection)}."
         )
     return theta, stop_reason
 
@@ -921,34 +946,79 @@ def _four_estimator_h2_from_branches(
     }
 
 
-def _common_sparse_estimator_guard(
+def _sparse_estimator_branch_guards(
     *,
     alpha_theta_pair_certified: bool,
     lasso_quadratics_available: bool,
     selected_span_refit_ok: bool,
-    estimator_values: np.ndarray,
-) -> tuple[bool, bool, list[str]]:
-    """Apply one fail-closed acceptance rule to all four sparse estimators."""
-    values = np.asarray(estimator_values, dtype=np.float64).reshape(-1)
-    sparse_outputs_finite = bool(
-        values.size == 4 and np.all(np.isfinite(values))
+    lasso_estimator_values: np.ndarray,
+    selected_support_estimator_values: np.ndarray,
+) -> dict[str, object]:
+    """Validate the Lasso and selected-support estimator branches separately.
+
+    The selected-support REML--GLS refit is downstream of support selection,
+    but its numerical failure must not erase valid Lasso plug-in and CHIVE
+    estimates.  No ordinary-REML value is substituted into either branch.
+    """
+    lasso_values = np.asarray(
+        lasso_estimator_values, dtype=np.float64
+    ).reshape(-1)
+    selected_values = np.asarray(
+        selected_support_estimator_values, dtype=np.float64
+    ).reshape(-1)
+    lasso_outputs_finite = bool(
+        lasso_values.size == 2 and np.all(np.isfinite(lasso_values))
     )
-    reasons: list[str] = []
+    selected_outputs_finite = bool(
+        selected_values.size == 2 and np.all(np.isfinite(selected_values))
+    )
+
+    lasso_reasons: list[str] = []
     if not alpha_theta_pair_certified:
-        reasons.append("penalized_alpha_theta_pair_not_certified")
+        lasso_reasons.append("penalized_alpha_theta_pair_not_certified")
     if not lasso_quadratics_available:
-        reasons.append("lasso_quadratic_unavailable")
-    if not selected_span_refit_ok:
-        reasons.append("selected_span_reml_gls_unavailable")
-    if not sparse_outputs_finite:
-        reasons.append("nonfinite_sparse_estimator")
-    accepted = bool(
+        lasso_reasons.append("lasso_quadratic_unavailable")
+    if not lasso_outputs_finite:
+        lasso_reasons.append("nonfinite_lasso_estimator")
+
+    lasso_branch_valid = bool(
         alpha_theta_pair_certified
         and lasso_quadratics_available
-        and selected_span_refit_ok
-        and sparse_outputs_finite
+        and lasso_outputs_finite
     )
-    return accepted, sparse_outputs_finite, reasons
+
+    selected_reasons: list[str] = []
+    if not lasso_branch_valid:
+        selected_reasons.append("lasso_support_branch_not_valid")
+    if not selected_span_refit_ok:
+        selected_reasons.append("selected_support_reml_gls_unavailable")
+    if not selected_outputs_finite:
+        selected_reasons.append("nonfinite_selected_support_estimator")
+
+    selected_support_branch_valid = bool(
+        lasso_branch_valid
+        and selected_span_refit_ok
+        and selected_outputs_finite
+    )
+    all_four_valid = bool(
+        lasso_branch_valid and selected_support_branch_valid
+    )
+    combined_reasons = list(lasso_reasons) + list(selected_reasons)
+    return {
+        "lasso_branch_valid": lasso_branch_valid,
+        "lasso_outputs_finite": lasso_outputs_finite,
+        "lasso_branch_invalid_reasons": lasso_reasons,
+        "selected_support_refit_branch_valid": (
+            selected_support_branch_valid
+        ),
+        "selected_support_outputs_finite": selected_outputs_finite,
+        "selected_support_refit_branch_invalid_reasons": selected_reasons,
+        "all_four_estimators_valid": all_four_valid,
+        "all_four_outputs_finite": bool(
+            lasso_outputs_finite and selected_outputs_finite
+        ),
+        "combined_invalid_reasons": combined_reasons,
+    }
 
 
 def _primary_sparse_dense_h2(
@@ -963,22 +1033,6 @@ def _primary_sparse_dense_h2(
     """
     del h2_post_gls_diagnostic
     return float(h2_penalized_chive)
-
-
-def _select_primary_h2_with_fallback(
-    h2_sparse_dense_hybrid: float,
-    h2_covariates_only_reml: float,
-    *,
-    alpha_theta_fixed_point_coherent: bool,
-) -> tuple[float, bool, str | None]:
-    """Apply the publication safety rule for an unmatched alpha/theta iterate."""
-    if alpha_theta_fixed_point_coherent:
-        return float(h2_sparse_dense_hybrid), False, None
-    return (
-        float(h2_covariates_only_reml),
-        True,
-        "sparse_outer_not_alpha_theta_fixed_point",
-    )
 
 
 def _selected_span_gls_quadratics(
@@ -1484,7 +1538,7 @@ def main() -> None:
     final_lasso = None
     theta_lasso = theta.copy()
     n_samples = y_np.shape[0]
-    ml_updates_completed = 0
+    variance_blocks_completed = 0
     outer_converged = False
     outer_stop_reason = "outer_max"
     verification_pending = False
@@ -1931,8 +1985,11 @@ def main() -> None:
                 ml_res,
                 expected_components=n_grm + 1,
                 stage=f"outer {outer} Lasso residual-ML block",
+                allow_step_rejection=True,
             )
-            ml_updates_completed += 1
+            # A rejected downhill candidate is still a completed BCD block:
+            # the block update is the unchanged, previously accepted theta.
+            variance_blocks_completed += 1
         except (FloatingPointError, RuntimeError, ValueError) as error:
             penalized_failure_reason = str(error)
             outer_stop_reason = "residual_ml_failed"
@@ -1990,8 +2047,15 @@ def main() -> None:
             "kkt_certified": bool(certified_kkt),
             "kkt_trace": kkt_trace,
             "verification": terminal_verification,
-            "variance_update": "intercept_contrast_residual_ml",
+            "variance_update": (
+                "intercept_contrast_residual_ml_no_update"
+                if lasso_ml_stop_reason == "ll_down"
+                else "intercept_contrast_residual_ml"
+            ),
             "variance_stop_reason": lasso_ml_stop_reason,
+            "variance_step_rejected": bool(
+                lasso_ml_stop_reason == "ll_down"
+            ),
         })
 
         logger.info(
@@ -2013,7 +2077,7 @@ def main() -> None:
         final_lasso = lasso
 
         stable_candidate = bool(
-            ml_updates_completed >= 2
+            variance_blocks_completed >= 2
             and stable_rounds >= int(args.support_stable_rounds)
         )
         if terminal_verification and stable_candidate:
@@ -2191,6 +2255,7 @@ def main() -> None:
                 selected_span_reml,
                 expected_components=n_grm + 1,
                 stage="selected-span REML refit",
+                allow_step_rejection=True,
             )
             selected_span_reml_iterations = len(
                 selected_span_reml.history
@@ -2199,8 +2264,9 @@ def main() -> None:
         except (FloatingPointError, RuntimeError, ValueError) as error:
             selected_span_refit_error = str(error)
             logger.warning(
-                "[WARN] selected-span REML refit rejected; all guarded "
-                "estimators will use ordinary REML fallback: %s",
+                "[WARN] selected-support REML refit is unavailable; "
+                "estimators 3 and 4 will be null while a valid Lasso branch "
+                "remains unchanged: %s",
                 selected_span_refit_error,
             )
     else:
@@ -2502,8 +2568,8 @@ def main() -> None:
                 f"{error}"
             )
             logger.warning(
-                "[WARN] %s; all guarded estimators will use ordinary "
-                "REML fallback.",
+                "[WARN] %s; estimators 3 and 4 will be null while a valid "
+                "Lasso branch remains unchanged.",
                 selected_span_refit_error,
             )
             theta_final_sum = unavailable
@@ -2564,123 +2630,91 @@ def main() -> None:
     # Compatibility alias for historical result readers.
     h2_chive_reml = h2_chive_post_gls
 
-    four_estimator_values = np.asarray(
-        [
-            h2_lasso_plugin,
-            h2_chive,
-            h2_ss_gls_plugin,
-            h2_ss_gls_df_corrected,
-        ],
-        dtype=np.float64,
-    )
-    (
-        guarded_sparse_fit_accepted,
-        sparse_outputs_finite,
-        sparse_fit_rejection_reasons,
-    ) = _common_sparse_estimator_guard(
+    branch_guards = _sparse_estimator_branch_guards(
         alpha_theta_pair_certified=(
             alpha_theta_fixed_point_coherent
         ),
         lasso_quadratics_available=lasso_quadratics_available,
         selected_span_refit_ok=selected_span_refit_ok,
-        estimator_values=four_estimator_values,
+        lasso_estimator_values=np.asarray(
+            [h2_lasso_plugin, h2_chive], dtype=np.float64
+        ),
+        selected_support_estimator_values=np.asarray(
+            [h2_ss_gls_plugin, h2_ss_gls_df_corrected],
+            dtype=np.float64,
+        ),
     )
+    lasso_branch_valid = bool(branch_guards["lasso_branch_valid"])
+    selected_support_refit_branch_valid = bool(
+        branch_guards["selected_support_refit_branch_valid"]
+    )
+    guarded_sparse_fit_accepted = bool(
+        branch_guards["all_four_estimators_valid"]
+    )
+    sparse_outputs_finite = bool(
+        branch_guards["all_four_outputs_finite"]
+    )
+    sparse_fit_rejection_reasons = list(
+        branch_guards["combined_invalid_reasons"]
+    )
+    if not guarded_sparse_fit_accepted:
+        logger.warning(
+            "[WARN] sparse estimator branches incomplete: "
+            "lasso_valid=%s selected_support_refit_valid=%s reasons=%s. "
+            "No ordinary-REML value will replace a sparse estimator.",
+            lasso_branch_valid,
+            selected_support_refit_branch_valid,
+            ",".join(sparse_fit_rejection_reasons),
+        )
 
+    # Ordinary REML is a separate baseline, never a replacement for any of
+    # the four sparse estimators.  The legacy fallback fields remain present
+    # as explicit nulls so old readers cannot silently reinterpret a sparse
+    # estimator as ordinary REML.
     theta_primary = theta_lasso_ml.copy()
     h2_covariates_only_reml_fallback = None
     primary_fallback_reml_iterations = 0
     primary_fallback_reml_stop_reason = None
-    if not guarded_sparse_fit_accepted:
-        logger.warning(
-            "[WARN] common sparse-estimator guard rejected the fit: "
-            "reasons=%s stop=%s theta_lasso_to_lasso_ml_rel=%.3e "
-            "vc_rel_tol=%.3e. Running a covariates-only REML fallback.",
-            ",".join(sparse_fit_rejection_reasons),
-            outer_stop_reason,
-            theta_lasso_to_lasso_ml_rel,
-            float(args.vc_rel_tol),
-        )
-        fallback_init = (
-            theta_selected_span_reml
-            if selected_span_refit_ok
-            else theta_lasso_ml
-        )
-        fallback_res = fitter.fit_infinitesimal(
-            y_jax,
-            jnp.asarray(covar_np, dtype=jnp.float32) if covar_np is not None else None,
-            h2_init=_trace_weighted_h2(fallback_init),
-            var_components_init=jnp.asarray(fallback_init, dtype=jnp.float32),
-        )
-        (
-            theta_primary,
-            primary_fallback_reml_stop_reason,
-        ) = _accepted_reml_theta(
-            fallback_res,
-            expected_components=n_grm + 1,
-            stage="covariates-only REML fallback",
-        )
-        h2_covariates_only_reml_fallback = _trace_weighted_h2(theta_primary)
-        primary_fallback_reml_iterations = len(fallback_res.history)
 
     h2_sparse_dense_hybrid = _primary_sparse_dense_h2(
         h2_chive, h2_chive_post_gls
     )
-    h2, primary_fallback, primary_fallback_reason = (
-        _select_primary_h2_with_fallback(
-            h2_sparse_dense_hybrid,
-            (
-                h2_covariates_only_reml_fallback
-                if h2_covariates_only_reml_fallback is not None
-                else _trace_weighted_h2(theta_selected_span_reml)
-            ),
-            alpha_theta_fixed_point_coherent=guarded_sparse_fit_accepted,
-        )
-    )
-    if primary_fallback:
-        primary_fallback_reason = "common_sparse_estimator_guard_rejected"
-    primary_h2_method = (
-        "covariates_only_reml_fallback"
-        if primary_fallback
-        else "penalized_ml_lasso_chive"
-    )
     h2_lasso_plugin_guarded = (
-        float(h2_covariates_only_reml_fallback)
-        if primary_fallback and h2_covariates_only_reml_fallback is not None
-        else float(h2_lasso_plugin)
+        float(h2_lasso_plugin) if lasso_branch_valid else unavailable
     )
-    h2_chive_guarded = float(h2)
+    h2_chive_guarded = float(h2_chive) if lasso_branch_valid else unavailable
     h2_ss_gls_plugin_guarded = (
-        float(h2_covariates_only_reml_fallback)
-        if primary_fallback and h2_covariates_only_reml_fallback is not None
-        else float(h2_ss_gls_plugin)
+        float(h2_ss_gls_plugin)
+        if selected_support_refit_branch_valid
+        else unavailable
     )
     h2_ss_gls_df_guarded = (
-        float(h2_covariates_only_reml_fallback)
-        if primary_fallback and h2_covariates_only_reml_fallback is not None
-        else float(h2_ss_gls_df_corrected)
+        float(h2_ss_gls_df_corrected)
+        if selected_support_refit_branch_valid
+        else unavailable
+    )
+    h2 = h2_chive_guarded
+    primary_fallback = False
+    primary_fallback_reason = None
+    primary_h2_method = (
+        "penalized_ml_lasso_chive" if lasso_branch_valid else "unavailable"
     )
 
-    # The legacy ``var_components`` field remains the selected-span REML
-    # covariance on accepted sparse fits.  If the common guard fails, it
-    # switches with all guarded estimators to the validated ordinary-REML
-    # fallback rather than exposing a placeholder as a fitted refit.
-    theta = (
-        theta_selected_span_reml.copy()
-        if guarded_sparse_fit_accepted
-        else theta_primary.copy()
+    # Fix the legacy field meanings: ``var_components`` follows the primary
+    # Lasso/residual-ML branch and never switches identity according to guard
+    # status.  REML-labelled background fields refer only to the independent
+    # selected-support refit and are unavailable when that branch is invalid.
+    theta = theta_lasso_ml.copy()
+    var_components_compatibility_branch = "lasso_ml"
+    h2_background_reml = (
+        _trace_weighted_h2(theta_selected_span_reml)
+        if selected_support_refit_branch_valid
+        else unavailable
     )
-    var_components_compatibility_branch = (
-        "selected_span_reml"
-        if guarded_sparse_fit_accepted
-        else "covariates_only_reml_fallback"
-    )
-    h2_background_reml = _trace_weighted_h2(theta)
-    # Compatibility alias.  Once sparse SNPs enter the accepted fixed-effect
-    # design, this is background-only rather than total heritability.
     h2_reml = h2_background_reml
     h2_background_selected_span_reml = (
         _trace_weighted_h2(theta_selected_span_reml)
-        if selected_span_refit_ok
+        if selected_support_refit_branch_valid
         else unavailable
     )
 
@@ -2794,20 +2828,24 @@ def main() -> None:
         if not guarded_sparse_fit_accepted:
             metadata_path = write_sparse_prediction_status(
                 out_prefix=out_prefix,
-                status="not_emitted_fallback",
+                status="not_emitted_incomplete_branch",
                 metadata={
                     **prediction_request_metadata,
-                    "reason": "common_sparse_estimator_guard_rejected",
+                    "reason": "both_sparse_prediction_branches_are_required",
+                    "lasso_branch_valid": lasso_branch_valid,
+                    "selected_support_refit_branch_valid": (
+                        selected_support_refit_branch_valid
+                    ),
                     "sparse_fit_rejection_reasons": list(
                         sparse_fit_rejection_reasons
                     ),
-                    "ordinary_reml_fallback_available": True,
+                    "ordinary_reml_fallback_available": False,
                     "branch_outputs_emitted": False,
                 },
             )
             prediction_summary = {
                 "requested": True,
-                "status": "not_emitted_fallback",
+                "status": "not_emitted_incomplete_branch",
                 "metadata_path": metadata_path,
             }
         else:
@@ -3029,7 +3067,7 @@ def main() -> None:
             }
 
     summary = {
-        "sparse_output_schema_version": 2,
+        "sparse_output_schema_version": 3,
         "finished_at": datetime.now().isoformat(timespec="seconds"),
         "elapsed_sec": float(time.time() - t0),
         "n_samples": int(y_np.shape[0]),
@@ -3058,6 +3096,11 @@ def main() -> None:
             if selected_span_refit_ok
             else None
         ),
+        "var_components_selected_support_reml": (
+            theta_selected_span_reml.tolist()
+            if selected_span_refit_ok
+            else None
+        ),
         "variance_component_branch_mapping": {
             "h2_lasso_plugin": "var_components_lasso_ml",
             "h2_chive": "var_components_lasso_ml",
@@ -3068,6 +3111,9 @@ def main() -> None:
         "var_components_covariates_only_reml_fallback": (
             theta_primary.tolist() if primary_fallback else None
         ),
+        "ordinary_reml_fallback_used": False,
+        "ordinary_reml_baseline_h2": None,
+        "ordinary_reml_baseline_var_components": None,
         "var_components_at_lasso": theta_lasso.tolist(),
         "phenotype_mean": phenotype_mean,
         "phenotype_scale": phenotype_scale,
@@ -3080,6 +3126,27 @@ def main() -> None:
             primary_fallback_reml_stop_reason
         ),
         "guarded_sparse_fit_accepted": guarded_sparse_fit_accepted,
+        "guarded_sparse_fit_accepted_role": (
+            "deprecated_complete_case_alias_of_two_branch_validity_flags"
+        ),
+        "lasso_branch_valid": lasso_branch_valid,
+        "lasso_branch_invalid_reasons": list(
+            branch_guards["lasso_branch_invalid_reasons"]
+        ),
+        "lasso_outputs_finite": bool(
+            branch_guards["lasso_outputs_finite"]
+        ),
+        "selected_support_refit_branch_valid": (
+            selected_support_refit_branch_valid
+        ),
+        "selected_support_refit_branch_invalid_reasons": list(
+            branch_guards[
+                "selected_support_refit_branch_invalid_reasons"
+            ]
+        ),
+        "selected_support_outputs_finite": bool(
+            branch_guards["selected_support_outputs_finite"]
+        ),
         "sparse_outputs_finite": sparse_outputs_finite,
         "sparse_fit_rejection_reasons": sparse_fit_rejection_reasons,
         "outer_converged": lasso_ml_outer_converged,
@@ -3093,6 +3160,10 @@ def main() -> None:
         "selected_span_reml_history": selected_span_reml_history,
         "selected_span_reml_stop_reason": (
             selected_span_reml_stop_reason or None
+        ),
+        "selected_span_reml_converged": bool(
+            selected_span_reml_stop_reason
+            in {"rel_dll", "scoring_step", "projected_gradient"}
         ),
         "selected_span_refit_ok": selected_span_refit_ok,
         "selected_span_refit_error": selected_span_refit_error,
@@ -3131,7 +3202,7 @@ def main() -> None:
         "h2_reml": h2_reml,
         "h2_lasso_plugin": _finite_float_or_none(h2_lasso_plugin),
         "h2_lasso_plugin_guarded": h2_lasso_plugin_guarded,
-        "h2_lasso_plugin_role": "uncorrected_lasso_ml_diagnostic",
+        "h2_lasso_plugin_role": "estimator_1_uncorrected_lasso_ml_plugin",
         "h2_chive": _finite_float_or_none(h2_chive),
         "h2_chive_guarded": h2_chive_guarded,
         "h2_chive_penalized_lasso": _finite_float_or_none(h2_chive),
@@ -3147,7 +3218,7 @@ def main() -> None:
             h2_ss_gls_df_corrected
         ),
         "h2_ss_gls_df_guarded": h2_ss_gls_df_guarded,
-        "h2_ss_gls_role": "selected_span_reml_secondary_estimator",
+        "h2_ss_gls_role": "estimators_3_and_4_selected_support_reml_gls",
         "h2_sparse_dense_hybrid": _finite_float_or_none(
             h2_sparse_dense_hybrid
         ),

@@ -104,20 +104,21 @@ Sparse-run output semantics are deliberately explicit:
 
 - `var_components_lasso_ml` and
   `var_components_selected_span_reml` expose the two variance branches.
-  Legacy `var_components` means the selected-span REML result on an accepted
-  sparse fit and the ordinary-REML result when the common guard falls back;
-  `var_components_compatibility_branch` records which one was emitted.
+  Legacy `var_components` has the fixed meaning
+  `var_components_lasso_ml`; it never switches to the refit branch or to an
+  ordinary-REML value.  `var_components_compatibility_branch` therefore equals
+  `lasso_ml`.
 - `h2` is the primary total estimate.  At an accepted penalized-ML fixed
   point it combines the calibrated LASSO quadratic with the
   `var_components_lasso_ml` background and residual components.
 - `h2_background_reml` (legacy alias `h2_reml`) is background-only once SNPs
   enter the fixed-effect design; it is not total heritability.
 - `h2_lasso_plugin` combines the uncorrected squared penalized-LASSO score
-  with the residual-ML LASSO-branch variance components.  Its guarded
-  counterpart is `h2_lasso_plugin_guarded`; it is a shrinkage-bias baseline,
-  not a recommended default.
-- `h2_chive_guarded` is the explicitly named guarded counterpart of
-  `h2_chive` and equals the top-level primary field `h2`.
+  with the residual-ML LASSO-branch variance components.  Its validated
+  counterpart is `h2_lasso_plugin_guarded` (estimator 1).
+- `h2_chive_guarded` is the validated counterpart of `h2_chive`
+  (estimator 2) and equals the top-level `h2` field whenever the Lasso branch
+  is valid.
 - `h2_chive_post_gls` (legacy alias `h2_chive_reml`) is a same-sample
   diagnostic obtained by inserting a post-selection GLS coefficient back
   into the CHIVE formula; it is not primary.
@@ -137,11 +138,19 @@ Sparse-run output semantics are deliberately explicit:
 - Raw-scale sparse quadratic terms and standardized-phenotype REML components
   are never added directly.  The summary records both quadratic scales and the
   phenotype scale used for conversion.
-- A common guard requires the certified penalized pair, a converged
-  selected-span REML--GLS refit, and four finite estimator values.  If any
-  requirement fails, raw unavailable branch values are reported as JSON
-  `null`, while all guarded values and primary `h2` use a separately validated
-  covariates-only REML fallback with `primary_fallback=true`.
+- `lasso_branch_valid` independently validates estimators 1 and 2;
+  `selected_support_refit_branch_valid` validates estimators 3 and 4.  A
+  failed selected-support refit therefore does not erase valid Lasso/CHIVE
+  estimates.  An invalid branch has JSON `null` in its guarded fields.
+- Ordinary REML is a separate baseline and is never substituted into any of
+  the four estimator fields.  The deprecated `guarded_sparse_fit_accepted`
+  field is only the complete-case conjunction of the two branch-validity
+  flags.
+- In REML history, `accepted` refers to the current line-search candidate.
+  A terminal `ll_down` rejects that candidate and returns the most recent
+  accepted variance vector; an intermediate BCD variance block records this
+  as a no-update and continues.  `converged` remains a separate first-order
+  diagnostic.
 
 ## Research Use Cases
 

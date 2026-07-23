@@ -108,27 +108,53 @@ def test_four_estimator_h2_uses_lasso_ml_and_reml_branches():
     )
 
 
-def test_common_guard_accepts_only_two_complete_finite_branches():
-    accepted, finite, reasons = SPARSE._common_sparse_estimator_guard(
+def test_branch_guards_preserve_valid_lasso_when_refit_is_unavailable():
+    guards = SPARSE._sparse_estimator_branch_guards(
         alpha_theta_pair_certified=True,
         lasso_quadratics_available=True,
         selected_span_refit_ok=True,
-        estimator_values=np.asarray([0.2, 0.3, 0.4, -0.1]),
+        lasso_estimator_values=np.asarray([0.2, 0.3]),
+        selected_support_estimator_values=np.asarray([0.4, -0.1]),
     )
-    assert accepted is True
-    assert finite is True
-    assert reasons == []
+    assert guards["lasso_branch_valid"] is True
+    assert guards["selected_support_refit_branch_valid"] is True
+    assert guards["all_four_estimators_valid"] is True
+    assert guards["combined_invalid_reasons"] == []
 
-    accepted, finite, reasons = SPARSE._common_sparse_estimator_guard(
+    guards = SPARSE._sparse_estimator_branch_guards(
         alpha_theta_pair_certified=True,
         lasso_quadratics_available=True,
         selected_span_refit_ok=False,
-        estimator_values=np.asarray([0.2, 0.3, np.nan, np.nan]),
+        lasso_estimator_values=np.asarray([0.2, 0.3]),
+        selected_support_estimator_values=np.asarray([np.nan, np.nan]),
     )
-    assert accepted is False
-    assert finite is False
-    assert "selected_span_reml_gls_unavailable" in reasons
-    assert "nonfinite_sparse_estimator" in reasons
+    assert guards["lasso_branch_valid"] is True
+    assert guards["selected_support_refit_branch_valid"] is False
+    assert guards["all_four_estimators_valid"] is False
+    assert "selected_support_reml_gls_unavailable" in guards[
+        "selected_support_refit_branch_invalid_reasons"
+    ]
+    assert "nonfinite_selected_support_estimator" in guards[
+        "selected_support_refit_branch_invalid_reasons"
+    ]
+
+
+def test_invalid_lasso_branch_invalidates_downstream_refit_branch():
+    guards = SPARSE._sparse_estimator_branch_guards(
+        alpha_theta_pair_certified=False,
+        lasso_quadratics_available=True,
+        selected_span_refit_ok=True,
+        lasso_estimator_values=np.asarray([0.2, 0.3]),
+        selected_support_estimator_values=np.asarray([0.4, 0.5]),
+    )
+    assert guards["lasso_branch_valid"] is False
+    assert guards["selected_support_refit_branch_valid"] is False
+    assert "penalized_alpha_theta_pair_not_certified" in guards[
+        "lasso_branch_invalid_reasons"
+    ]
+    assert "lasso_support_branch_not_valid" in guards[
+        "selected_support_refit_branch_invalid_reasons"
+    ]
 
 
 def test_terminal_sparse_pair_stops_only_after_returned_full_p_kkt():
@@ -151,33 +177,15 @@ def test_terminal_sparse_pair_stops_only_after_returned_full_p_kkt():
     )
 
 
-def test_coherent_sparse_fixed_point_keeps_hybrid_as_primary():
-    primary, fallback, reason = SPARSE._select_primary_h2_with_fallback(
-        0.31,
-        0.22,
-        alpha_theta_fixed_point_coherent=True,
-    )
-    assert primary == 0.31
-    assert fallback is False
-    assert reason is None
-
-
-def test_incoherent_sparse_fixed_point_falls_back_to_standard_reml():
-    primary, fallback, reason = SPARSE._select_primary_h2_with_fallback(
-        0.31,
-        0.22,
-        alpha_theta_fixed_point_coherent=False,
-    )
-    assert primary == 0.22
-    assert fallback is True
-    assert reason == "sparse_outer_not_alpha_theta_fixed_point"
-
-
 def test_sparse_pipeline_ebic_defaults_to_full_model_space(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["gpu-reml-sparse"])
     args = SPARSE.parse_args()
     assert args.ebic_p_mode == "full"
     assert args.minq_iter == 50
+    assert args.kkt_check is True
+
+    monkeypatch.setattr(sys, "argv", ["gpu-reml-sparse", "--kkt-check"])
+    assert SPARSE.parse_args().kkt_check is True
 
     monkeypatch.setattr(
         sys,
@@ -185,6 +193,12 @@ def test_sparse_pipeline_ebic_defaults_to_full_model_space(monkeypatch):
         ["gpu-reml-sparse", "--ebic-p-mode", "candidate"],
     )
     assert SPARSE.parse_args().ebic_p_mode == "candidate"
+
+    monkeypatch.setattr(
+        sys, "argv", ["gpu-reml-sparse", "--no-kkt-check"]
+    )
+    with np.testing.assert_raises(SystemExit):
+        SPARSE.parse_args()
 
 
 def test_sparse_dense_h2_rejects_nonfinite_or_nonpositive_denominator():
@@ -204,7 +218,7 @@ def test_json_safe_value_replaces_nested_nonfinite_diagnostics():
     }
 
 
-def test_reml_acceptance_requires_a_converged_accepted_iteration():
+def test_reml_state_validation_distinguishes_convergence_from_rejected_step():
     accepted = SimpleNamespace(
         var_components=np.asarray([0.3, 0.7]),
         history=[
@@ -241,6 +255,32 @@ def test_reml_acceptance_requires_a_converged_accepted_iteration():
     assert np.array_equal(theta, np.asarray([0.3, 0.7]))
     assert reason == "projected_gradient"
 
+    rejected_step = SimpleNamespace(
+        var_components=np.asarray([0.3, 0.7]),
+        history=[
+            {
+                "accepted": False,
+                "returned_state_accepted": True,
+                "converged": False,
+                "stop_reason": "ll_down",
+            }
+        ],
+    )
+    with np.testing.assert_raises(RuntimeError):
+        SPARSE._accepted_reml_theta(
+            rejected_step,
+            expected_components=2,
+            stage="test",
+        )
+    theta, reason = SPARSE._accepted_reml_theta(
+        rejected_step,
+        expected_components=2,
+        stage="test",
+        allow_step_rejection=True,
+    )
+    assert np.array_equal(theta, np.asarray([0.3, 0.7]))
+    assert reason == "ll_down"
+
     for rejected in (
         SimpleNamespace(
             var_components=np.asarray([0.3, 0.7]),
@@ -252,15 +292,6 @@ def test_reml_acceptance_requires_a_converged_accepted_iteration():
                 {
                     "accepted": True,
                     "stop_reason": "max_iter",
-                }
-            ],
-        ),
-        SimpleNamespace(
-            var_components=np.asarray([0.3, 0.7]),
-            history=[
-                {
-                    "accepted": False,
-                    "stop_reason": "ll_down",
                 }
             ],
         ),
@@ -553,5 +584,39 @@ def test_reml_backtracking_reuses_the_accepted_state_warm_anchor(
 
     assert np.allclose(np.asarray(theta), [0.5, 0.5])
     assert history[-1]["stop_reason"] == "projected_gradient"
+    assert history[-1]["accepted"] is False
+    assert history[-1]["returned_state_accepted"] is True
+    assert history[-1]["converged"] is True
     assert history[-1]["line_search_trials"] == 3
+    assert calls["candidate_warm_means"] == [10.0, 10.0, 10.0]
+
+    # The same rejected candidates are a nonstationary ``ll_down`` when the
+    # projected-score tolerance is tighter.  The returned value must still be
+    # the old accepted theta, never the downhill candidate.
+    calls["eval"] = 0
+    calls["candidate_warm_means"] = []
+    theta, history = REML.fit_reml(
+        y=jnp.asarray([0.5, -0.1, 1.2, 0.3], dtype=jnp.float32),
+        K_mvs=[lambda value: value],
+        diag_list=[jnp.ones((4,), dtype=jnp.float32)],
+        covar=None,
+        n_rand_vec=2,
+        maxiter=8,
+        minq_iter=1,
+        slq_samples=2,
+        slq_m=3,
+        precond_conf=None,
+        param_init=jnp.asarray([0.5, 0.5], dtype=jnp.float32),
+        max_linesearch_trials=3,
+        scoring_step_tol=1e-6,
+        verbose=False,
+    )
+
+    assert np.allclose(np.asarray(theta), [0.5, 0.5])
+    assert history[-1]["stop_reason"] == "ll_down"
+    assert history[-1]["accepted"] is False
+    assert history[-1]["returned_state_accepted"] is True
+    assert history[-1]["converged"] is False
+    assert np.allclose(history[-1]["params"], [0.5, 0.5])
+    assert history[-1]["loglik"] == history[-1]["loglik_prev"]
     assert calls["candidate_warm_means"] == [10.0, 10.0, 10.0]
