@@ -98,6 +98,7 @@ write_keep_file = _common_mod.write_keep_file
 resolve_cpu_threads = _common_mod.resolve_cpu_threads
 
 LASSO_EBIC_ES_PATIENCE_FIXED = 10
+TERMINAL_KKT_CORRECTION_ROUNDS_FIXED = 1
 
 
 def _bed_count(path: str, attr: str) -> int:
@@ -486,12 +487,26 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument("--pcg-tol", type=float, default=float(env("PCG_TOL", "5e-3")))
+    p.add_argument(
+        "--kkt-pcg-tol",
+        type=float,
+        default=(
+            float(env("KKT_PCG_TOL", ""))
+            if env("KKT_PCG_TOL", "").strip()
+            else None
+        ),
+        help=(
+            "PCG tolerance used only to recheck a failed coarse KKT "
+            "certificate. By default it is the smaller of the KKT tolerance "
+            "scale and --pcg-tol/50. The ordinary outer solves keep using "
+            "--pcg-tol."
+        ),
+    )
     p.add_argument("--pcg-ridge", type=float, default=float(env("PCG_RIDGE", "1e-6")))
     p.add_argument("--max-pcg-iters", type=int, default=int(env("MAX_PCG_ITERS", "400")))
     p.add_argument("--outer-max", type=int, default=6)
     p.add_argument("--screen-topk", type=int, default=2000)
     p.add_argument("--candidate-k", type=int, default=256)
-    p.add_argument("--max-active", type=int, default=128)
     p.add_argument("--vc-rel-tol", type=float, default=1e-2)
     p.add_argument("--support-stable-rounds", type=int, default=1)
     p.add_argument("--lasso-lam-min-ratio", type=float, default=0.05)
@@ -551,7 +566,25 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         default=env("VERBOSE", "").strip().lower() in {"1", "true", "yes", "on"},
     )
-    return p.parse_args()
+    args = p.parse_args()
+    if args.kkt_pcg_tol is None:
+        positive_certificate_tolerances = [
+            value
+            for value in (
+                float(args.kkt_tol),
+                float(args.kkt_rel_tol),
+            )
+            if value > 0.0
+        ]
+        certificate_scale = (
+            min(positive_certificate_tolerances)
+            if positive_certificate_tolerances
+            else 1e-6
+        )
+        args.kkt_pcg_tol = min(
+            float(args.pcg_tol) / 50.0, certificate_scale
+        )
+    return args
 
 
 def _max_rel_change(new_v: np.ndarray, old_v: np.ndarray) -> float:
@@ -716,6 +749,18 @@ def _require_pcg_converged(
             f"tolerance={float(tol):.3e}, iterations={int(iters)}/{int(maxiter)}."
         )
     return rel
+
+
+def _true_pcg_relative_residual(hv, rhs, solution) -> float:
+    """Recompute ``||B-HX||/||B||`` instead of trusting PCG recurrence state."""
+    rhs_arr = jnp.asarray(rhs)
+    solution_arr = jnp.asarray(solution)
+    true_residual = rhs_arr - hv(solution_arr)
+    denominator = jnp.linalg.norm(rhs_arr, axis=0) + 1e-12
+    relative = jnp.max(
+        jnp.linalg.norm(true_residual, axis=0) / denominator
+    )
+    return float(np.asarray(jax.device_get(relative)))
 
 
 def _chive_q_hat_given_active(
@@ -1176,10 +1221,128 @@ def _outside_kkt_violators(
     return violators, max_outside, threshold
 
 
+def _strict_kkt_refinement_action(
+    *,
+    full_certificate_passed: bool,
+    candidate_certificate_passed: bool,
+    outside_violator_count: int,
+) -> str:
+    """Choose the only mathematically useful response to a strict scan."""
+    if bool(full_certificate_passed):
+        return "accept"
+    if not bool(candidate_certificate_passed):
+        return "rerun_path_strict"
+    if int(outside_violator_count) > 0:
+        return "expand_candidate_strict"
+    return "inconsistent_full_certificate"
+
+
+def _partitioned_lasso_kkt_from_scores(
+    *,
+    score: np.ndarray,
+    candidate: np.ndarray,
+    beta_candidate: np.ndarray,
+    lam: float,
+    abs_tol: float,
+    rel_tol: float,
+) -> dict[str, object]:
+    """Return signed full/candidate certificates and outside violations."""
+    score_arr = np.asarray(score, dtype=np.float64).reshape(-1)
+    candidate_arr = np.asarray(candidate, dtype=np.int64).reshape(-1)
+    beta_arr = np.asarray(beta_candidate, dtype=np.float64).reshape(-1)
+    lam_f = float(lam)
+    abs_tol_f = float(abs_tol)
+    rel_tol_f = float(rel_tol)
+    if (
+        not np.all(np.isfinite(score_arr))
+        or not np.all(np.isfinite(beta_arr))
+        or not np.isfinite(lam_f)
+        or lam_f < 0.0
+        or not np.isfinite(abs_tol_f)
+        or not np.isfinite(rel_tol_f)
+        or abs_tol_f < 0.0
+        or rel_tol_f < 0.0
+    ):
+        raise ValueError("Full-p KKT inputs must be finite and valid.")
+    if candidate_arr.size != beta_arr.size:
+        raise ValueError("Candidate and coefficient sizes do not match.")
+    if (
+        candidate_arr.size > 0
+        and (
+            np.any(candidate_arr < 0)
+            or np.any(candidate_arr >= score_arr.size)
+            or np.unique(candidate_arr).size != candidate_arr.size
+        )
+    ):
+        raise ValueError("Candidate indices are invalid for the score vector.")
+
+    beta_global = np.zeros(score_arr.size, dtype=np.float64)
+    beta_global[candidate_arr] = beta_arr
+    full_certificate = _lasso_kkt_certificate_from_scores(
+        score=score_arr,
+        beta=beta_global,
+        lam=lam,
+        abs_tol=abs_tol,
+        rel_tol=rel_tol,
+    )
+    candidate_certificate = _lasso_kkt_certificate_from_scores(
+        score=score_arr[candidate_arr],
+        beta=beta_arr,
+        lam=lam,
+        abs_tol=abs_tol,
+        rel_tol=rel_tol,
+    )
+    outside_violators, max_outside, threshold = _outside_kkt_violators(
+        score_abs=np.abs(score_arr),
+        candidate=candidate_arr,
+        lam=lam,
+        abs_tol=abs_tol,
+        rel_tol=rel_tol,
+    )
+    return {
+        "full_certificate": full_certificate,
+        "candidate_certificate": candidate_certificate,
+        "outside_violators": outside_violators,
+        "max_outside_score": max_outside,
+        "threshold": threshold,
+    }
+
+
+def _build_lasso_candidate(
+    *,
+    previous_support: np.ndarray,
+    screened_indices: np.ndarray,
+    candidate_target: int,
+) -> np.ndarray:
+    """Keep the complete previous support, then fill from the new screen.
+
+    ``candidate_target`` is a minimum seed size, not a cap.  In particular,
+    a valid Lasso support is never truncated merely because it is larger than
+    the initial screening target.
+    """
+    target = int(candidate_target)
+    if target <= 0:
+        raise ValueError("candidate_target must be > 0.")
+
+    keep_list: list[int] = []
+    seen: set[int] = set()
+    for value in np.asarray(previous_support, dtype=np.int64).reshape(-1):
+        index = int(value)
+        if index not in seen:
+            keep_list.append(index)
+            seen.add(index)
+    for value in np.asarray(screened_indices, dtype=np.int64).reshape(-1):
+        if len(keep_list) >= target:
+            break
+        index = int(value)
+        if index not in seen:
+            keep_list.append(index)
+            seen.add(index)
+    return np.asarray(sorted(keep_list), dtype=np.int64)
+
+
 def main() -> None:
     args = parse_args()
-    if int(args.candidate_k) < int(args.max_active):
-        raise SystemExit("candidate-k must be >= max-active.")
     if int(args.screen_topk) < int(args.candidate_k):
         raise SystemExit("screen-topk must be >= candidate-k.")
     if int(args.outer_max) < 1:
@@ -1196,8 +1359,22 @@ def main() -> None:
         raise SystemExit("kkt-max-rounds must be >= 1.")
     if int(args.kkt_add_topk) < 1:
         raise SystemExit("kkt-add-topk must be >= 1.")
-    if float(args.kkt_tol) < 0.0 or float(args.kkt_rel_tol) < 0.0:
-        raise SystemExit("kkt tolerances must be nonnegative.")
+    if (
+        not np.isfinite(float(args.kkt_tol))
+        or not np.isfinite(float(args.kkt_rel_tol))
+        or float(args.kkt_tol) < 0.0
+        or float(args.kkt_rel_tol) < 0.0
+    ):
+        raise SystemExit("kkt tolerances must be finite and nonnegative.")
+    if (
+        not np.isfinite(float(args.pcg_tol))
+        or not np.isfinite(float(args.kkt_pcg_tol))
+        or float(args.pcg_tol) <= 0.0
+        or float(args.kkt_pcg_tol) <= 0.0
+    ):
+        raise SystemExit("PCG tolerances must be finite and > 0.")
+    if float(args.kkt_pcg_tol) >= float(args.pcg_tol):
+        raise SystemExit("kkt-pcg-tol must be < pcg-tol.")
 
     logger.info("[INFO] sparse pipeline start @ %s", datetime.now().isoformat(timespec='seconds'))
     t0 = time.time()
@@ -1530,6 +1707,7 @@ def main() -> None:
     outer_converged = False
     outer_stop_reason = "outer_max"
     verification_pending = False
+    terminal_kkt_corrections_used = 0
     lasso_ml_stop_reason = ""
     penalized_failure_reason = None
 
@@ -1547,13 +1725,17 @@ def main() -> None:
         lasso_fit: dict,
         *,
         stage: str,
-    ) -> tuple[dict[str, float | bool], str | None]:
-        """Certify the fitted Lasso coefficients at the supplied covariance."""
+    ) -> tuple[dict[str, object], str | None]:
+        """Two-stage full-p KKT certificate at the supplied covariance."""
         failed = {
             "passed": False,
             "tolerance": float("nan"),
             "max_active_error": float("inf"),
             "max_inactive_excess": float("inf"),
+            "strict_recheck_triggered": False,
+            "decision_precision": "unavailable",
+            "coarse": None,
+            "strict": None,
         }
         try:
             candidate_arr = np.asarray(
@@ -1592,15 +1774,35 @@ def main() -> None:
                 jnp.asarray(theta_arr[:-1], dtype=jnp.float32),
                 jnp.asarray(theta_arr[-1], dtype=jnp.float32),
             )
+            coarse_record = {
+                "pcg_tol": float(args.pcg_tol),
+                "pcg_iters": None,
+                "pcg_reported_res": None,
+                "pcg_true_res": None,
+                "certificate": None,
+                "error": None,
+            }
+            failed["coarse"] = coarse_record
+            residual_rhs = jnp.asarray(
+                residual[:, None], dtype=jnp.float32
+            )
             sol, rel_res, iters = pcg_solve(
                 hv_returned,
-                jnp.asarray(residual[:, None], dtype=jnp.float32),
+                residual_rhs,
                 M=precond_returned,
                 tol=args.pcg_tol,
                 maxiter=args.max_pcg_iters,
             )
+            coarse_record["pcg_iters"] = int(iters)
+            coarse_record["pcg_reported_res"] = float(
+                np.asarray(rel_res)
+            )
+            coarse_true_res = _true_pcg_relative_residual(
+                hv_returned, residual_rhs, sol
+            )
+            coarse_record["pcg_true_res"] = float(coarse_true_res)
             _require_pcg_converged(
-                rel_res,
+                coarse_true_res,
                 tol=args.pcg_tol,
                 iters=iters,
                 maxiter=args.max_pcg_iters,
@@ -1611,17 +1813,92 @@ def main() -> None:
                 grm_index.m_total, dtype=np.float64
             )
             beta_global[candidate_arr] = beta_snp
-            return (
-                _lasso_kkt_certificate_from_scores(
-                    score=score,
+            coarse_certificate = _lasso_kkt_certificate_from_scores(
+                score=score,
+                beta=beta_global,
+                lam=float(lasso_fit["lam"]),
+                abs_tol=float(args.kkt_tol),
+                rel_tol=float(args.kkt_rel_tol),
+            )
+            coarse_record["certificate"] = dict(coarse_certificate)
+            if bool(coarse_certificate["passed"]):
+                return (
+                    {
+                        **coarse_certificate,
+                        "strict_recheck_triggered": False,
+                        "decision_precision": "coarse",
+                        "coarse": coarse_record,
+                        "strict": None,
+                    },
+                    None,
+                )
+
+            # A failed coarse certificate is not final.  Warm-start a stricter
+            # residual solve from the coarse solution and recompute all-marker
+            # signed scores.  The Lasso path/Gram solve itself is unchanged.
+            failed["strict_recheck_triggered"] = True
+            strict_record = {
+                "pcg_tol": float(args.kkt_pcg_tol),
+                "pcg_iters": None,
+                "pcg_reported_res": None,
+                "pcg_true_res": None,
+                "certificate": None,
+                "error": None,
+            }
+            failed["strict"] = strict_record
+            try:
+                sol_strict, rel_res_strict, iters_strict = pcg_solve(
+                    hv_returned,
+                    residual_rhs,
+                    M=precond_returned,
+                    tol=args.kkt_pcg_tol,
+                    maxiter=args.max_pcg_iters,
+                    X0=sol,
+                )
+                strict_record["pcg_iters"] = int(iters_strict)
+                strict_record["pcg_reported_res"] = float(
+                    np.asarray(rel_res_strict)
+                )
+                strict_true_res = _true_pcg_relative_residual(
+                    hv_returned, residual_rhs, sol_strict
+                )
+                strict_record["pcg_true_res"] = float(strict_true_res)
+                _require_pcg_converged(
+                    strict_true_res,
+                    tol=args.kkt_pcg_tol,
+                    iters=iters_strict,
+                    maxiter=args.max_pcg_iters,
+                    stage=f"{stage} strict PCG recheck",
+                )
+                strict_score = grm_index.xtv_all(
+                    sol_strict[:, 0], normalize=False
+                )
+                strict_certificate = _lasso_kkt_certificate_from_scores(
+                    score=strict_score,
                     beta=beta_global,
                     lam=float(lasso_fit["lam"]),
                     abs_tol=float(args.kkt_tol),
                     rel_tol=float(args.kkt_rel_tol),
-                ),
-                None,
-            )
+                )
+                strict_record["certificate"] = dict(strict_certificate)
+                return (
+                    {
+                        **strict_certificate,
+                        "strict_recheck_triggered": True,
+                        "decision_precision": "strict",
+                        "coarse": coarse_record,
+                        "strict": strict_record,
+                    },
+                    None,
+                )
+            except (FloatingPointError, RuntimeError, ValueError) as error:
+                strict_record["error"] = str(error)
+                failed["decision_precision"] = "strict_failed"
+                return failed, str(error)
         except (FloatingPointError, RuntimeError, ValueError) as error:
+            if isinstance(failed.get("coarse"), dict):
+                failed["coarse"]["error"] = str(error)
+            failed["decision_precision"] = "coarse_failed"
             return failed, str(error)
 
     returned_covariance_kkt = {
@@ -1629,6 +1906,10 @@ def main() -> None:
         "tolerance": float("nan"),
         "max_active_error": float("inf"),
         "max_inactive_excess": float("inf"),
+        "strict_recheck_triggered": False,
+        "decision_precision": "unavailable",
+        "coarse": None,
+        "strict": None,
     }
     returned_covariance_kkt_error = None
 
@@ -1688,26 +1969,13 @@ def main() -> None:
 
         candidate_seed = top_idx[:candidate_target]
 
-        # Build candidate: prioritize previous support, then new screened SNPs
-        keep_list = []
-        keep_set_cand = set()
-        for snp in support.tolist():
-            snp_i = int(snp)
-            if snp_i not in keep_set_cand:
-                keep_list.append(snp_i)
-                keep_set_cand.add(snp_i)
-                if len(keep_list) >= candidate_target:
-                    break
-        if len(keep_list) < candidate_target:
-            for snp in candidate_seed.tolist():
-                snp_i = int(snp)
-                if snp_i not in keep_set_cand:
-                    keep_list.append(snp_i)
-                    keep_set_cand.add(snp_i)
-                    if len(keep_list) >= candidate_target:
-                        break
-
-        candidate = np.asarray(sorted(keep_list), dtype=np.int64)
+        # ``candidate_target`` controls only the new screen seed.  The entire
+        # previously selected support is retained even when it is larger.
+        candidate = _build_lasso_candidate(
+            previous_support=support,
+            screened_indices=candidate_seed,
+            candidate_target=candidate_target,
+        )
 
         # ---- Step 3/4: candidate LASSO with global KKT refinement ----------
         kkt_trace: list[dict] = []
@@ -1722,15 +1990,109 @@ def main() -> None:
         penalized_block_failure = None
 
         max_kkt_rounds = int(args.kkt_max_rounds)
+        strict_kkt_locked = False
+        strict_screen_solution = None
+        strict_screen_record = None
         for kkt_round in range(1, max_kkt_rounds + 1):
-            # Z_cand PCG with dictionary warm-start.  Candidate may grow after
-            # global KKT scans, so this solve is intentionally inside the loop.
-            Z_cand = grm_index.extract_standardized_columns(candidate).astype(np.float32, copy=False)
-            B_z = jnp.asarray(Z_cand, dtype=jnp.float32)
+            strict_at_round_start = bool(strict_kkt_locked)
+            path_pcg_tol = (
+                float(args.kkt_pcg_tol)
+                if strict_at_round_start
+                else float(args.pcg_tol)
+            )
 
+            # Once a strict score confirms any KKT violation, every remaining
+            # refinement round at this theta uses one coherent strict inverse
+            # for H^{-1}[y,C,Z].  We never combine a strict residual score with
+            # a newly rebuilt coarse Gram/path.
+            if strict_at_round_start and strict_screen_solution is None:
+                strict_screen_record = {
+                    "pcg_tol": float(args.kkt_pcg_tol),
+                    "pcg_reported_res": None,
+                    "pcg_true_res": None,
+                    "pcg_iters": None,
+                    "error": None,
+                }
+                try:
+                    (
+                        strict_screen_solution,
+                        strict_screen_reported_res,
+                        strict_screen_iters,
+                    ) = pcg_solve(
+                        hv,
+                        B_screen_dev,
+                        M=precond,
+                        tol=args.kkt_pcg_tol,
+                        maxiter=args.max_pcg_iters,
+                        X0=sol_screen,
+                    )
+                    strict_screen_record["pcg_reported_res"] = float(
+                        np.asarray(strict_screen_reported_res)
+                    )
+                    strict_screen_record["pcg_iters"] = int(
+                        strict_screen_iters
+                    )
+                    strict_screen_true_res = _true_pcg_relative_residual(
+                        hv, B_screen_dev, strict_screen_solution
+                    )
+                    strict_screen_record["pcg_true_res"] = float(
+                        strict_screen_true_res
+                    )
+                    _require_pcg_converged(
+                        strict_screen_true_res,
+                        tol=args.kkt_pcg_tol,
+                        iters=strict_screen_iters,
+                        maxiter=args.max_pcg_iters,
+                        stage=(
+                            f"outer {outer} KKT round {kkt_round} "
+                            "strict Hinv[y,C] rebuild"
+                        ),
+                    )
+                except (FloatingPointError, RuntimeError, ValueError) as error:
+                    strict_screen_record["error"] = str(error)
+                    kkt_trace.append(
+                        {
+                            "round": int(kkt_round),
+                            "candidate_size": int(candidate.size),
+                            "strict_mode_locked_at_round_start": True,
+                            "decision": "strict_linear_solve_failed",
+                            "strict_screen": strict_screen_record,
+                        }
+                    )
+                    penalized_block_failure = (
+                        "Strict PCG Hinv[y,C] rebuild failed as a "
+                        f"linear-solve certification error: {error}"
+                    )
+                    break
+
+            screen_solution_for_path = (
+                strict_screen_solution
+                if strict_at_round_start
+                else sol_screen
+            )
+            Hinv_y_for_path = np.asarray(
+                screen_solution_for_path[:, 0], dtype=np.float64
+            )
+            Hinv_covar_for_path = None
+            if covar_np is not None and covar_np.shape[1] > 0:
+                Hinv_covar_for_path = np.asarray(
+                    screen_solution_for_path[:, 1:n_screen],
+                    dtype=np.float64,
+                )
+
+            # Z_cand PCG with dictionary warm-start. Candidate may grow, and
+            # after strict locking the coarse dictionary is merely X0 for the
+            # strict solve; all returned columns are then replaced by strict
+            # solutions.
+            Z_cand = grm_index.extract_standardized_columns(candidate).astype(
+                np.float32, copy=False
+            )
+            B_z = jnp.asarray(Z_cand, dtype=jnp.float32)
             x0_z = None
             if warm_z_dict:
-                x0_arr = np.zeros((n_samples, candidate.size), dtype=np.float32)
+                x0_arr = np.zeros(
+                    (n_samples, candidate.size), dtype=np.float32
+                )
                 hit = 0
                 for j, snp_idx in enumerate(candidate.tolist()):
                     snp_i = int(snp_idx)
@@ -1745,17 +2107,43 @@ def main() -> None:
                             outer, kkt_round, hit, candidate.size,
                         )
 
-            sol_z, res_all, it_all = pcg_solve(
-                hv, B_z, M=precond, tol=args.pcg_tol,
-                maxiter=args.max_pcg_iters, X0=x0_z,
-            )
-            _require_pcg_converged(
-                res_all,
-                tol=args.pcg_tol,
-                iters=it_all,
-                maxiter=args.max_pcg_iters,
-                stage=f"outer {outer} KKT round {kkt_round} candidate",
-            )
+            try:
+                sol_z, res_all, it_all = pcg_solve(
+                    hv,
+                    B_z,
+                    M=precond,
+                    tol=path_pcg_tol,
+                    maxiter=args.max_pcg_iters,
+                    X0=x0_z,
+                )
+                candidate_true_res = (
+                    _true_pcg_relative_residual(hv, B_z, sol_z)
+                    if strict_at_round_start
+                    else float(np.asarray(res_all))
+                )
+                _require_pcg_converged(
+                    candidate_true_res,
+                    tol=path_pcg_tol,
+                    iters=it_all,
+                    maxiter=args.max_pcg_iters,
+                    stage=f"outer {outer} KKT round {kkt_round} candidate",
+                )
+            except (FloatingPointError, RuntimeError, ValueError) as error:
+                kkt_trace.append(
+                    {
+                        "round": int(kkt_round),
+                        "candidate_size": int(candidate.size),
+                        "strict_mode_locked_at_round_start": strict_at_round_start,
+                        "path_pcg_tol": path_pcg_tol,
+                        "decision": "candidate_linear_solve_failed",
+                        "error": str(error),
+                    }
+                )
+                penalized_block_failure = (
+                    "Candidate Hinv[Z] PCG failed as a linear-solve "
+                    f"error: {error}"
+                )
+                break
 
             sol_z_np = np.asarray(sol_z, dtype=np.float32)
             warm_z_dict = {
@@ -1763,13 +2151,22 @@ def main() -> None:
                 for j, snp_idx in enumerate(candidate.tolist())
             }
 
-            p_for_ebic = int(candidate.size) if args.ebic_p_mode == "candidate" else grm_index.m_total
+            p_for_ebic = (
+                int(candidate.size)
+                if args.ebic_p_mode == "candidate"
+                else grm_index.m_total
+            )
             try:
                 lasso = fit_weighted_lasso_with_covariates(
-                    y=y_np, covar=covar_np, geno=Z_cand,
-                    Hinv_y=Hinv_y_np, Hinv_covar=Hinv_covar_np,
-                    Hinv_geno=sol_z_np, p_total=p_for_ebic,
-                    cfg=path_cfg, ridge=args.lasso_ridge,
+                    y=y_np,
+                    covar=covar_np,
+                    geno=Z_cand,
+                    Hinv_y=Hinv_y_for_path,
+                    Hinv_covar=Hinv_covar_for_path,
+                    Hinv_geno=sol_z_np,
+                    p_total=p_for_ebic,
+                    cfg=path_cfg,
+                    ridge=args.lasso_ridge,
                 )
             except (
                 FloatingPointError,
@@ -1778,89 +2175,342 @@ def main() -> None:
                 np.linalg.LinAlgError,
             ) as error:
                 penalized_block_failure = (
-                    "Weighted-LASSO solve failed: "
-                    f"{error}"
+                    "Weighted-LASSO solve failed: " f"{error}"
                 )
                 break
             theta_lasso = theta.copy()
 
             best_path = min(
                 lasso["path"],
-                key=lambda row: abs(float(row["lam"]) - float(lasso["lam"])),
+                key=lambda row: abs(
+                    float(row["lam"]) - float(lasso["lam"])
+                ),
             )
             if not bool(best_path.get("converged", False)):
                 penalized_block_failure = (
-                    "Selected LASSO solution did not converge; KKT optimality cannot be certified. "
-                    "Increase --lasso-cd-max-iter or loosen --lasso-cd-tol."
+                    "Selected LASSO solution did not converge; KKT "
+                    "optimality cannot be certified. Increase "
+                    "--lasso-cd-max-iter or inspect its score certificate."
                 )
                 break
 
-            active_local = np.asarray(lasso["active_idx"], dtype=np.int64)
-            if active_local.size > int(args.max_active):
-                penalized_block_failure = (
-                    "LASSO selected more active SNPs than max-active "
-                    f"({active_local.size} > {int(args.max_active)}). "
-                    "Refusing to truncate coefficients because that would violate KKT optimality; "
-                    "increase --max-active or use stronger LASSO/EBIC settings."
-                )
-                break
+            active_local = np.asarray(
+                lasso["active_idx"], dtype=np.int64
+            )
             support_new = np.sort(candidate[active_local])
-
-            beta_cov = np.asarray(lasso.get("beta_cov", np.empty((0,))), dtype=np.float64)
-            beta_snp = np.asarray(lasso["beta_snp"], dtype=np.float64)
+            beta_cov = np.asarray(
+                lasso.get("beta_cov", np.empty((0,))), dtype=np.float64
+            )
+            beta_snp = np.asarray(
+                lasso["beta_snp"], dtype=np.float64
+            )
             resid_lasso = _lasso_residual(
-                y=y_np, covar=covar_np, geno=Z_cand,
-                beta_cov=beta_cov, beta_snp=beta_snp,
+                y=y_np,
+                covar=covar_np,
+                geno=Z_cand,
+                beta_cov=beta_cov,
+                beta_snp=beta_snp,
             )
-            sol_resid, res_kkt, it_kkt = pcg_solve(
-                hv,
-                jnp.asarray(resid_lasso[:, None], dtype=jnp.float32),
-                M=precond,
-                tol=args.pcg_tol,
-                maxiter=args.max_pcg_iters,
+            residual_rhs = jnp.asarray(
+                resid_lasso[:, None], dtype=jnp.float32
             )
-            _require_pcg_converged(
-                res_kkt,
-                tol=args.pcg_tol,
-                iters=it_kkt,
-                maxiter=args.max_pcg_iters,
-                stage=f"outer {outer} KKT round {kkt_round} residual",
+            try:
+                sol_resid, res_kkt, it_kkt = pcg_solve(
+                    hv,
+                    residual_rhs,
+                    M=precond,
+                    tol=path_pcg_tol,
+                    maxiter=args.max_pcg_iters,
+                )
+                true_res_kkt = _true_pcg_relative_residual(
+                    hv, residual_rhs, sol_resid
+                )
+                _require_pcg_converged(
+                    true_res_kkt,
+                    tol=path_pcg_tol,
+                    iters=it_kkt,
+                    maxiter=args.max_pcg_iters,
+                    stage=f"outer {outer} KKT round {kkt_round} residual",
+                )
+            except (FloatingPointError, RuntimeError, ValueError) as error:
+                kkt_trace.append(
+                    {
+                        "round": int(kkt_round),
+                        "candidate_size": int(candidate.size),
+                        "support_size": int(support_new.size),
+                        "strict_mode_locked_at_round_start": strict_at_round_start,
+                        "path_pcg_tol": path_pcg_tol,
+                        "decision": "score_linear_solve_failed",
+                        "error": str(error),
+                    }
+                )
+                penalized_block_failure = (
+                    "KKT score PCG failed as a linear-solve certification "
+                    f"error: {error}"
+                )
+                break
+
+            score_signed = np.asarray(
+                grm_index.xtv_all(sol_resid[:, 0], normalize=False),
+                dtype=np.float64,
             )
-            score_kkt = np.abs(grm_index.xtv_all(sol_resid[:, 0], normalize=False))
-            violators, max_outside_score, kkt_threshold = _outside_kkt_violators(
-                score_abs=score_kkt,
+            partitioned = _partitioned_lasso_kkt_from_scores(
+                score=score_signed,
                 candidate=candidate,
+                beta_candidate=beta_snp,
                 lam=float(lasso["lam"]),
                 abs_tol=float(args.kkt_tol),
                 rel_tol=float(args.kkt_rel_tol),
             )
+            violators = np.asarray(
+                partitioned["outside_violators"], dtype=np.int64
+            )
+            max_outside_score = float(
+                partitioned["max_outside_score"]
+            )
+            kkt_threshold = float(partitioned["threshold"])
+            score_kkt_decision = np.abs(score_signed)
+            current_record = {
+                "pcg_tol": path_pcg_tol,
+                "pcg_reported_res": float(np.asarray(res_kkt)),
+                "pcg_true_res": float(true_res_kkt),
+                "pcg_iters": int(it_kkt),
+                "threshold": kkt_threshold,
+                "max_outside_score": max_outside_score,
+                "n_outside_violators": int(violators.size),
+                "candidate_certificate": dict(
+                    partitioned["candidate_certificate"]
+                ),
+                "full_certificate": dict(
+                    partitioned["full_certificate"]
+                ),
+                "error": None,
+            }
+
+            coarse_record = None
+            strict_record = None
+            strict_recheck_triggered = False
+            if strict_at_round_start:
+                strict_record = current_record
+                decision_precision = "strict_locked"
+            else:
+                coarse_record = current_record
+                decision_precision = "coarse"
+
+            # The first-stage decision is the signed full-p certificate, not
+            # merely the outside-candidate scan.  A discrepancy on an active
+            # or candidate-inactive coordinate also triggers the strict
+            # recheck because the direct residual solve and the Gram solve are
+            # independent finite-tolerance PCG calculations.
+            coarse_full_passed = bool(
+                partitioned["full_certificate"]["passed"]
+            )
+            if not strict_at_round_start and coarse_full_passed:
+                action = "accept"
+            elif not strict_at_round_start:
+                strict_recheck_triggered = True
+                strict_kkt_locked = True
+                strict_record = {
+                    "pcg_tol": float(args.kkt_pcg_tol),
+                    "pcg_reported_res": None,
+                    "pcg_true_res": None,
+                    "pcg_iters": None,
+                    "threshold": None,
+                    "max_outside_score": None,
+                    "n_outside_violators": None,
+                    "candidate_certificate": None,
+                    "full_certificate": None,
+                    "error": None,
+                }
+                try:
+                    (
+                        sol_resid_strict,
+                        res_kkt_strict,
+                        it_kkt_strict,
+                    ) = pcg_solve(
+                        hv,
+                        residual_rhs,
+                        M=precond,
+                        tol=args.kkt_pcg_tol,
+                        maxiter=args.max_pcg_iters,
+                        X0=sol_resid,
+                    )
+                    strict_record["pcg_reported_res"] = float(
+                        np.asarray(res_kkt_strict)
+                    )
+                    strict_record["pcg_iters"] = int(it_kkt_strict)
+                    strict_true_res = _true_pcg_relative_residual(
+                        hv, residual_rhs, sol_resid_strict
+                    )
+                    strict_record["pcg_true_res"] = float(strict_true_res)
+                    _require_pcg_converged(
+                        strict_true_res,
+                        tol=args.kkt_pcg_tol,
+                        iters=it_kkt_strict,
+                        maxiter=args.max_pcg_iters,
+                        stage=(
+                            f"outer {outer} KKT round {kkt_round} "
+                            "strict residual recheck"
+                        ),
+                    )
+                    strict_score_signed = np.asarray(
+                        grm_index.xtv_all(
+                            sol_resid_strict[:, 0], normalize=False
+                        ),
+                        dtype=np.float64,
+                    )
+                    partitioned = _partitioned_lasso_kkt_from_scores(
+                        score=strict_score_signed,
+                        candidate=candidate,
+                        beta_candidate=beta_snp,
+                        lam=float(lasso["lam"]),
+                        abs_tol=float(args.kkt_tol),
+                        rel_tol=float(args.kkt_rel_tol),
+                    )
+                    violators = np.asarray(
+                        partitioned["outside_violators"],
+                        dtype=np.int64,
+                    )
+                    max_outside_score = float(
+                        partitioned["max_outside_score"]
+                    )
+                    kkt_threshold = float(partitioned["threshold"])
+                    score_kkt_decision = np.abs(strict_score_signed)
+                    strict_record.update(
+                        {
+                            "threshold": kkt_threshold,
+                            "max_outside_score": max_outside_score,
+                            "n_outside_violators": int(violators.size),
+                            "candidate_certificate": dict(
+                                partitioned["candidate_certificate"]
+                            ),
+                            "full_certificate": dict(
+                                partitioned["full_certificate"]
+                            ),
+                        }
+                    )
+                    decision_precision = "strict_recheck"
+                except (FloatingPointError, RuntimeError, ValueError) as error:
+                    strict_record["error"] = str(error)
+                    kkt_trace.append(
+                        {
+                            "round": int(kkt_round),
+                            "candidate_size": int(candidate.size),
+                            "support_size": int(support_new.size),
+                            "lambda": float(lasso["lam"]),
+                            "strict_mode_locked_at_round_start": False,
+                            "strict_recheck_triggered": True,
+                            "decision_precision": "strict_failed",
+                            "decision": "strict_linear_solve_failed",
+                            "path_pcg_tol": path_pcg_tol,
+                            "coarse": coarse_record,
+                            "strict": strict_record,
+                        }
+                    )
+                    penalized_block_failure = (
+                        "Strict PCG KKT recheck failed as a linear-solve "
+                        f"certification error: {error}"
+                    )
+                    break
+                action = _strict_kkt_refinement_action(
+                    full_certificate_passed=bool(
+                        partitioned["full_certificate"]["passed"]
+                    ),
+                    candidate_certificate_passed=bool(
+                        partitioned["candidate_certificate"]["passed"]
+                    ),
+                    outside_violator_count=int(violators.size),
+                )
+            else:
+                action = _strict_kkt_refinement_action(
+                    full_certificate_passed=bool(
+                        partitioned["full_certificate"]["passed"]
+                    ),
+                    candidate_certificate_passed=bool(
+                        partitioned["candidate_certificate"]["passed"]
+                    ),
+                    outside_violator_count=int(violators.size),
+                )
+                if action == "rerun_path_strict":
+                    # The path was already rebuilt from strict H^{-1}[y,C,Z]
+                    # at this theta.  Repeating the identical strict solve
+                    # cannot repair a remaining disagreement between its Gram
+                    # equations and an independent strict residual solve.
+                    action = "strict_candidate_inconsistency"
 
             n_viol = int(violators.size)
-            kkt_trace.append({
-                "round": int(kkt_round),
-                "candidate_size": int(candidate.size),
-                "support_size": int(support_new.size),
-                "lambda": float(lasso["lam"]),
-                "threshold": float(kkt_threshold),
-                "max_outside_score": float(max_outside_score),
-                "n_violators": n_viol,
-                "pcg_kkt_iters": int(it_kkt),
-                "pcg_kkt_res": float(np.asarray(res_kkt)),
-            })
+            kkt_trace.append(
+                {
+                    "round": int(kkt_round),
+                    "candidate_size": int(candidate.size),
+                    "support_size": int(support_new.size),
+                    "lambda": float(lasso["lam"]),
+                    "threshold": float(kkt_threshold),
+                    "max_outside_score": float(max_outside_score),
+                    "n_violators": n_viol,
+                    "strict_mode_locked_at_round_start": strict_at_round_start,
+                    "strict_mode_locked_after_round": bool(strict_kkt_locked),
+                    "strict_recheck_triggered": strict_recheck_triggered,
+                    "decision_precision": decision_precision,
+                    "decision": action,
+                    "path_pcg_tol": path_pcg_tol,
+                    "candidate_pcg_reported_res": float(
+                        np.asarray(res_all)
+                    ),
+                    "candidate_pcg_true_res": float(candidate_true_res),
+                    "candidate_pcg_iters": int(it_all),
+                    "strict_screen": strict_screen_record,
+                    "coarse": coarse_record,
+                    "strict": strict_record,
+                }
+            )
             logger.info(
                 "[outer %s kkt %s] cand=%s active=%s lam=%.3e "
-                "max_outside=%.3e threshold=%.3e violators=%s",
-                outer, kkt_round, int(candidate.size), int(support_new.size),
-                float(lasso["lam"]), max_outside_score, kkt_threshold, n_viol,
+                "max_outside=%.3e threshold=%.3e violators=%s "
+                "precision=%s decision=%s strict_locked=%s",
+                outer,
+                kkt_round,
+                int(candidate.size),
+                int(support_new.size),
+                float(lasso["lam"]),
+                max_outside_score,
+                kkt_threshold,
+                n_viol,
+                decision_precision,
+                action,
+                strict_kkt_locked,
             )
 
-            if n_viol == 0:
+            if action == "accept":
                 certified_kkt = True
                 break
+            if action == "strict_candidate_inconsistency":
+                penalized_block_failure = (
+                    "Strict PCG Lasso path and strict direct residual score "
+                    "disagree on a candidate coordinate; global KKT cannot "
+                    "be certified at the requested tolerance."
+                )
+                break
+            if action == "inconsistent_full_certificate":
+                penalized_block_failure = (
+                    "The strict full-p KKT certificate failed without an "
+                    "identified candidate-coordinate or outside-coordinate "
+                    "violation; numerical certification is inconsistent."
+                )
+                break
+            if action == "rerun_path_strict":
+                # The strict score disagrees on a coordinate already present
+                # in the candidate. Candidate expansion cannot repair that;
+                # the next round rebuilds the complete strict Gram/path.
+                continue
 
             n_add = min(int(args.kkt_add_topk), n_viol)
-            add_idx = violators[np.argsort(score_kkt[violators])[-n_add:]]
-            candidate = np.unique(np.concatenate([candidate, add_idx])).astype(np.int64)
+            add_idx = violators[
+                np.argsort(score_kkt_decision[violators])[-n_add:]
+            ]
+            candidate = np.unique(
+                np.concatenate([candidate, add_idx])
+            ).astype(np.int64)
             candidate.sort()
 
             max_candidate = int(args.kkt_max_candidate)
@@ -2077,13 +2727,16 @@ def main() -> None:
             logger.info(
                 "[outer %s returned covariance KKT] lambda=%.6e "
                 "tolerance=%.6e max_active_error=%.6e "
-                "max_inactive_excess=%.6e passed=%s error=%s",
+                "max_inactive_excess=%.6e passed=%s "
+                "precision=%s strict_recheck=%s error=%s",
                 outer,
                 float(lasso["lam"]),
                 float(returned_covariance_kkt["tolerance"]),
                 float(returned_covariance_kkt["max_active_error"]),
                 float(returned_covariance_kkt["max_inactive_excess"]),
                 bool(returned_covariance_kkt["passed"]),
+                returned_covariance_kkt["decision_precision"],
+                bool(returned_covariance_kkt["strict_recheck_triggered"]),
                 returned_covariance_kkt_error,
             )
             if _terminal_sparse_pair_may_stop(
@@ -2101,11 +2754,33 @@ def main() -> None:
                 outer_stop_reason = "terminal_verification_passed"
                 break
             outer_stop_reason = "returned_covariance_kkt_failed"
-            logger.warning(
-                "[WARN] terminal returned-covariance full-p KKT failed at "
-                "outer=%s; continuing from the returned covariance.",
-                outer,
-            )
+            if (
+                terminal_kkt_corrections_used
+                < TERMINAL_KKT_CORRECTION_ROUNDS_FIXED
+            ):
+                terminal_kkt_corrections_used += 1
+                verification_pending = True
+                history[-1]["terminal_kkt_correction_scheduled"] = True
+                history[-1]["terminal_kkt_correction_index"] = int(
+                    terminal_kkt_corrections_used
+                )
+                logger.warning(
+                    "[WARN] terminal returned-covariance full-p KKT failed "
+                    "at outer=%s; scheduling bounded correction round %s/%s "
+                    "from the returned covariance.",
+                    outer,
+                    terminal_kkt_corrections_used,
+                    TERMINAL_KKT_CORRECTION_ROUNDS_FIXED,
+                )
+            else:
+                history[-1]["terminal_kkt_correction_scheduled"] = False
+                logger.warning(
+                    "[WARN] terminal returned-covariance full-p KKT failed "
+                    "at outer=%s and the bounded correction budget is "
+                    "exhausted; continuing only if the ordinary outer budget "
+                    "remains.",
+                    outer,
+                )
             continue
         if terminal_verification:
             outer_stop_reason = "terminal_verification_failed"
@@ -2155,12 +2830,15 @@ def main() -> None:
         logger.info(
             "[returned covariance KKT] lambda=%.6e tolerance=%.6e "
             "max_active_error=%.6e max_inactive_excess=%.6e passed=%s "
-            "theta_lasso_to_ml_rel=%.6e error=%s",
+            "precision=%s strict_recheck=%s theta_lasso_to_ml_rel=%.6e "
+            "error=%s",
             float(final_lasso["lam"]),
             float(returned_covariance_kkt["tolerance"]),
             float(returned_covariance_kkt["max_active_error"]),
             float(returned_covariance_kkt["max_inactive_excess"]),
             bool(returned_covariance_kkt["passed"]),
+            returned_covariance_kkt["decision_precision"],
+            bool(returned_covariance_kkt["strict_recheck_triggered"]),
             float(theta_lasso_to_lasso_ml_rel),
             returned_covariance_kkt_error,
         )
@@ -2700,18 +3378,11 @@ def main() -> None:
         if selected_span_refit_ok
         else []
     )
-    returned_covariance_kkt_summary = {
-        "passed": bool(returned_covariance_kkt["passed"]),
-        "tolerance": _finite_float_or_none(
-            float(returned_covariance_kkt["tolerance"])
-        ),
-        "max_active_error": _finite_float_or_none(
-            float(returned_covariance_kkt["max_active_error"])
-        ),
-        "max_inactive_excess": _finite_float_or_none(
-            float(returned_covariance_kkt["max_inactive_excess"])
-        ),
-    }
+    # Preserve both PCG stages in the machine-readable summary.  Non-finite
+    # placeholders from an unavailable/failed certificate become JSON null.
+    returned_covariance_kkt_summary = _json_safe_value(
+        returned_covariance_kkt
+    )
 
     prediction_summary = {
         "requested": bool(prediction_active),

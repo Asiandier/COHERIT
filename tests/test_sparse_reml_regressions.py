@@ -199,6 +199,170 @@ def test_sparse_pipeline_ebic_defaults_to_full_model_space(monkeypatch):
         SPARSE.parse_args()
 
 
+def test_sparse_pipeline_has_no_max_active_cap(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["gpu-reml-sparse"])
+    args = SPARSE.parse_args()
+    assert not hasattr(args, "max_active")
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["gpu-reml-sparse", "--max-active", "128"],
+    )
+    with np.testing.assert_raises(SystemExit):
+        SPARSE.parse_args()
+
+
+def test_lasso_candidate_keeps_complete_previous_support_above_seed_target():
+    candidate = SPARSE._build_lasso_candidate(
+        previous_support=np.asarray([9, 2, 7, 2]),
+        screened_indices=np.asarray([7, 1, 3, 4]),
+        candidate_target=2,
+    )
+    np.testing.assert_array_equal(candidate, np.asarray([2, 7, 9]))
+
+    filled = SPARSE._build_lasso_candidate(
+        previous_support=np.asarray([9, 2, 7, 2]),
+        screened_indices=np.asarray([7, 1, 3, 4]),
+        candidate_target=5,
+    )
+    np.testing.assert_array_equal(filled, np.asarray([1, 2, 3, 7, 9]))
+
+
+def test_partitioned_signed_kkt_distinguishes_candidate_and_outside_failures():
+    signed_pass = SPARSE._partitioned_lasso_kkt_from_scores(
+        score=np.asarray([0.5, -0.5, 0.49]),
+        candidate=np.asarray([0, 1]),
+        beta_candidate=np.asarray([0.2, -0.1]),
+        lam=0.5,
+        abs_tol=1e-8,
+        rel_tol=0.0,
+    )
+    assert signed_pass["candidate_certificate"]["passed"] is True
+    assert signed_pass["full_certificate"]["passed"] is True
+    assert signed_pass["outside_violators"].size == 0
+
+    inside_failure = SPARSE._partitioned_lasso_kkt_from_scores(
+        score=np.asarray([0.45, 0.49, 0.49]),
+        candidate=np.asarray([0, 1]),
+        beta_candidate=np.asarray([0.2, 0.0]),
+        lam=0.5,
+        abs_tol=1e-8,
+        rel_tol=0.0,
+    )
+    assert inside_failure["candidate_certificate"]["passed"] is False
+    assert inside_failure["full_certificate"]["passed"] is False
+    assert inside_failure["outside_violators"].size == 0
+
+    outside_failure = SPARSE._partitioned_lasso_kkt_from_scores(
+        score=np.asarray([0.5, 0.49, -0.51]),
+        candidate=np.asarray([0, 1]),
+        beta_candidate=np.asarray([0.2, 0.0]),
+        lam=0.5,
+        abs_tol=1e-8,
+        rel_tol=0.0,
+    )
+    assert outside_failure["candidate_certificate"]["passed"] is True
+    assert outside_failure["full_certificate"]["passed"] is False
+    np.testing.assert_array_equal(
+        outside_failure["outside_violators"], np.asarray([2])
+    )
+
+
+def test_strict_kkt_action_separates_refit_expand_and_accept():
+    assert SPARSE._strict_kkt_refinement_action(
+        full_certificate_passed=False,
+        candidate_certificate_passed=False,
+        outside_violator_count=3,
+    ) == "rerun_path_strict"
+    assert SPARSE._strict_kkt_refinement_action(
+        full_certificate_passed=False,
+        candidate_certificate_passed=True,
+        outside_violator_count=3,
+    ) == "expand_candidate_strict"
+    assert SPARSE._strict_kkt_refinement_action(
+        full_certificate_passed=True,
+        candidate_certificate_passed=True,
+        outside_violator_count=0,
+    ) == "accept"
+    assert SPARSE._strict_kkt_refinement_action(
+        full_certificate_passed=False,
+        candidate_certificate_passed=True,
+        outside_violator_count=0,
+    ) == "inconsistent_full_certificate"
+
+
+def test_partitioned_kkt_rejects_nonfinite_outside_score_with_empty_support():
+    with np.testing.assert_raises_regex(
+        ValueError, "Full-p KKT inputs must be finite"
+    ):
+        SPARSE._partitioned_lasso_kkt_from_scores(
+            score=np.asarray([np.nan]),
+            candidate=np.empty((0,), dtype=np.int64),
+            beta_candidate=np.empty((0,), dtype=np.float64),
+            lam=0.5,
+            abs_tol=1e-8,
+            rel_tol=0.0,
+        )
+
+
+def test_default_kkt_pcg_tolerance_is_dynamic_and_stricter(monkeypatch):
+    monkeypatch.delenv("PCG_TOL", raising=False)
+    monkeypatch.delenv("KKT_PCG_TOL", raising=False)
+
+    monkeypatch.setattr(sys, "argv", ["gpu-reml-sparse"])
+    default_args = SPARSE.parse_args()
+    assert np.isclose(default_args.kkt_pcg_tol, 1e-4)
+    assert default_args.kkt_pcg_tol < default_args.pcg_tol
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["gpu-reml-sparse", "--pcg-tol", "1e-3"],
+    )
+    tighter_coarse = SPARSE.parse_args()
+    assert np.isclose(tighter_coarse.kkt_pcg_tol, 2e-5)
+    assert tighter_coarse.kkt_pcg_tol < tighter_coarse.pcg_tol
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "gpu-reml-sparse",
+            "--kkt-tol",
+            "1e-6",
+            "--kkt-rel-tol",
+            "1e-6",
+        ],
+    )
+    tighter_certificate = SPARSE.parse_args()
+    assert np.isclose(tighter_certificate.kkt_pcg_tol, 1e-6)
+
+
+def test_true_pcg_relative_residual_recomputes_from_linear_system():
+    matrix = SPARSE.jnp.asarray(
+        [[2.0, 0.0], [0.0, 4.0]], dtype=SPARSE.jnp.float32
+    )
+    rhs = SPARSE.jnp.asarray(
+        [[2.0, 1.0], [4.0, -2.0]], dtype=SPARSE.jnp.float32
+    )
+    exact = SPARSE.jnp.asarray(
+        [[1.0, 0.5], [1.0, -0.5]], dtype=SPARSE.jnp.float32
+    )
+    hv = lambda value: matrix @ value
+
+    assert SPARSE._true_pcg_relative_residual(hv, rhs, exact) == 0.0
+
+    perturbed = exact.at[0, 0].add(0.1)
+    observed = SPARSE._true_pcg_relative_residual(hv, rhs, perturbed)
+    rhs_np = np.asarray(rhs)
+    perturbed_np = np.asarray(perturbed)
+    expected = np.max(
+        np.linalg.norm(rhs_np - np.asarray(matrix) @ perturbed_np, axis=0)
+        / (np.linalg.norm(rhs_np, axis=0) + 1e-12)
+    )
+    assert np.isclose(observed, expected)
+
 def test_sparse_dense_h2_rejects_nonfinite_or_nonpositive_denominator():
     assert np.isnan(SPARSE._sparse_dense_h2(np.nan, 0.2, 0.8))
     assert np.isnan(SPARSE._sparse_dense_h2(-1.0, 0.2, 0.8))

@@ -92,18 +92,25 @@ to the intercept.  In the full sample space this is implemented by supplying
 an intercept to the REML routine; it prevents the zero-energy constant mode of
 a centered GRM from spuriously driving residual variance to its lower bound.
 Within each candidate problem, coordinate descent is accepted solely when the
-active and inactive score-KKT conditions pass; coefficient change is only an
-active-set scheduling heuristic.  Every evaluated lambda on the EBIC path
-must pass that certificate.  An unsolved path point is reported as a numerical
-failure rather than being skipped in favor of the lambda-max empty model.
+active and inactive score-KKT conditions pass at the configured numerical
+tolerance; coefficient change is only an active-set scheduling heuristic.
+Every evaluated lambda on the EBIC path must pass that finite-tolerance
+certificate.  An unsolved path point is reported as a numerical failure rather
+than being skipped in favor of the lambda-max empty model.
 This produces the penalized-ML branch `(alpha_L, theta_L)`.  A preliminary
 support/variance match schedules one complete terminal LASSO/KKT plus
-residual-ML round, and the returned covariance receives a signed,
-all-marker KKT check.  Only then is the selected span frozen and one separate
-REML--GLS refit used to produce `(zeta_R, theta_R)`; that refit is not fed back
-into the LASSO.  When EBIC is recomputed at every covariance update, the outer
-map is adaptive and is not a monotone optimization of one fixed-lambda
-objective.  The default EBIC penalty uses the full eligible marker count.
+residual-ML round, and the returned covariance receives a signed, all-marker
+KKT check.  Full-marker checks use two PCG stages: ordinary outer iterations
+retain the default PCG tolerance, while a failed coarse KKT check is recomputed
+from a warm-started stricter PCG solve.  A strict pass is accepted without
+candidate expansion.  A strict candidate-coordinate violation rebuilds the
+Gram system and EBIC path at strict precision; a strict outside-candidate
+violation expands the candidate set before that rebuild.  Only then is the
+selected span frozen and one separate REML--GLS refit used to produce
+`(zeta_R, theta_R)`; that refit is not fed back into the LASSO.  When EBIC is
+recomputed at every covariance update, the outer map is adaptive and is not a
+monotone optimization of one fixed-lambda objective.  The default EBIC penalty
+uses the full eligible marker count.
 
 Sparse-run output semantics are deliberately explicit:
 
@@ -473,6 +480,15 @@ fit lifecycle.
 - `GPU_REML_MATMUL_PRECISION`: JAX matmul precision policy. The robust default
   is `highest`; an alternative should be used only after validating numerical
   agreement on the target GPU.
+- `--pcg-tol`: ordinary PCG tolerance used by screening, candidate construction,
+  and outer iterations; the default is `5e-3`.
+- `--kkt-pcg-tol`: PCG tolerance used only after a coarse full-marker or
+  returned-covariance KKT check fails.  By default it is the smaller of
+  `--pcg-tol/50` and the positive KKT tolerance scale, which is `1e-4` under
+  the defaults.
+- `--kkt-tol` and `--kkt-rel-tol`: absolute and lambda-scaled tolerances for
+  the signed score-KKT conditions.  They define the numerical certificate and
+  are distinct from the linear-system residual tolerance.
 
 The startup report labels the pinned streaming ring as `Host memory plan (CPU
 RAM, not GPU VRAM)`. A line such as `streaming_ring=35.4GiB` therefore describes
@@ -492,6 +508,11 @@ python -m pip wheel --no-deps --no-build-isolation \
 
 - REML likelihood terms use randomized approximations; results can vary with
   seed and SLQ/Hutchinson settings.
+- A PCG residual tolerance does not itself give an analytic coordinatewise
+  bound on KKT-score error.  Reported KKT status is a finite-tolerance
+  numerical certificate, not a proof of exact optimality.  Under the
+  two-stage policy, a coarse full-marker KKT pass does not trigger a strict
+  PCG recheck; strict PCG is used to adjudicate coarse failures.
 - The package currently focuses on continuous traits.
 - GPU performance depends on JAX/CUDA versions, PCIe bandwidth, call width,
   sample size, SNP count, and component count.
