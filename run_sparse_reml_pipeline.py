@@ -21,6 +21,7 @@ import logging
 import os
 import sys
 import time
+from dataclasses import replace
 from datetime import datetime
 
 repo_root = os.path.dirname(os.path.abspath(__file__))
@@ -497,9 +498,9 @@ def parse_args() -> argparse.Namespace:
         ),
         help=(
             "PCG tolerance used only to recheck a failed coarse KKT "
-            "certificate. By default it is the smaller of the KKT tolerance "
-            "scale and --pcg-tol/50. The ordinary outer solves keep using "
-            "--pcg-tol."
+            "certificate. By default it is the smaller of one tenth of the "
+            "KKT tolerance scale and --pcg-tol/500. The ordinary outer "
+            "solves keep using --pcg-tol."
         ),
     )
     p.add_argument("--pcg-ridge", type=float, default=float(env("PCG_RIDGE", "1e-6")))
@@ -582,7 +583,8 @@ def parse_args() -> argparse.Namespace:
             else 1e-6
         )
         args.kkt_pcg_tol = min(
-            float(args.pcg_tol) / 50.0, certificate_scale
+            float(args.pcg_tol) / 500.0,
+            certificate_scale / 10.0,
         )
     return args
 
@@ -1237,6 +1239,17 @@ def _strict_kkt_refinement_action(
     return "inconsistent_full_certificate"
 
 
+def _strict_lasso_path_config(
+    path_cfg: LassoPathConfig,
+) -> LassoPathConfig:
+    """Copy a path configuration with tighter strict-stage KKT tolerances."""
+    return replace(
+        path_cfg,
+        kkt_abs_tol=float(path_cfg.kkt_abs_tol) / 4.0,
+        kkt_rel_tol=float(path_cfg.kkt_rel_tol) / 4.0,
+    )
+
+
 def _partitioned_lasso_kkt_from_scores(
     *,
     score: np.ndarray,
@@ -1691,6 +1704,7 @@ def main() -> None:
         kkt_abs_tol=args.kkt_tol, kkt_rel_tol=args.kkt_rel_tol,
         verbose=args.verbose,
     )
+    strict_path_cfg = _strict_lasso_path_config(path_cfg)
 
     support = np.array([], dtype=np.int64)
     stable_rounds = 0
@@ -2165,7 +2179,7 @@ def main() -> None:
                     Hinv_covar=Hinv_covar_for_path,
                     Hinv_geno=sol_z_np,
                     p_total=p_for_ebic,
-                    cfg=path_cfg,
+                    cfg=(strict_path_cfg if strict_at_round_start else path_cfg),
                     ridge=args.lasso_ridge,
                 )
             except (

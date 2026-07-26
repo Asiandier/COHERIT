@@ -484,8 +484,10 @@ fit lifecycle.
   and outer iterations; the default is `5e-3`.
 - `--kkt-pcg-tol`: PCG tolerance used only after a coarse full-marker or
   returned-covariance KKT check fails.  By default it is the smaller of
-  `--pcg-tol/50` and the positive KKT tolerance scale, which is `1e-4` under
-  the defaults.
+  `--pcg-tol/500` and one tenth of the positive KKT tolerance scale, which is
+  `1e-5` under the defaults.  A strict-path rebuild also solves its internal
+  Gram KKT conditions at one quarter of the final certificate tolerances, so
+  the independent residual-score check retains a finite-precision margin.
 - `--kkt-tol` and `--kkt-rel-tol`: absolute and lambda-scaled tolerances for
   the signed score-KKT conditions.  They define the numerical certificate and
   are distinct from the linear-system residual tolerance.

@@ -312,7 +312,7 @@ def test_default_kkt_pcg_tolerance_is_dynamic_and_stricter(monkeypatch):
 
     monkeypatch.setattr(sys, "argv", ["gpu-reml-sparse"])
     default_args = SPARSE.parse_args()
-    assert np.isclose(default_args.kkt_pcg_tol, 1e-4)
+    assert np.isclose(default_args.kkt_pcg_tol, 1e-5)
     assert default_args.kkt_pcg_tol < default_args.pcg_tol
 
     monkeypatch.setattr(
@@ -321,7 +321,7 @@ def test_default_kkt_pcg_tolerance_is_dynamic_and_stricter(monkeypatch):
         ["gpu-reml-sparse", "--pcg-tol", "1e-3"],
     )
     tighter_coarse = SPARSE.parse_args()
-    assert np.isclose(tighter_coarse.kkt_pcg_tol, 2e-5)
+    assert np.isclose(tighter_coarse.kkt_pcg_tol, 2e-6)
     assert tighter_coarse.kkt_pcg_tol < tighter_coarse.pcg_tol
 
     monkeypatch.setattr(
@@ -336,7 +336,36 @@ def test_default_kkt_pcg_tolerance_is_dynamic_and_stricter(monkeypatch):
         ],
     )
     tighter_certificate = SPARSE.parse_args()
-    assert np.isclose(tighter_certificate.kkt_pcg_tol, 1e-6)
+    assert np.isclose(tighter_certificate.kkt_pcg_tol, 1e-7)
+
+
+def test_strict_lasso_path_config_only_tightens_kkt_tolerances():
+    path_cfg = LASSO.LassoPathConfig(
+        lam_min_ratio=0.02,
+        n_lambda=17,
+        ebic_gamma=0.7,
+        ebic_eps=2e-12,
+        max_cd_iter=321,
+        cd_tol=3e-7,
+        ebic_early_stop=False,
+        ebic_early_stop_patience=6,
+        ebic_early_stop_min_delta=0.25,
+        active_set_period=9,
+        kkt_abs_tol=8e-5,
+        kkt_rel_tol=4e-5,
+        verbose=True,
+    )
+
+    strict_cfg = SPARSE._strict_lasso_path_config(path_cfg)
+
+    assert strict_cfg is not path_cfg
+    assert np.isclose(strict_cfg.kkt_abs_tol, 2e-5)
+    assert np.isclose(strict_cfg.kkt_rel_tol, 1e-5)
+    assert np.isclose(path_cfg.kkt_abs_tol, 8e-5)
+    assert np.isclose(path_cfg.kkt_rel_tol, 4e-5)
+    for field, value in vars(path_cfg).items():
+        if field not in {"kkt_abs_tol", "kkt_rel_tol"}:
+            assert getattr(strict_cfg, field) == value
 
 
 def test_true_pcg_relative_residual_recomputes_from_linear_system():
