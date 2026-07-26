@@ -6,6 +6,7 @@ import os
 import sys
 
 import numpy as np
+import pytest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PARENT = os.path.dirname(REPO_ROOT)
@@ -89,6 +90,27 @@ def test_prediction_cli_keep_options(monkeypatch):
     assert args.prediction_pgen_prefix == "test"
     assert args.prediction_covar_txt == "test.covar"
     assert args.prediction_keep_path == "test.keep"
+
+
+def test_sparse_prediction_branches_follow_estimator_validity():
+    branch_names = RUN_SPARSE._sparse_prediction_branch_names
+    assert branch_names(
+        lasso_branch_valid=False,
+        selected_support_refit_branch_valid=False,
+    ) == []
+    assert branch_names(
+        lasso_branch_valid=True,
+        selected_support_refit_branch_valid=False,
+    ) == ["lasso"]
+    assert branch_names(
+        lasso_branch_valid=True,
+        selected_support_refit_branch_valid=True,
+    ) == ["lasso", "selected_span"]
+    with pytest.raises(ValueError, match="requires a valid Lasso"):
+        branch_names(
+            lasso_branch_valid=False,
+            selected_support_refit_branch_valid=True,
+        )
 
 
 class _ArraySource:
@@ -331,7 +353,7 @@ def _toy_branch(name: str, offset: float) -> SparseBranchPrediction:
     )
 
 
-def test_sparse_prediction_writer_and_fallback_status(tmp_path):
+def test_sparse_prediction_writer_supports_independent_branches(tmp_path):
     prefix = str(tmp_path / "pred" / "fit")
     paths = write_sparse_prediction_outputs(
         out_prefix=prefix,
@@ -349,12 +371,39 @@ def test_sparse_prediction_writer_and_fallback_status(tmp_path):
     assert metadata["status"] == "emitted"
     assert metadata["test_phenotype_used"] is False
 
+    lasso_only = write_sparse_prediction_outputs(
+        out_prefix=prefix,
+        sample_ids=["i1", "i2"],
+        lasso=_toy_branch("lasso", 0.0),
+        selected_span=None,
+        metadata={
+            "test_phenotype_used": False,
+            "emitted_branches": ["lasso"],
+        },
+    )
+    with open(lasso_only["prediction"], encoding="utf-8") as handle:
+        lasso_header = handle.readline().strip().split("\t")
+    assert "lasso_genetic_score_raw" in lasso_header
+    assert not any(column.startswith("selected_span_") for column in lasso_header)
+    with open(lasso_only["metadata"], encoding="utf-8") as handle:
+        lasso_metadata = json.load(handle)
+    assert lasso_metadata["emitted_branches"] == ["lasso"]
+
+    with pytest.raises(ValueError, match="At least one valid"):
+        write_sparse_prediction_outputs(
+            out_prefix=prefix,
+            sample_ids=["i1", "i2"],
+            lasso=None,
+            selected_span=None,
+            metadata={"test_phenotype_used": False},
+        )
+
     write_sparse_prediction_status(
         out_prefix=prefix,
-        status="not_emitted_fallback",
+        status="not_emitted_no_valid_branch",
         metadata={"sparse_fit_rejection_reasons": ["guard_failed"]},
     )
     assert not os.path.exists(paths["prediction"])
     with open(paths["metadata"], encoding="utf-8") as handle:
         metadata = json.load(handle)
-    assert metadata["status"] == "not_emitted_fallback"
+    assert metadata["status"] == "not_emitted_no_valid_branch"

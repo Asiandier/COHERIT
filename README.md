@@ -141,6 +141,10 @@ Sparse-run output semantics are deliberately explicit:
 - Ordinary REML is a separate baseline and is never substituted into any of
   the four estimator fields. `all_sparse_branches_valid` is the conjunction of
   the two branch-validity flags.
+- Sparse prediction follows the same branch contract. A valid Lasso branch
+  emits `lasso_*` scores even if the downstream refit is invalid;
+  `selected_span_*` scores are emitted only for a valid refit. The prediction
+  metadata lists the actual `emitted_branches`, with no baseline substitution.
 - In REML history, `accepted` refers to the current line-search candidate.
   A terminal `ll_down` rejects that candidate and returns the most recent
   accepted variance vector; an intermediate BCD variance block records this

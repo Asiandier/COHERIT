@@ -218,24 +218,39 @@ def write_sparse_prediction_outputs(
     *,
     out_prefix: str,
     sample_ids: Sequence[str],
-    lasso: SparseBranchPrediction,
-    selected_span: SparseBranchPrediction,
+    lasso: SparseBranchPrediction | None,
+    selected_span: SparseBranchPrediction | None,
     metadata: Mapping[str, object],
 ) -> dict[str, str]:
-    """Write paired Lasso and selected-span predictions to one aligned table."""
+    """Write every available sparse branch to one aligned prediction table."""
     n = len(sample_ids)
-    arrays = (
-        lasso.fixed_snp_score_raw,
-        lasso.background_blup_raw,
-        lasso.genetic_score_raw,
-        lasso.nuisance_fixed_score_raw,
-        lasso.phenotype_prediction_raw,
-        selected_span.fixed_snp_score_raw,
-        selected_span.background_blup_raw,
-        selected_span.genetic_score_raw,
-        selected_span.nuisance_fixed_score_raw,
-        selected_span.phenotype_prediction_raw,
+    branches = (
+        ("lasso", lasso),
+        ("selected_span", selected_span),
     )
+    available = [(prefix, branch) for prefix, branch in branches if branch is not None]
+    if not available:
+        raise ValueError("At least one valid sparse prediction branch is required.")
+    suffixes = (
+        "fixed_snp_score_raw",
+        "background_blup_raw",
+        "genetic_score_raw",
+        "nuisance_fixed_score_raw",
+        "phenotype_prediction_raw",
+    )
+    arrays: list[np.ndarray] = []
+    columns = ["sample_index", "iid"]
+    for prefix, branch in available:
+        columns.extend(f"{prefix}_{suffix}" for suffix in suffixes)
+        arrays.extend(
+            (
+                branch.fixed_snp_score_raw,
+                branch.background_blup_raw,
+                branch.genetic_score_raw,
+                branch.nuisance_fixed_score_raw,
+                branch.phenotype_prediction_raw,
+            )
+        )
     if any(np.asarray(arr).size != n for arr in arrays):
         raise ValueError(
             "Sparse prediction arrays and sample IDs have different lengths."
@@ -244,20 +259,6 @@ def write_sparse_prediction_outputs(
     parent = os.path.dirname(table_path)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    columns = (
-        "sample_index",
-        "iid",
-        "lasso_fixed_snp_score_raw",
-        "lasso_background_blup_raw",
-        "lasso_genetic_score_raw",
-        "lasso_nuisance_fixed_score_raw",
-        "lasso_phenotype_prediction_raw",
-        "selected_span_fixed_snp_score_raw",
-        "selected_span_background_blup_raw",
-        "selected_span_genetic_score_raw",
-        "selected_span_nuisance_fixed_score_raw",
-        "selected_span_phenotype_prediction_raw",
-    )
     with open(table_path, "w", encoding="utf-8") as handle:
         handle.write("\t".join(columns) + "\n")
         for idx, iid in enumerate(sample_ids):
@@ -271,7 +272,7 @@ def write_sparse_prediction_outputs(
         metadata={
             **dict(metadata),
             "n_samples": n,
-            "columns": list(columns),
+            "columns": columns,
         },
     )
     return {"prediction": table_path, "metadata": status_path}

@@ -1014,6 +1014,22 @@ def _sparse_estimator_branch_guards(
     }
 
 
+def _sparse_prediction_branch_names(
+    *,
+    lasso_branch_valid: bool,
+    selected_support_refit_branch_valid: bool,
+) -> list[str]:
+    """Return independently available prediction branches in output order."""
+    if selected_support_refit_branch_valid and not lasso_branch_valid:
+        raise ValueError(
+            "A selected-support prediction requires a valid Lasso branch."
+        )
+    names = ["lasso"] if lasso_branch_valid else []
+    if selected_support_refit_branch_valid:
+        names.append("selected_span")
+    return names
+
+
 def _selected_span_gls_quadratics(
     *,
     y: np.ndarray,
@@ -2701,6 +2717,12 @@ def main() -> None:
         "status": "not_requested",
     }
     if prediction_active:
+        emitted_branches = _sparse_prediction_branch_names(
+            lasso_branch_valid=lasso_branch_valid,
+            selected_support_refit_branch_valid=(
+                selected_support_refit_branch_valid
+            ),
+        )
         prediction_request_metadata = {
             "test_phenotype_used": False,
             "genotype_standardization_source": "training_samples_only",
@@ -2735,13 +2757,13 @@ def main() -> None:
                 "phenotype_mean": float(phenotype_mean),
             },
         }
-        if not all_sparse_branches_valid:
+        if not emitted_branches:
             metadata_path = write_sparse_prediction_status(
                 out_prefix=out_prefix,
-                status="not_emitted_incomplete_branch",
+                status="not_emitted_no_valid_branch",
                 metadata={
                     **prediction_request_metadata,
-                    "reason": "both_sparse_prediction_branches_are_required",
+                    "reason": "no_valid_sparse_prediction_branch",
                     "lasso_branch_valid": lasso_branch_valid,
                     "selected_support_refit_branch_valid": (
                         selected_support_refit_branch_valid
@@ -2750,11 +2772,33 @@ def main() -> None:
                         sparse_fit_rejection_reasons
                     ),
                     "branch_outputs_emitted": False,
+                    "emitted_branches": [],
+                    "branches": {
+                        "lasso": {
+                            "estimator_valid": False,
+                            "output_emitted": False,
+                            "invalid_reasons": list(
+                                branch_guards[
+                                    "lasso_branch_invalid_reasons"
+                                ]
+                            ),
+                        },
+                        "selected_span": {
+                            "estimator_valid": False,
+                            "output_emitted": False,
+                            "invalid_reasons": list(
+                                branch_guards[
+                                    "selected_support_refit_branch_invalid_reasons"
+                                ]
+                            ),
+                        },
+                    },
                 },
             )
             prediction_summary = {
                 "requested": True,
-                "status": "not_emitted_incomplete_branch",
+                "status": "not_emitted_no_valid_branch",
+                "emitted_branches": [],
                 "metadata_path": metadata_path,
             }
         else:
@@ -2906,27 +2950,32 @@ def main() -> None:
                     pcg_tol=args.pcg_tol,
                     max_pcg_iters=args.max_pcg_iters,
                 )
-                selected_span_prediction = predict_sparse_branch(
-                    name="selected_span",
-                    fitter=fitter,
-                    test_fitter=prediction_fitter,
-                    y_train_raw=y_np,
-                    train_covar=covar_np,
-                    test_covar=prediction_covar,
-                    train_active_geno=Z_support,
-                    test_active_geno=prediction_support,
-                    beta_cov_raw=beta_cov_gls,
-                    beta_active_raw=beta_gls_active,
-                    theta_standardized=theta_selected_span_reml,
-                    phenotype_scale=phenotype_scale,
-                    pcg_tol=args.pcg_tol,
-                    max_pcg_iters=args.max_pcg_iters,
-                )
+                selected_span_prediction = None
+                if "selected_span" in emitted_branches:
+                    selected_span_prediction = predict_sparse_branch(
+                        name="selected_span",
+                        fitter=fitter,
+                        test_fitter=prediction_fitter,
+                        y_train_raw=y_np,
+                        train_covar=covar_np,
+                        test_covar=prediction_covar,
+                        train_active_geno=Z_support,
+                        test_active_geno=prediction_support,
+                        beta_cov_raw=beta_cov_gls,
+                        beta_active_raw=beta_gls_active,
+                        theta_standardized=theta_selected_span_reml,
+                        phenotype_scale=phenotype_scale,
+                        pcg_tol=args.pcg_tol,
+                        max_pcg_iters=args.max_pcg_iters,
+                    )
             finally:
                 prediction_fitter.close()
 
             branch_metadata = {
                 "lasso": {
+                    "estimator_valid": True,
+                    "output_emitted": True,
+                    "invalid_reasons": [],
                     "mean_estimator": "final_weighted_lasso",
                     "covariance_estimator": "lasso_residual_ml",
                     "theta_standardized": theta_lasso_ml.tolist(),
@@ -2939,6 +2988,22 @@ def main() -> None:
                     "pcg_iters": lasso_prediction.pcg_iters,
                 },
                 "selected_span": {
+                    "estimator_valid": bool(
+                        selected_support_refit_branch_valid
+                    ),
+                    "output_emitted": bool(
+                        selected_support_refit_branch_valid
+                    ),
+                    "invalid_reasons": list(
+                        branch_guards[
+                            "selected_support_refit_branch_invalid_reasons"
+                        ]
+                    ),
+                },
+            }
+            if "selected_span" in emitted_branches:
+                assert selected_span_prediction is not None
+                branch_metadata["selected_span"].update({
                     "mean_estimator": "selected_span_gls",
                     "covariance_estimator": "selected_span_reml",
                     "theta_standardized": (
@@ -2954,8 +3019,7 @@ def main() -> None:
                         selected_span_prediction.pcg_rel_res
                     ),
                     "pcg_iters": selected_span_prediction.pcg_iters,
-                },
-            }
+                })
             prediction_paths = write_sparse_prediction_outputs(
                 out_prefix=out_prefix,
                 sample_ids=prediction_ids,
@@ -2964,6 +3028,7 @@ def main() -> None:
                 metadata={
                     **prediction_request_metadata,
                     "branch_outputs_emitted": True,
+                    "emitted_branches": emitted_branches,
                     "branches": branch_metadata,
                 },
             )
@@ -2971,6 +3036,7 @@ def main() -> None:
                 "requested": True,
                 "status": "emitted",
                 "n_samples": len(prediction_ids),
+                "emitted_branches": emitted_branches,
                 "paths": prediction_paths,
             }
 
