@@ -91,6 +91,11 @@ for the residual `y-C alpha-Z b` in the \(n-1\) dimensional space orthogonal
 to the intercept.  In the full sample space this is implemented by supplying
 an intercept to the REML routine; it prevents the zero-energy constant mode of
 a centered GRM from spuriously driving residual variance to its lower bound.
+Within each candidate problem, coordinate descent is accepted solely when the
+active and inactive score-KKT conditions pass; coefficient change is only an
+active-set scheduling heuristic.  Every evaluated lambda on the EBIC path
+must pass that certificate.  An unsolved path point is reported as a numerical
+failure rather than being skipped in favor of the lambda-max empty model.
 This produces the penalized-ML branch `(alpha_L, theta_L)`.  A preliminary
 support/variance match schedules one complete terminal LASSO/KKT plus
 residual-ML round, and the returned covariance receives a signed,

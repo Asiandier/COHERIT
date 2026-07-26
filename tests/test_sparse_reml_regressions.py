@@ -18,6 +18,7 @@ if PARENT not in sys.path:
 PKG = os.path.basename(REPO_ROOT)
 SPARSE = importlib.import_module(f"{PKG}.run_sparse_reml_pipeline")
 REML = importlib.import_module(f"{PKG}.reml")
+LASSO = importlib.import_module(f"{PKG}.lasso_cd")
 
 
 def test_sparse_dense_h2_is_invariant_to_phenotype_rescaling():
@@ -315,6 +316,133 @@ def test_full_score_kkt_certificate_checks_active_and_inactive_coordinates():
     )
     assert inactive_failure["passed"] is False
     assert inactive_failure["max_inactive_excess"] > 0.0
+
+
+def test_gram_cd_uses_score_kkt_not_coefficient_delta_to_stop():
+    beta, gram_beta, n_iter, converged = LASSO.solve_lasso_cd_gram(
+        Q=np.eye(2),
+        q=np.asarray([2.0, -1.0]),
+        lam=0.5,
+        max_iter=10,
+        tol=1e-12,
+        active_set_period=5,
+        kkt_abs_tol=1e-12,
+        kkt_rel_tol=0.0,
+    )
+
+    # The first sweep moves beta by 1.5 (> tol), yet its exact score already
+    # satisfies KKT and is therefore the convex optimum.
+    assert converged
+    assert n_iter == 1
+    np.testing.assert_allclose(beta, np.asarray([1.5, -0.5]))
+    np.testing.assert_allclose(
+        np.asarray([2.0, -1.0]) - gram_beta,
+        0.5 * np.sign(beta),
+    )
+
+
+def test_gram_cd_final_active_sweep_receives_exact_kkt_certificate():
+    gram = np.asarray([[1.0, 0.5], [0.5, 1.0]])
+    linear = np.asarray([2.0, 2.0])
+    beta, gram_beta, n_iter, converged = LASSO.solve_lasso_cd_gram(
+        gram,
+        linear,
+        lam=1.0,
+        max_iter=2,
+        tol=1e-12,
+        active_set_period=5,
+        kkt_abs_tol=0.1,
+        kkt_rel_tol=0.0,
+    )
+
+    # Iteration two is active-only.  The unconditional return-time score check
+    # must recognize its valid KKT point even though no periodic full sweep is
+    # left in the iteration budget.
+    assert n_iter == 2
+    assert converged
+    score = linear - gram_beta
+    np.testing.assert_array_less(
+        np.abs(score - np.sign(beta)),
+        np.full(2, 0.1 + 1e-12),
+    )
+
+
+def test_gram_cd_kkt_certificate_on_scaled_high_ld_gram():
+    k = 128
+    lam = 550.0
+    scale = 8.0e4
+    correlation = 0.2
+    gram = scale * (
+        (1.0 - correlation) * np.eye(k)
+        + correlation * np.ones((k, k))
+    )
+    linear = np.random.default_rng(7).normal(0.0, 700.0, k)
+    abs_tol = 1e-4
+    rel_tol = 1e-4
+    tolerance = max(abs_tol, rel_tol * lam)
+
+    beta, gram_beta, _, converged = LASSO.solve_lasso_cd_gram(
+        gram,
+        linear,
+        lam,
+        max_iter=5000,
+        tol=1e-6,
+        active_set_period=5,
+        kkt_abs_tol=abs_tol,
+        kkt_rel_tol=rel_tol,
+    )
+
+    score = linear - gram_beta
+    active = beta != 0.0
+    active_error = (
+        float(
+            np.max(
+                np.abs(score[active] - lam * np.sign(beta[active]))
+            )
+        )
+        if np.any(active)
+        else 0.0
+    )
+    inactive_excess = (
+        float(max(np.max(np.abs(score[~active])) - lam, 0.0))
+        if np.any(~active)
+        else 0.0
+    )
+    assert converged
+    assert active_error <= tolerance
+    assert inactive_excess <= tolerance
+
+
+def test_ebic_path_failure_does_not_fall_back_to_valid_null(monkeypatch):
+    def fake_lambda_sequence(_lam_max, _lam_min_ratio, _n_lambda):
+        return np.asarray([1.0, 0.1])
+
+    def fake_cd(_gram, _linear, lam, **_kwargs):
+        if np.isclose(lam, 1.0):
+            return np.asarray([0.0]), np.asarray([0.0]), 1, True
+        # Artificially attractive partial iterate: zero RSS but failed KKT.
+        return np.asarray([1.0]), np.asarray([1.0]), 2, False
+
+    monkeypatch.setattr(LASSO, "make_lambda_sequence", fake_lambda_sequence)
+    monkeypatch.setattr(LASSO, "solve_lasso_cd_gram", fake_cd)
+
+    with np.testing.assert_raises_regex(
+        RuntimeError,
+        "Lasso path failed score-KKT convergence",
+    ):
+        LASSO.solve_lasso_path_and_select_ebic(
+            Q=np.asarray([[1.0]]),
+            q=np.asarray([1.0]),
+            yHy=1.0,
+            n_samples=100,
+            p_total=10,
+            cfg=LASSO.LassoPathConfig(
+                n_lambda=2,
+                ebic_early_stop=False,
+                kkt_abs_tol=1e-8,
+                kkt_rel_tol=0.0,
+            ),
+        )
 
 
 def test_lasso_variance_block_uses_an_intercept_contrast_design():

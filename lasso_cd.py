@@ -44,6 +44,8 @@ class LassoPathConfig:
     ebic_early_stop_patience: int = 10
     ebic_early_stop_min_delta: float = 0.0
     active_set_period: int = 5
+    kkt_abs_tol: float = 1e-4
+    kkt_rel_tol: float = 1e-4
     verbose: bool = False
 
 
@@ -200,6 +202,60 @@ def _cd_active_epoch(Q: np.ndarray, q: np.ndarray, diag: np.ndarray,
     return max_delta
 
 
+def _score_kkt_diagnostics(
+    *,
+    q: np.ndarray,
+    Qb: np.ndarray,
+    beta: np.ndarray,
+    lam: float,
+    abs_tol: float,
+    rel_tol: float,
+) -> tuple[bool, float, float, float]:
+    """Return the complete active/inactive score-KKT certificate."""
+    lam_f = float(lam)
+    tolerance = max(
+        float(abs_tol),
+        float(rel_tol) * max(1.0, abs(lam_f)),
+    )
+    score = np.asarray(q, dtype=np.float64) - np.asarray(
+        Qb,
+        dtype=np.float64,
+    )
+    beta_arr = np.asarray(beta, dtype=np.float64)
+    if (
+        score.shape != beta_arr.shape
+        or not np.all(np.isfinite(score))
+        or not np.all(np.isfinite(beta_arr))
+        or not np.isfinite(lam_f)
+        or lam_f < 0.0
+    ):
+        return False, tolerance, float("inf"), float("inf")
+
+    active = beta_arr != 0.0
+    max_active_error = (
+        float(
+            np.max(
+                np.abs(
+                    score[active]
+                    - lam_f * np.sign(beta_arr[active])
+                )
+            )
+        )
+        if np.any(active)
+        else 0.0
+    )
+    max_inactive_excess = (
+        float(max(np.max(np.abs(score[~active])) - lam_f, 0.0))
+        if np.any(~active)
+        else 0.0
+    )
+    passed = bool(
+        max_active_error <= tolerance
+        and max_inactive_excess <= tolerance
+    )
+    return passed, tolerance, max_active_error, max_inactive_excess
+
+
 def solve_lasso_cd_gram(
     Q: np.ndarray,
     q: np.ndarray,
@@ -209,6 +265,8 @@ def solve_lasso_cd_gram(
     max_iter: int = 2000,
     tol: float = 1e-6,
     active_set_period: int = 5,
+    kkt_abs_tol: float | None = None,
+    kkt_rel_tol: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray, int, bool]:
     """
     Coordinate descent for
@@ -216,7 +274,11 @@ def solve_lasso_cd_gram(
     where Q is symmetric PSD and diag(Q) > 0.
 
     Uses Numba-JIT inner loop with active-set acceleration:
-    alternates between full sweeps and active-set-only sweeps.
+    alternates between full sweeps and active-set-only sweeps.  ``converged``
+    is determined solely by the explicit active/inactive score-KKT equations.
+    The coefficient-update tolerance only schedules an earlier full sweep; it
+    is not a convergence condition because its scale depends on the Gram
+    diagonal and column correlation.
     """
     Q = np.ascontiguousarray(Q, dtype=np.float64)
     q = np.ascontiguousarray(q.reshape(-1), dtype=np.float64)
@@ -242,19 +304,32 @@ def solve_lasso_cd_gram(
     qb_full_stale = False
 
     max_iter = max(int(max_iter), 1)
-    # Active-set strategy: after first full sweep, do active-set sweeps
-    # until convergence, then verify with a full sweep.
+    kkt_abs = float(tol) if kkt_abs_tol is None else float(kkt_abs_tol)
+    kkt_rel = float(kkt_rel_tol)
+    if not np.isfinite(float(lam)) or float(lam) < 0.0:
+        raise ValueError("lambda must be finite and nonnegative.")
+    if (
+        not np.isfinite(kkt_abs)
+        or not np.isfinite(kkt_rel)
+        or kkt_abs < 0.0
+        or kkt_rel < 0.0
+    ):
+        raise ValueError("KKT tolerances must be nonnegative.")
+    # Active-set strategy: alternate cheaper active-only sweeps with periodic
+    # full sweeps; every completed full sweep receives an exact KKT check.
     active_set_period = max(int(active_set_period), 1)
     it = 0
 
     for it_idx in range(1, max_iter + 1):
         it = it_idx
+        completed_full_sweep = False
         if it_idx == 1 or it_idx % active_set_period == 0:
             # Full sweep
             if qb_full_stale:
                 Qb = Q @ beta
                 qb_full_stale = False
             max_delta = _cd_epoch(Q, q, diag, beta, Qb, lam)
+            completed_full_sweep = True
         else:
             # Active-set sweep
             active = np.flatnonzero(beta != 0.0).astype(np.int64)
@@ -264,24 +339,54 @@ def solve_lasso_cd_gram(
                     Qb = Q @ beta
                     qb_full_stale = False
                 max_delta = _cd_epoch(Q, q, diag, beta, Qb, lam)
+                completed_full_sweep = True
             else:
                 max_delta = _cd_active_epoch(Q, q, diag, beta, Qb, lam, active)
                 if max_delta > 0.0:
                     qb_full_stale = True
 
-        if max_delta <= tol:
-            # Verify convergence with a full sweep
+        if max_delta <= tol and not completed_full_sweep:
+            # A small active-set update triggers an immediate full sweep.  It
+            # is only an efficiency heuristic; the score KKT equations below,
+            # not the coefficient delta, decide convergence.
             if qb_full_stale:
                 Qb = Q @ beta
                 qb_full_stale = False
-            max_delta_full = _cd_epoch(Q, q, diag, beta, Qb, lam)
+            _cd_epoch(Q, q, diag, beta, Qb, lam)
             it += 1
-            if max_delta_full <= tol:
+            completed_full_sweep = True
+
+        if completed_full_sweep:
+            # Rebuild Qb before every full-sweep certificate.  Incremental
+            # updates are fast, but their accumulated roundoff must not decide
+            # KKT optimality at publication-scale Gram magnitudes.
+            Qb = Q @ beta
+            qb_full_stale = False
+            kkt_passed, _, _, _ = _score_kkt_diagnostics(
+                q=q,
+                Qb=Qb,
+                beta=beta,
+                lam=float(lam),
+                abs_tol=kkt_abs,
+                rel_tol=kkt_rel,
+            )
+            if kkt_passed:
                 converged = True
                 break
 
-    if qb_full_stale:
-        Qb = Q @ beta
+    # ``max_iter`` may end immediately after an active-only sweep.  Rebuild
+    # the exact score and apply the same decisive certificate once more; do
+    # not report a KKT solution as failed merely because no periodic full
+    # sweep remained in the iteration budget.
+    Qb = Q @ beta
+    converged, _, _, _ = _score_kkt_diagnostics(
+        q=q,
+        Qb=Qb,
+        beta=beta,
+        lam=float(lam),
+        abs_tol=kkt_abs,
+        rel_tol=kkt_rel,
+    )
     return beta, Qb, it, converged
 
 
@@ -335,11 +440,26 @@ def solve_lasso_path_and_select_ebic(
             max_iter=cfg.max_cd_iter,
             tol=cfg.cd_tol,
             active_set_period=cfg.active_set_period,
+            kkt_abs_tol=cfg.kkt_abs_tol,
+            kkt_rel_tol=cfg.kkt_rel_tol,
         )
         beta_warm = beta
 
         rss = max(float(rss0 - 2.0 * (beta @ q) + (beta @ Qb)), 0.0)
         k = int(np.count_nonzero(beta))
+        (
+            kkt_passed,
+            kkt_tolerance,
+            max_active_kkt_error,
+            max_inactive_kkt_excess,
+        ) = _score_kkt_diagnostics(
+            q=q,
+            Qb=Qb,
+            beta=beta,
+            lam=float(lam),
+            abs_tol=float(cfg.kkt_abs_tol),
+            rel_tol=float(cfg.kkt_rel_tol),
+        )
         ebic = ebic_from_rss(
             n=n_samples,
             p=p_total,
@@ -357,8 +477,25 @@ def solve_lasso_path_and_select_ebic(
                 "ebic": float(ebic),
                 "cd_iter": int(n_iter),
                 "converged": bool(converged),
+                "kkt_passed": kkt_passed,
+                "kkt_tolerance": kkt_tolerance,
+                "max_active_kkt_error": max_active_kkt_error,
+                "max_inactive_kkt_excess": max_inactive_kkt_excess,
             }
         )
+
+        # Never silently drop an unsolved lower-lambda point and select the
+        # last valid (often empty) model.  That would be an implicit fallback,
+        # not EBIC selection over the requested path.  The caller records this
+        # as an explicit penalized-block failure and does not substitute REML.
+        if not (converged and kkt_passed):
+            raise RuntimeError(
+                "Lasso path failed score-KKT convergence at "
+                f"index={i}, lambda={float(lam):.8e}, cd_iter={int(n_iter)}, "
+                f"active_error={max_active_kkt_error:.8e}, "
+                f"inactive_excess={max_inactive_kkt_excess:.8e}, "
+                f"tolerance={kkt_tolerance:.8e}."
+            )
 
         if (ebic < best_ebic - cfg.ebic_early_stop_min_delta) or (
             math.isclose(ebic, best_ebic) and k < path[best_idx]["k"]

@@ -1511,6 +1511,7 @@ def main() -> None:
         ebic_early_stop_patience=LASSO_EBIC_ES_PATIENCE_FIXED,
         ebic_early_stop_min_delta=args.lasso_ebic_es_min_delta,
         cd_tol=args.lasso_cd_tol, active_set_period=args.lasso_active_set_period,
+        kkt_abs_tol=args.kkt_tol, kkt_rel_tol=args.kkt_rel_tol,
         verbose=args.verbose,
     )
 
