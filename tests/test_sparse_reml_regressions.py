@@ -392,6 +392,101 @@ def test_true_pcg_relative_residual_recomputes_from_linear_system():
     )
     assert np.isclose(observed, expected)
 
+
+def test_strict_pcg_restarts_from_current_solution_when_true_residual_fails(
+    monkeypatch,
+):
+    rhs = np.asarray([[1.0], [2.0]], dtype=np.float32)
+    calls = []
+    true_residuals = iter([2e-4, 5e-5])
+
+    def fake_pcg(_hv, _rhs, *, M, tol, maxiter, X0):
+        del M, tol
+        solution = np.full_like(rhs, len(calls) + 1, dtype=np.float32)
+        calls.append(
+            {
+                "maxiter": int(maxiter),
+                "X0": None if X0 is None else np.asarray(X0).copy(),
+                "solution": solution.copy(),
+            }
+        )
+        iters = 3 if len(calls) == 1 else 2
+        return solution, np.asarray(5e-5), iters
+
+    monkeypatch.setattr(SPARSE, "pcg_solve", fake_pcg)
+    monkeypatch.setattr(
+        SPARSE,
+        "_true_pcg_relative_residual",
+        lambda _hv, _rhs, _solution: next(true_residuals),
+    )
+
+    solution, diagnostics = SPARSE._strict_pcg_solve_with_true_residual(
+        lambda value: value,
+        rhs,
+        M=None,
+        tol=1e-4,
+        maxiter=10,
+        stage="test strict solve",
+    )
+
+    assert len(calls) == 2
+    assert calls[0]["X0"] is None
+    np.testing.assert_array_equal(calls[1]["X0"], calls[0]["solution"])
+    np.testing.assert_array_equal(solution, calls[1]["solution"])
+    assert [call["maxiter"] for call in calls] == [10, 7]
+    assert diagnostics["pcg_iters"] == 5
+    assert diagnostics["pcg_restart_count"] == 1
+    assert np.isclose(diagnostics["pcg_true_res"], 5e-5)
+    assert len(diagnostics["pcg_attempt_trace"]) == 2
+    assert diagnostics["pcg_attempt_trace"][1]["warm_started"] is True
+
+
+def test_strict_pcg_fails_after_bounded_true_residual_restarts(monkeypatch):
+    rhs = np.asarray([[1.0], [2.0]], dtype=np.float32)
+    calls = []
+
+    def fake_pcg(_hv, _rhs, *, M, tol, maxiter, X0):
+        del M, tol
+        solution = np.full_like(rhs, len(calls) + 1, dtype=np.float32)
+        calls.append(
+            {
+                "maxiter": int(maxiter),
+                "X0": None if X0 is None else np.asarray(X0).copy(),
+                "solution": solution.copy(),
+            }
+        )
+        return solution, np.asarray(5e-5), 2
+
+    monkeypatch.setattr(SPARSE, "pcg_solve", fake_pcg)
+    monkeypatch.setattr(
+        SPARSE,
+        "_true_pcg_relative_residual",
+        lambda _hv, _rhs, _solution: 2e-4,
+    )
+
+    try:
+        SPARSE._strict_pcg_solve_with_true_residual(
+            lambda value: value,
+            rhs,
+            M=None,
+            tol=1e-4,
+            maxiter=10,
+            stage="test strict exhaustion",
+        )
+    except RuntimeError as error:
+        diagnostics = error.strict_pcg_diagnostics
+        assert "true-residual replacement restarts=2" in str(error)
+    else:
+        raise AssertionError("Expected strict PCG true-residual failure.")
+
+    assert len(calls) == 3
+    assert [call["maxiter"] for call in calls] == [10, 8, 6]
+    np.testing.assert_array_equal(calls[1]["X0"], calls[0]["solution"])
+    np.testing.assert_array_equal(calls[2]["X0"], calls[1]["solution"])
+    assert diagnostics["pcg_iters"] == 6
+    assert diagnostics["pcg_restart_count"] == 2
+    assert len(diagnostics["pcg_attempt_trace"]) == 3
+
 def test_sparse_dense_h2_rejects_nonfinite_or_nonpositive_denominator():
     assert np.isnan(SPARSE._sparse_dense_h2(np.nan, 0.2, 0.8))
     assert np.isnan(SPARSE._sparse_dense_h2(-1.0, 0.2, 0.8))

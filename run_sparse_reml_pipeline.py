@@ -99,6 +99,7 @@ write_keep_file = _common_mod.write_keep_file
 resolve_cpu_threads = _common_mod.resolve_cpu_threads
 
 LASSO_EBIC_ES_PATIENCE_FIXED = 10
+STRICT_PCG_TRUE_RESIDUAL_RESTARTS_FIXED = 2
 TERMINAL_KKT_CORRECTION_ROUNDS_FIXED = 1
 
 
@@ -763,6 +764,132 @@ def _true_pcg_relative_residual(hv, rhs, solution) -> float:
         jnp.linalg.norm(true_residual, axis=0) / denominator
     )
     return float(np.asarray(jax.device_get(relative)))
+
+
+def _strict_pcg_solve_with_true_residual(
+    hv,
+    rhs,
+    *,
+    M,
+    tol: float,
+    maxiter: int,
+    stage: str,
+    X0=None,
+) -> tuple[object, dict[str, object]]:
+    """Strict PCG with bounded true-residual replacement restarts.
+
+    PCG may satisfy its recursively updated residual while a direct
+    ``B-HX`` recomputation remains above tolerance.  In that case, reuse the
+    current solution as the next initial value, without increasing the total
+    iteration budget.
+    """
+    maxiter_i = int(maxiter)
+    tol_f = float(tol)
+    total_iters = 0
+    restart_count = 0
+    current_x0 = X0
+    attempt_trace: list[dict[str, object]] = []
+    final_solution = None
+    final_reported_res = float("inf")
+    final_true_res = float("inf")
+
+    while True:
+        remaining_iters = maxiter_i - total_iters
+        if remaining_iters <= 0:
+            break
+        (
+            final_solution,
+            reported_res,
+            attempt_iters,
+        ) = pcg_solve(
+            hv,
+            rhs,
+            M=M,
+            tol=tol_f,
+            maxiter=remaining_iters,
+            X0=current_x0,
+        )
+        attempt_iters_i = int(attempt_iters)
+        total_iters += attempt_iters_i
+        final_reported_res = float(
+            np.asarray(jax.device_get(reported_res))
+        )
+        final_true_res = _true_pcg_relative_residual(
+            hv, rhs, final_solution
+        )
+        attempt_trace.append(
+            {
+                "attempt": len(attempt_trace) + 1,
+                "maxiter_budget": int(remaining_iters),
+                "iters": attempt_iters_i,
+                "total_iters": int(total_iters),
+                "reported_res": final_reported_res,
+                "true_res": final_true_res,
+                "warm_started": current_x0 is not None,
+            }
+        )
+
+        true_passed = bool(
+            np.isfinite(final_true_res)
+            and final_true_res <= tol_f * 1.05
+        )
+        if true_passed:
+            _require_pcg_converged(
+                final_true_res,
+                tol=tol_f,
+                iters=total_iters,
+                maxiter=maxiter_i,
+                stage=stage,
+            )
+            return final_solution, {
+                "pcg_tol": tol_f,
+                "pcg_reported_res": final_reported_res,
+                "pcg_true_res": final_true_res,
+                "pcg_iters": int(total_iters),
+                "pcg_restart_count": int(restart_count),
+                "pcg_attempt_trace": attempt_trace,
+            }
+
+        reported_stopped = bool(
+            np.isfinite(final_reported_res)
+            and final_reported_res <= tol_f * 1.05
+        )
+        can_restart = bool(
+            reported_stopped
+            and np.isfinite(final_true_res)
+            and total_iters < maxiter_i
+            and restart_count
+            < STRICT_PCG_TRUE_RESIDUAL_RESTARTS_FIXED
+        )
+        if not can_restart:
+            break
+        current_x0 = final_solution
+        restart_count += 1
+
+    diagnostics = {
+        "pcg_tol": tol_f,
+        "pcg_reported_res": final_reported_res,
+        "pcg_true_res": final_true_res,
+        "pcg_iters": int(total_iters),
+        "pcg_restart_count": int(restart_count),
+        "pcg_attempt_trace": attempt_trace,
+    }
+    try:
+        _require_pcg_converged(
+            final_true_res,
+            tol=tol_f,
+            iters=total_iters,
+            maxiter=maxiter_i,
+            stage=stage,
+        )
+    except RuntimeError as error:
+        error.strict_pcg_diagnostics = diagnostics
+        error.args = (
+            f"{error}; true-residual replacement restarts="
+            f"{restart_count}, attempt_trace={attempt_trace}",
+        )
+        raise
+    raise RuntimeError(f"{stage} strict PCG failed without a solution.")
 
 
 def _chive_q_hat_given_active(
@@ -1861,29 +1988,18 @@ def main() -> None:
             }
             failed["strict"] = strict_record
             try:
-                sol_strict, rel_res_strict, iters_strict = pcg_solve(
-                    hv_returned,
-                    residual_rhs,
-                    M=precond_returned,
-                    tol=args.kkt_pcg_tol,
-                    maxiter=args.max_pcg_iters,
-                    X0=sol,
+                sol_strict, strict_pcg = (
+                    _strict_pcg_solve_with_true_residual(
+                        hv_returned,
+                        residual_rhs,
+                        M=precond_returned,
+                        tol=args.kkt_pcg_tol,
+                        maxiter=args.max_pcg_iters,
+                        stage=f"{stage} strict PCG recheck",
+                        X0=sol,
+                    )
                 )
-                strict_record["pcg_iters"] = int(iters_strict)
-                strict_record["pcg_reported_res"] = float(
-                    np.asarray(rel_res_strict)
-                )
-                strict_true_res = _true_pcg_relative_residual(
-                    hv_returned, residual_rhs, sol_strict
-                )
-                strict_record["pcg_true_res"] = float(strict_true_res)
-                _require_pcg_converged(
-                    strict_true_res,
-                    tol=args.kkt_pcg_tol,
-                    iters=iters_strict,
-                    maxiter=args.max_pcg_iters,
-                    stage=f"{stage} strict PCG recheck",
-                )
+                strict_record.update(strict_pcg)
                 strict_score = grm_index.xtv_all(
                     sol_strict[:, 0], normalize=False
                 )
@@ -1906,6 +2022,9 @@ def main() -> None:
                     None,
                 )
             except (FloatingPointError, RuntimeError, ValueError) as error:
+                strict_record.update(
+                    getattr(error, "strict_pcg_diagnostics", {})
+                )
                 strict_record["error"] = str(error)
                 failed["decision_precision"] = "strict_failed"
                 return failed, str(error)
@@ -2030,39 +2149,24 @@ def main() -> None:
                 try:
                     (
                         strict_screen_solution,
-                        strict_screen_reported_res,
-                        strict_screen_iters,
-                    ) = pcg_solve(
+                        strict_screen_pcg,
+                    ) = _strict_pcg_solve_with_true_residual(
                         hv,
                         B_screen_dev,
                         M=precond,
                         tol=args.kkt_pcg_tol,
                         maxiter=args.max_pcg_iters,
-                        X0=sol_screen,
-                    )
-                    strict_screen_record["pcg_reported_res"] = float(
-                        np.asarray(strict_screen_reported_res)
-                    )
-                    strict_screen_record["pcg_iters"] = int(
-                        strict_screen_iters
-                    )
-                    strict_screen_true_res = _true_pcg_relative_residual(
-                        hv, B_screen_dev, strict_screen_solution
-                    )
-                    strict_screen_record["pcg_true_res"] = float(
-                        strict_screen_true_res
-                    )
-                    _require_pcg_converged(
-                        strict_screen_true_res,
-                        tol=args.kkt_pcg_tol,
-                        iters=strict_screen_iters,
-                        maxiter=args.max_pcg_iters,
                         stage=(
                             f"outer {outer} KKT round {kkt_round} "
                             "strict Hinv[y,C] rebuild"
                         ),
+                        X0=sol_screen,
                     )
+                    strict_screen_record.update(strict_screen_pcg)
                 except (FloatingPointError, RuntimeError, ValueError) as error:
+                    strict_screen_record.update(
+                        getattr(error, "strict_pcg_diagnostics", {})
+                    )
                     strict_screen_record["error"] = str(error)
                     kkt_trace.append(
                         {
@@ -2121,28 +2225,58 @@ def main() -> None:
                             outer, kkt_round, hit, candidate.size,
                         )
 
+            candidate_pcg_restart_count = 0
+            candidate_pcg_attempt_trace: list[dict[str, object]] = []
             try:
-                sol_z, res_all, it_all = pcg_solve(
-                    hv,
-                    B_z,
-                    M=precond,
-                    tol=path_pcg_tol,
-                    maxiter=args.max_pcg_iters,
-                    X0=x0_z,
-                )
-                candidate_true_res = (
-                    _true_pcg_relative_residual(hv, B_z, sol_z)
-                    if strict_at_round_start
-                    else float(np.asarray(res_all))
-                )
-                _require_pcg_converged(
-                    candidate_true_res,
-                    tol=path_pcg_tol,
-                    iters=it_all,
-                    maxiter=args.max_pcg_iters,
-                    stage=f"outer {outer} KKT round {kkt_round} candidate",
-                )
+                if strict_at_round_start:
+                    sol_z, strict_candidate_pcg = (
+                        _strict_pcg_solve_with_true_residual(
+                            hv,
+                            B_z,
+                            M=precond,
+                            tol=path_pcg_tol,
+                            maxiter=args.max_pcg_iters,
+                            stage=(
+                                f"outer {outer} KKT round {kkt_round} "
+                                "strict candidate"
+                            ),
+                            X0=x0_z,
+                        )
+                    )
+                    res_all = strict_candidate_pcg["pcg_reported_res"]
+                    candidate_true_res = strict_candidate_pcg[
+                        "pcg_true_res"
+                    ]
+                    it_all = int(strict_candidate_pcg["pcg_iters"])
+                    candidate_pcg_restart_count = int(
+                        strict_candidate_pcg["pcg_restart_count"]
+                    )
+                    candidate_pcg_attempt_trace = list(
+                        strict_candidate_pcg["pcg_attempt_trace"]
+                    )
+                else:
+                    sol_z, res_all, it_all = pcg_solve(
+                        hv,
+                        B_z,
+                        M=precond,
+                        tol=path_pcg_tol,
+                        maxiter=args.max_pcg_iters,
+                        X0=x0_z,
+                    )
+                    candidate_true_res = float(np.asarray(res_all))
+                    _require_pcg_converged(
+                        candidate_true_res,
+                        tol=path_pcg_tol,
+                        iters=it_all,
+                        maxiter=args.max_pcg_iters,
+                        stage=(
+                            f"outer {outer} KKT round {kkt_round} candidate"
+                        ),
+                    )
             except (FloatingPointError, RuntimeError, ValueError) as error:
+                strict_failure = getattr(
+                    error, "strict_pcg_diagnostics", None
+                )
                 kkt_trace.append(
                     {
                         "round": int(kkt_round),
@@ -2150,6 +2284,7 @@ def main() -> None:
                         "strict_mode_locked_at_round_start": strict_at_round_start,
                         "path_pcg_tol": path_pcg_tol,
                         "decision": "candidate_linear_solve_failed",
+                        "strict_pcg": strict_failure,
                         "error": str(error),
                     }
                 )
@@ -2228,25 +2363,56 @@ def main() -> None:
             residual_rhs = jnp.asarray(
                 resid_lasso[:, None], dtype=jnp.float32
             )
+            score_pcg_restart_count = 0
+            score_pcg_attempt_trace: list[dict[str, object]] = []
             try:
-                sol_resid, res_kkt, it_kkt = pcg_solve(
-                    hv,
-                    residual_rhs,
-                    M=precond,
-                    tol=path_pcg_tol,
-                    maxiter=args.max_pcg_iters,
-                )
-                true_res_kkt = _true_pcg_relative_residual(
-                    hv, residual_rhs, sol_resid
-                )
-                _require_pcg_converged(
-                    true_res_kkt,
-                    tol=path_pcg_tol,
-                    iters=it_kkt,
-                    maxiter=args.max_pcg_iters,
-                    stage=f"outer {outer} KKT round {kkt_round} residual",
-                )
+                if strict_at_round_start:
+                    sol_resid, strict_score_pcg = (
+                        _strict_pcg_solve_with_true_residual(
+                            hv,
+                            residual_rhs,
+                            M=precond,
+                            tol=path_pcg_tol,
+                            maxiter=args.max_pcg_iters,
+                            stage=(
+                                f"outer {outer} KKT round {kkt_round} "
+                                "strict residual"
+                            ),
+                        )
+                    )
+                    res_kkt = strict_score_pcg["pcg_reported_res"]
+                    true_res_kkt = strict_score_pcg["pcg_true_res"]
+                    it_kkt = int(strict_score_pcg["pcg_iters"])
+                    score_pcg_restart_count = int(
+                        strict_score_pcg["pcg_restart_count"]
+                    )
+                    score_pcg_attempt_trace = list(
+                        strict_score_pcg["pcg_attempt_trace"]
+                    )
+                else:
+                    sol_resid, res_kkt, it_kkt = pcg_solve(
+                        hv,
+                        residual_rhs,
+                        M=precond,
+                        tol=path_pcg_tol,
+                        maxiter=args.max_pcg_iters,
+                    )
+                    true_res_kkt = _true_pcg_relative_residual(
+                        hv, residual_rhs, sol_resid
+                    )
+                    _require_pcg_converged(
+                        true_res_kkt,
+                        tol=path_pcg_tol,
+                        iters=it_kkt,
+                        maxiter=args.max_pcg_iters,
+                        stage=(
+                            f"outer {outer} KKT round {kkt_round} residual"
+                        ),
+                    )
             except (FloatingPointError, RuntimeError, ValueError) as error:
+                strict_failure = getattr(
+                    error, "strict_pcg_diagnostics", None
+                )
                 kkt_trace.append(
                     {
                         "round": int(kkt_round),
@@ -2255,6 +2421,7 @@ def main() -> None:
                         "strict_mode_locked_at_round_start": strict_at_round_start,
                         "path_pcg_tol": path_pcg_tol,
                         "decision": "score_linear_solve_failed",
+                        "strict_pcg": strict_failure,
                         "error": str(error),
                     }
                 )
@@ -2289,6 +2456,8 @@ def main() -> None:
                 "pcg_reported_res": float(np.asarray(res_kkt)),
                 "pcg_true_res": float(true_res_kkt),
                 "pcg_iters": int(it_kkt),
+                "pcg_restart_count": int(score_pcg_restart_count),
+                "pcg_attempt_trace": score_pcg_attempt_trace,
                 "threshold": kkt_threshold,
                 "max_outside_score": max_outside_score,
                 "n_outside_violators": int(violators.size),
@@ -2339,34 +2508,20 @@ def main() -> None:
                 try:
                     (
                         sol_resid_strict,
-                        res_kkt_strict,
-                        it_kkt_strict,
-                    ) = pcg_solve(
+                        strict_recheck_pcg,
+                    ) = _strict_pcg_solve_with_true_residual(
                         hv,
                         residual_rhs,
                         M=precond,
                         tol=args.kkt_pcg_tol,
                         maxiter=args.max_pcg_iters,
-                        X0=sol_resid,
-                    )
-                    strict_record["pcg_reported_res"] = float(
-                        np.asarray(res_kkt_strict)
-                    )
-                    strict_record["pcg_iters"] = int(it_kkt_strict)
-                    strict_true_res = _true_pcg_relative_residual(
-                        hv, residual_rhs, sol_resid_strict
-                    )
-                    strict_record["pcg_true_res"] = float(strict_true_res)
-                    _require_pcg_converged(
-                        strict_true_res,
-                        tol=args.kkt_pcg_tol,
-                        iters=it_kkt_strict,
-                        maxiter=args.max_pcg_iters,
                         stage=(
                             f"outer {outer} KKT round {kkt_round} "
                             "strict residual recheck"
                         ),
+                        X0=sol_resid,
                     )
+                    strict_record.update(strict_recheck_pcg)
                     strict_score_signed = np.asarray(
                         grm_index.xtv_all(
                             sol_resid_strict[:, 0], normalize=False
@@ -2405,6 +2560,9 @@ def main() -> None:
                     )
                     decision_precision = "strict_recheck"
                 except (FloatingPointError, RuntimeError, ValueError) as error:
+                    strict_record.update(
+                        getattr(error, "strict_pcg_diagnostics", {})
+                    )
                     strict_record["error"] = str(error)
                     kkt_trace.append(
                         {
@@ -2473,6 +2631,12 @@ def main() -> None:
                     ),
                     "candidate_pcg_true_res": float(candidate_true_res),
                     "candidate_pcg_iters": int(it_all),
+                    "candidate_pcg_restart_count": int(
+                        candidate_pcg_restart_count
+                    ),
+                    "candidate_pcg_attempt_trace": (
+                        candidate_pcg_attempt_trace
+                    ),
                     "strict_screen": strict_screen_record,
                     "coarse": coarse_record,
                     "strict": strict_record,

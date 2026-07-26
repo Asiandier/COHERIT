@@ -488,6 +488,10 @@ fit lifecycle.
   `1e-5` under the defaults.  A strict-path rebuild also solves its internal
   Gram KKT conditions at one quarter of the final certificate tolerances, so
   the independent residual-score check retains a finite-precision margin.
+  If a recursive PCG residual passes while the directly recomputed residual
+  does not, the strict solve performs at most two residual-replacement
+  restarts from the current solution, within the original total iteration
+  budget.  Only the directly recomputed residual can accept the strict solve.
 - `--kkt-tol` and `--kkt-rel-tol`: absolute and lambda-scaled tolerances for
   the signed score-KKT conditions.  They define the numerical certificate and
   are distinct from the linear-system residual tolerance.
