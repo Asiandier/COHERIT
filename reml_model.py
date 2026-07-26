@@ -67,9 +67,7 @@ class FitConfig:
     slq_samples: int = 4
     slq_m: int = 8
     slq_mode: str = "projected_core_residual"
-    precond_type: str = "projected_core"
     precond_rank: int = 500
-    precond_refresh_reldp: float = 0.20
     pcg_ridge: float = 1e-6
     reml_pcg_tol: float = 1e-3
     effect_pcg_tol: float = 1e-3
@@ -111,8 +109,6 @@ class FitResult:
     var_components: jnp.ndarray
     history: list[dict[str, object]]
     rep_var_components: Optional[jnp.ndarray] = None
-    jackknife_se_var: Optional[jnp.ndarray] = None
-    jackknife_se_h2: Optional[float] = None
     effects: Optional[EffectEstimates] = None
     final_ai: Optional[jnp.ndarray] = None
     final_grad: Optional[jnp.ndarray] = None
@@ -459,11 +455,6 @@ class InfinitesimalREMLFitter:
             str(prefix) for prefix in configured_rare_bed_prefixes if prefix
         ]
 
-        if cfg.precond_type != "projected_core":
-            raise ValueError(
-                f"Unsupported precond_type={cfg.precond_type!r}. "
-                "Only 'projected_core' is available."
-            )
         if cfg.vc_block_sizes is not None and cfg.component_variant_indices is not None:
             raise ValueError(
                 "Use either vc_block_sizes or component_variant_indices, not both."
@@ -1409,15 +1400,11 @@ class InfinitesimalREMLFitter:
                 var_components_init=var_components_init,
             )
 
-    def _make_precond_refresh_fn(
+    def _make_pcg_precond_refresh_fn(
         self,
         ops: _OperatorBundle,
     ):
         if self.cfg.precond_rank <= 0:
-            return None
-        if self.cfg.precond_refresh_reldp <= 0.0:
-            return None
-        if self._smile_operators:
             return None
         if len(ops.K_mvs) <= 1:
             return None
@@ -1838,7 +1825,6 @@ class InfinitesimalREMLFitter:
         h2_init: float = 0.5,
         var_components_init: Optional[jnp.ndarray] = None,
         estimate_effects: bool = False,
-        standardize_y: bool = True,
     ) -> FitResult:
         if self.cfg.verbose:
             logger.info("fit_infinitesimal start @ %s", datetime.now().isoformat(timespec='seconds'))
@@ -1874,8 +1860,8 @@ class InfinitesimalREMLFitter:
                 slq_m=self.cfg.slq_m,
                 slq_mode=self.cfg.slq_mode,
                 precond_conf=self.precond_conf,
-                precond_refresh_fn=self._make_precond_refresh_fn(ops),
-                precond_refresh_reldp=self.cfg.precond_refresh_reldp,
+                slq_precond_conf=self.precond_conf,
+                precond_refresh_fn=self._make_pcg_precond_refresh_fn(ops),
                 precond_eps=self.cfg.pcg_ridge,
                 weighted_hv=ops.weighted_hv,
                 stacked_kv=ops.stacked_kv,
@@ -1884,13 +1870,10 @@ class InfinitesimalREMLFitter:
                     self.cfg.smile_optimizer
                     if self._smile_operators else "strict"
                 ),
-                warmup_pcg_tol=self.cfg.reml_pcg_tol,
-                early_pcg_tol=self.cfg.reml_pcg_tol,
-                default_pcg_tol=self.cfg.reml_pcg_tol,
+                pcg_tol=self.cfg.reml_pcg_tol,
                 scoring_step_tol=self.cfg.smile_scoring_step_tol,
                 max_linesearch_trials=self.cfg.strict_max_linesearch_trials,
                 return_diagnostics=bool(self.cfg.capture_reml_diagnostics),
-                standardize_y=bool(standardize_y),
                 verbose=self.cfg.verbose,
             )
             if bool(self.cfg.capture_reml_diagnostics):
@@ -1902,8 +1885,6 @@ class InfinitesimalREMLFitter:
         vc_mean = reps[0][0]
         history = reps[0][1]
         rep_var_components = None
-        jackknife_se_var = None
-        jackknife_se_h2 = None
         monte_carlo_se_var = None
         monte_carlo_se_h2 = None
 
@@ -1923,7 +1904,6 @@ class InfinitesimalREMLFitter:
                     jnp.sum(vc_center**2, axis=0) / float(n_reps * (n_reps - 1)),
                 )
             )
-            jackknife_se_var = monte_carlo_se_var
             rep_var_components = vc_stack
             h2_vals = _trace_weighted_h2(vc_stack)
             h2_center = h2_vals - jnp.mean(h2_vals)
@@ -1935,7 +1915,6 @@ class InfinitesimalREMLFitter:
                     )
                 )
             )
-            jackknife_se_h2 = monte_carlo_se_h2
             # AI/gradient/loglik from one replicate do not describe vc_mean.
             diagnostics = None
 
@@ -1952,8 +1931,6 @@ class InfinitesimalREMLFitter:
         result = FitResult(
             var_components=vc_mean, history=history,
             rep_var_components=rep_var_components,
-            jackknife_se_var=jackknife_se_var,
-            jackknife_se_h2=jackknife_se_h2,
             effects=effects,
             final_ai=None if diagnostics is None else diagnostics.get("ai"),
             final_grad=None if diagnostics is None else diagnostics.get("grad"),

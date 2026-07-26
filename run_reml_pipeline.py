@@ -154,11 +154,6 @@ def parse_args():
     p.add_argument("--vc-block-sizes", default=env("VC_BLOCK_SIZES", ""),
                    help="Comma-separated contiguous SNP block sizes for single-file multi-GRM.")
     p.add_argument(
-        "--component-indices-npz",
-        default=env("COMPONENT_INDICES_NPZ", ""),
-        help="Legacy NPZ file of per-component SNP index arrays for arbitrary single-file multi-GRM.",
-    )
-    p.add_argument(
         "--component-spec",
         default=env("COMPONENT_SPEC", ""),
         help="Structured component spec (.json or .npz) with optional names/metadata for arbitrary single-file multi-GRM.",
@@ -317,14 +312,12 @@ def parse_args():
                    help="Call width w (0 = auto from planner)")
     p.add_argument(
         "--gpu-budget-gib",
-        "--gpu-budget-gb",
         dest="gpu_budget_gib",
         type=float,
-        default=float(env("GPU_BUDGET_GIB", env("GPU_BUDGET_GB", "0"))),
+        default=float(env("GPU_BUDGET_GIB", "0")),
         help=(
             "Planner budget for active GPU allocations in GiB "
-            "(`--gpu-budget-gb` is a legacy alias; 0 = use 85%% of current "
-            "free memory). JAX allocator reservation shown by nvidia-smi may "
+            "(0 = use 85%% of current free memory). JAX allocator reservation shown by nvidia-smi may "
             "be higher."
         ),
     )
@@ -341,13 +334,6 @@ def parse_args():
         default=env("SLQ_MODE", "projected_core_residual"),
         help="SLQ mode: raw Lanczos on H, or projected-core residual SLQ when a projected-core preconditioner is available.",
     )
-    p.add_argument(
-        "--precond-refresh-reldp",
-        type=float,
-        default=float(env("PRECOND_REFRESH_RELDP", "0.20")),
-        help="Rebuild projected-core U/core after an accepted REML step when max relative parameter change exceeds this threshold (<=0 disables).",
-    )
-    p.add_argument("--precond-type", choices=["projected_core"], default="projected_core")
     p.add_argument("--minq-iter", type=int, default=int(env("MINQ_ITER", "10")))
     p.add_argument(
         "--reml-pcg-tol",
@@ -432,10 +418,7 @@ def main():
         else 0
     )
     component_spec_path = args.component_spec.strip()
-    legacy_component_npz = args.component_indices_npz.strip()
-    if component_spec_path and legacy_component_npz:
-        raise SystemExit("Use only one of --component-spec or --component-indices-npz.")
-    component_spec_source = component_spec_path or legacy_component_npz
+    component_spec_source = component_spec_path
     component_specs = load_component_specs(component_spec_source)
     component_variant_indices = [
         np.asarray(spec.variant_indices, dtype=np.int64).reshape(-1)
@@ -459,7 +442,7 @@ def main():
             "Specify only one of --rare-bed-prefix / --rare-pgen-prefix."
         )
     if vc_block_sizes and component_variant_indices:
-        raise SystemExit("Use only one of --vc-block-sizes or --component-indices-npz.")
+        raise SystemExit("Use only one of --vc-block-sizes or --component-spec.")
     if use_smile and not smile_inputs_present:
         raise SystemExit(
             "SMILE mode requires one of --identity-w, --w-files, --w-files-list, or --grm-groups."
@@ -627,7 +610,6 @@ def main():
             if component_variant_indices
             else vc_block_sizes or None
         ),
-        precond_type=args.precond_type,
         gpu_free=gpu_free,
         gpu_budget=(args.gpu_budget_gib * 1024**3) if args.gpu_budget_gib > 0 else None,
         n_covar=n_covar,
@@ -664,9 +646,9 @@ def main():
     )
     precond_rank = plan.precond_rank
 
-    logger.info("call_width=%d, n_rand_vec=%d, seed=%d, precond_rank=%d, slq_samples=%d, slq_mode=%s, precond_refresh_reldp=%.3g, "
+    logger.info("call_width=%d, n_rand_vec=%d, seed=%d, precond_rank=%d, slq_samples=%d, slq_mode=%s, "
                 "gpu_budget_gib=%s", call_width, args.n_rand_vec, args.seed, precond_rank,
-                args.slq_samples, args.slq_mode, args.precond_refresh_reldp,
+                args.slq_samples, args.slq_mode,
                 args.gpu_budget_gib if args.gpu_budget_gib > 0 else 'auto')
     logger.info("cpu_threads=%d (source=%s)", cpu_threads, cpu_threads_src)
     print_planner_info(plan, gpu_name, gpu_free, call_width)
@@ -677,7 +659,7 @@ def main():
             if component_variant_indices
             else f"vc_block_sizes={vc_block_sizes}"
         )
-        if args.precond_type == "projected_core" and precond_rank > 0:
+        if precond_rank > 0:
             logger.info(
                 "single-stream multi-GRM enabled via %s; "
                 "projected_core preconditioner rank=%d",
@@ -734,8 +716,7 @@ def main():
             n_rand_vec=args.n_rand_vec, minq_iter=args.minq_iter, seed=args.seed,
             reml_pcg_tol=args.reml_pcg_tol,
             slq_samples=args.slq_samples, slq_m=args.slq_m, slq_mode=args.slq_mode,
-            precond_refresh_reldp=args.precond_refresh_reldp,
-            precond_type=args.precond_type, precond_rank=precond_rank,
+            precond_rank=precond_rank,
             capture_reml_diagnostics=bool(args.export_ai),
             verbose=args.verbose)
     else:
@@ -765,8 +746,7 @@ def main():
             n_rand_vec=args.n_rand_vec, minq_iter=args.minq_iter, seed=args.seed,
             reml_pcg_tol=args.reml_pcg_tol,
             slq_samples=args.slq_samples, slq_m=args.slq_m, slq_mode=args.slq_mode,
-            precond_refresh_reldp=args.precond_refresh_reldp,
-            precond_type=args.precond_type, precond_rank=precond_rank,
+            precond_rank=precond_rank,
             capture_reml_diagnostics=bool(args.export_ai),
             verbose=args.verbose)
 
@@ -1025,7 +1005,6 @@ def main():
             slq_samples=args.slq_samples,
             slq_m=args.slq_m,
             slq_mode=args.slq_mode,
-            precond_type=args.precond_type,
             precond_rank=0,
             verbose=args.verbose,
         )

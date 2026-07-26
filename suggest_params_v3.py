@@ -167,6 +167,24 @@ def _projected_core_state_bytes(n: int, n_grm: int, rank: int) -> float:
     return u_bytes + core_bytes + diag_bytes
 
 
+def _slq_reference_state_bytes(n: int, rank: int) -> float:
+    """Persistent fixed SLQ reference after the PCG basis has refreshed."""
+    if rank <= 0:
+        return 0.0
+    u_bytes = _mat_bytes(n, rank)
+    factor_bytes = 2.0 * _mat_bytes(rank, rank)
+    vector_bytes = float(_F32 * (rank + 2))
+    return u_bytes + factor_bytes + vector_bytes
+
+
+def _fit_projected_core_state_bytes(n: int, n_grm: int, rank: int) -> float:
+    """Dynamic PCG configuration plus the independent fixed SLQ reference."""
+    state = _projected_core_state_bytes(n, n_grm, rank)
+    if n_grm <= 1:
+        return state
+    return state + _slq_reference_state_bytes(n, rank)
+
+
 def _basis_build_live_bytes(
     n: int,
     geom: _CallGeometry,
@@ -235,12 +253,12 @@ def _solve_live_bytes(
     ai_cols = n_grm + 1
     solve_cols = max(warm_cols, ai_cols)
     if solve_cols <= 0:
-        return _projected_core_state_bytes(n, n_grm, rank)
+        return _fit_projected_core_state_bytes(n, n_grm, rank)
     wide_block = _mat_bytes(n, geom.max_unpack_width)
     inner = _mat_bytes(geom.max_unpack_width, solve_cols)
     warm_vec = _mat_bytes(n, solve_cols)
     return (
-        _projected_core_state_bytes(n, n_grm, rank)
+        _fit_projected_core_state_bytes(n, n_grm, rank)
         + _kvrand_cache_bytes(n, n_grm, n_rand_vec)
         + geom.inflight_packed_row_bytes * n
         + wide_block
@@ -264,7 +282,7 @@ def _precompute_live_bytes(
     vrand = _mat_bytes(n, n_rand_vec)
     rhs_const = _mat_bytes(n, warm_cols)
     return (
-        _projected_core_state_bytes(n, n_grm, rank)
+        _fit_projected_core_state_bytes(n, n_grm, rank)
         + geom.inflight_packed_row_bytes * n
         + wide_block
         + 2.0 * inner
@@ -292,7 +310,7 @@ def _projection_live_bytes(
     gpy = float(n_grm + 1) * _mat_bytes(n, 1)
     sol = _mat_bytes(n, warm_cols)
     return (
-        _projected_core_state_bytes(n, n_grm, rank)
+        _fit_projected_core_state_bytes(n, n_grm, rank)
         + _kvrand_cache_bytes(n, n_grm, n_rand_vec)
         + geom.inflight_packed_row_bytes * n
         + wide_block
@@ -316,13 +334,54 @@ def _slq_live_bytes(
     inner = _mat_bytes(geom.max_unpack_width, slq_samples)
     slq_vec = _mat_bytes(n, slq_samples)
     return (
-        _projected_core_state_bytes(n, n_grm, rank)
+        _fit_projected_core_state_bytes(n, n_grm, rank)
         + _kvrand_cache_bytes(n, n_grm, n_rand_vec)
         + geom.inflight_packed_row_bytes * n
         + wide_block
         + 2.0 * inner
         + _SLQ_WORK_VECS * slq_vec
     )
+
+
+def _refresh_build_live_bytes(
+    n: int,
+    geom: _CallGeometry,
+    *,
+    n_grm: int,
+    rank: int,
+    n_covar: int,
+    n_rand_vec: int,
+    partitioned: bool,
+) -> float:
+    """Peak while rebuilding PCG state with fit-wide arrays still resident."""
+    if rank <= 0 or n_grm <= 1:
+        return 0.0
+    warm_cols = n_covar + 1 + n_rand_vec
+    ai_cols = n_grm + 1
+    retained_fit_state = (
+        _fit_projected_core_state_bytes(n, n_grm, rank)
+        + _kvrand_cache_bytes(n, n_grm, n_rand_vec)
+        + 3.0 * _mat_bytes(n, warm_cols)
+        + 2.0 * _mat_bytes(n, ai_cols)
+        + _mat_bytes(ai_cols, ai_cols)
+    )
+    basis_peak = retained_fit_state + _basis_build_live_bytes(n, geom, rank)
+    if partitioned:
+        atom_build = _partitioned_atoms_live_bytes(
+            n,
+            geom,
+            n_grm=n_grm,
+            rank=rank,
+        )
+    else:
+        atom_build = _generic_atoms_live_bytes(
+            n,
+            geom,
+            n_grm=n_grm,
+            rank=rank,
+        )
+    atoms_peak = retained_fit_state + atom_build
+    return max(basis_peak, atoms_peak)
 
 
 def _allocator_pool_limit_bytes() -> Optional[float]:
@@ -391,7 +450,6 @@ def suggest_call_width(
     *,
     n_grm: Optional[int] = None,
     component_block_sizes: Optional[Sequence[int]] = None,
-    precond_type: str = "projected_core",
     gpu_free_bytes: Optional[float] = None,
     gpu_budget_bytes: Optional[float] = None,
     gpu_headroom: float = _GPU_HEADROOM,
@@ -417,11 +475,6 @@ def suggest_call_width(
     )
     G_geom = len(segment_sizes)
     G = int(n_grm) if n_grm is not None else G_geom
-    if precond_type != "projected_core":
-        raise ValueError(
-            f"Unsupported precond_type={precond_type!r}. "
-            "Only 'projected_core' is available."
-        )
     if G == 0:
         return PlanResult(
             feasible=False,
@@ -458,7 +511,7 @@ def suggest_call_width(
             call_width=width,
             n_grm=G,
         )
-        precond_state = _projected_core_state_bytes(n, G, precond_rank)
+        precond_state = _fit_projected_core_state_bytes(n, G, precond_rank)
         build_basis = streamer_state + _basis_build_live_bytes(n, geom, precond_rank)
         if component_block_sizes is not None:
             build_atoms = streamer_state + _partitioned_atoms_live_bytes(
@@ -474,7 +527,16 @@ def suggest_call_width(
                 n_grm=G,
                 rank=precond_rank,
             )
-        build_peak = max(build_basis, build_atoms)
+        refresh_build = streamer_state + _refresh_build_live_bytes(
+            n,
+            geom,
+            n_grm=G,
+            rank=precond_rank,
+            n_covar=n_covar,
+            n_rand_vec=n_rand_vec,
+            partitioned=component_block_sizes is not None,
+        )
+        build_peak = max(build_basis, build_atoms, refresh_build)
         precompute_peak = streamer_state + _precompute_live_bytes(
             n,
             geom,
@@ -619,7 +681,6 @@ def suggest_call_width(
     anon_est = ring_bytes + _HOST_ANON_BASE
 
     note = (
-        f"precond_type={precond_type} "
         f"precond_rank={precond_rank} "
         f"effective_w={geom.max_true_width} "
         f"build_live={gpu_precond_build_peak/_GIB:.1f}GiB "

@@ -418,11 +418,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pgen-prefix", default=env("PGEN_PREFIX", ""),
                    help="PLINK2 PGEN file prefix (direct read, no conversion needed)")
     p.add_argument(
-        "--component-indices-npz",
-        default=env("COMPONENT_INDICES_NPZ", ""),
-        help="Legacy NPZ file of per-component SNP index arrays for single-file multi-GRM Lasso.",
-    )
-    p.add_argument(
         "--component-spec",
         default=env("COMPONENT_SPEC", ""),
         help="Structured component spec (.json or .npz) defining SNP-ID/index GRM partitions.",
@@ -466,14 +461,12 @@ def parse_args() -> argparse.Namespace:
                    help="Call width w (0 = auto from planner)")
     p.add_argument(
         "--gpu-budget-gib",
-        "--gpu-budget-gb",
         dest="gpu_budget_gib",
         type=float,
-        default=float(env("GPU_BUDGET_GIB", env("GPU_BUDGET_GB", "0"))),
+        default=float(env("GPU_BUDGET_GIB", "0")),
         help=(
             "Planner budget for active GPU allocations in GiB "
-            "(`--gpu-budget-gb` is a legacy alias; 0 = use 85%% of current "
-            "free memory). JAX allocator reservation shown by nvidia-smi may "
+            "(0 = use 85%% of current free memory). JAX allocator reservation shown by nvidia-smi may "
             "be higher."
         ),
     )
@@ -482,18 +475,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n-rand-vec", type=int, default=100)
     p.add_argument("--slq-samples", type=int, default=100)
     p.add_argument("--slq-m", type=int, default=int(env("SLQ_M", "50")))
-    p.add_argument("--precond-type", choices=["projected_core"], default=env("PRECOND_TYPE", "projected_core"))
     p.add_argument("--minq-iter", type=int, default=int(env("MINQ_ITER", "50")))
-    p.add_argument(
-        "--reml-scoring-step-tol",
-        type=float,
-        default=float(env("REML_SCORING_STEP_TOL", "1e-4")),
-        help=(
-            "Projected-score/relative-step tolerance used by each strict REML "
-            "variance update. The default preserves the core REML default; "
-            "large stochastic fits may use a prespecified looser tolerance."
-        ),
-    )
     p.add_argument(
         "--reml-max-linesearch-trials",
         type=int,
@@ -533,16 +515,6 @@ def parse_args() -> argparse.Namespace:
             "The default 'full' matches genome-wide KKT certification; "
             "'candidate' is retained only for screened-EBIC sensitivity analyses."
         ),
-    )
-    # Full-p KKT certification is part of the sparse estimator definition.
-    # Retain the positive spelling for command-line compatibility, but do not
-    # expose the former ``--no-kkt-check`` mode: the final estimator contract
-    # can never certify a run in which this check was disabled.
-    p.add_argument(
-        "--kkt-check",
-        action="store_true",
-        default=True,
-        help="Mandatory full-marker KKT certification (always enabled).",
     )
     p.add_argument(
         "--kkt-tol",
@@ -592,15 +564,13 @@ def _accepted_reml_theta(
     *,
     expected_components: int,
     stage: str,
-    allow_step_rejection: bool = False,
 ) -> tuple[np.ndarray, str]:
-    """Return a valid REML state without accepting a downhill candidate.
+    """Return a valid, converged REML state.
 
     ``fit_reml`` returns the last accepted parameter vector when all
-    line-search candidates are downhill.  For an intermediate BCD block that
-    is a legitimate no-update result, not an invalid covariance estimate.
-    ``allow_step_rejection`` controls whether that non-converged but valid
-    returned state may be used by the caller.
+    line-search candidates are downhill.  ``ll_down`` therefore represents a
+    converged no-update state: the current candidate is rejected while the
+    previous accepted parameter vector is retained.
     """
     theta = np.asarray(fit_result.var_components, dtype=np.float64).reshape(-1)
     history = list(fit_result.history)
@@ -614,29 +584,19 @@ def _accepted_reml_theta(
         and theta[-1] > 0.0
     )
     last_history = history[-1] if history else {}
-    converged_history = bool(
+    candidate_accepted = bool(last_history.get("accepted", False))
+    converged = bool(last_history.get("converged", False))
+    usable_history = bool(
         history
+        and converged
         and (
             (
-                bool(history[-1].get("accepted", False))
-                and stop_reason in {"rel_dll", "scoring_step"}
+                stop_reason in {"rel_dll", "scoring_step"}
+                and candidate_accepted
             )
-            or (
-                bool(history[-1].get("returned_state_accepted", False))
-                and bool(history[-1].get("converged", False))
-                and stop_reason == "projected_gradient"
-            )
+            or (stop_reason == "ll_down" and not candidate_accepted)
         )
     )
-    rejected_step_with_valid_return = bool(
-        history
-        and allow_step_rejection
-        and stop_reason == "ll_down"
-        and not bool(last_history.get("accepted", False))
-        and bool(last_history.get("returned_state_accepted", False))
-        and not bool(last_history.get("converged", False))
-    )
-    usable_history = bool(converged_history or rejected_step_with_valid_return)
     if not valid_theta or not usable_history:
         raise RuntimeError(
             f"{stage} did not return a usable REML state: "
@@ -644,12 +604,9 @@ def _accepted_reml_theta(
             f"stop_reason={stop_reason!r}, "
             f"last_accepted="
             f"{bool(history[-1].get('accepted', False)) if history else False}, "
-            f"returned_state_accepted="
-            f"{bool(last_history.get('returned_state_accepted', False))}, "
-            f"proj_grad_inf={last_history.get('proj_grad_inf')}, "
+            f"converged={converged}, "
             f"dll_true={last_history.get('dll_true')}, "
-            f"max_rel_dp={last_history.get('max_rel_dp')}, "
-            f"allow_step_rejection={bool(allow_step_rejection)}."
+            f"max_rel_dp={last_history.get('max_rel_dp')}."
         )
     return theta, stop_reason
 
@@ -669,19 +626,78 @@ def _fit_intercept_contrast_residual_ml(
     *,
     h2_init: float,
 ):
-    """Fit the Lasso residual covariance through intercept REML contrasts."""
+    """Fit residual covariance and return it on the standardized-phenotype scale.
+
+    Core REML always standardizes its response. The Lasso residual already has
+    units of the globally standardized phenotype, so the unit-residual-scale
+    variance estimates are multiplied by the residual variance before they are
+    combined with sparse quadratic terms.
+    """
     residual = np.asarray(residual_standardized, dtype=np.float32).reshape(-1)
     theta = np.asarray(theta_init, dtype=np.float32).reshape(-1)
-    return fitter.fit_infinitesimal(
+    _, residual_scale = _phenotype_standardization_stats(residual)
+    variance_scale = float(residual_scale) ** 2
+    fit_result = fitter.fit_infinitesimal(
         jnp.asarray(residual, dtype=jnp.float32),
         jnp.asarray(
             _intercept_contrast_fixed_effect(residual.size),
             dtype=jnp.float32,
         ),
         h2_init=float(h2_init),
-        var_components_init=jnp.asarray(theta, dtype=jnp.float32),
-        standardize_y=False,
+        var_components_init=jnp.asarray(
+            theta / variance_scale, dtype=jnp.float32
+        ),
     )
+    fit_result.var_components = (
+        jnp.asarray(fit_result.var_components) * variance_scale
+    )
+    if fit_result.rep_var_components is not None:
+        fit_result.rep_var_components = (
+            jnp.asarray(fit_result.rep_var_components) * variance_scale
+        )
+    if fit_result.monte_carlo_se_var is not None:
+        fit_result.monte_carlo_se_var = (
+            jnp.asarray(fit_result.monte_carlo_se_var) * variance_scale
+        )
+    if fit_result.final_grad is not None:
+        fit_result.final_grad = (
+            jnp.asarray(fit_result.final_grad) / variance_scale
+        )
+    if fit_result.final_ai is not None:
+        fit_result.final_ai = (
+            jnp.asarray(fit_result.final_ai) / (variance_scale**2)
+        )
+    if fit_result.diagnostics is not None:
+        diagnostics = dict(fit_result.diagnostics)
+        if diagnostics.get("theta") is not None:
+            diagnostics["theta"] = (
+                jnp.asarray(diagnostics["theta"]) * variance_scale
+            )
+        if diagnostics.get("grad") is not None:
+            diagnostics["grad"] = (
+                jnp.asarray(diagnostics["grad"]) / variance_scale
+            )
+        if diagnostics.get("ai") is not None:
+            diagnostics["ai"] = (
+                jnp.asarray(diagnostics["ai"]) / (variance_scale**2)
+            )
+        fit_result.diagnostics = diagnostics
+
+    history = []
+    for source_row in fit_result.history:
+        row = dict(source_row)
+        if row.get("params") is not None:
+            row["params"] = (
+                np.asarray(row["params"], dtype=np.float64) * variance_scale
+            ).tolist()
+        if row.get("step_norm") is not None:
+            row["step_norm"] = float(row["step_norm"]) * variance_scale
+        if row.get("grad_norm") is not None:
+            row["grad_norm"] = float(row["grad_norm"]) / variance_scale
+        row["variance_scale_to_standardized_phenotype"] = variance_scale
+        history.append(row)
+    fit_result.history = history
+    return fit_result
 
 
 def _require_pcg_converged(
@@ -700,29 +716,6 @@ def _require_pcg_converged(
             f"tolerance={float(tol):.3e}, iterations={int(iters)}/{int(maxiter)}."
         )
     return rel
-
-
-def _fixed_point_skip_reml(
-    *,
-    support_same: bool,
-    theta_stable_prev: bool,
-    has_reml_refit: bool,
-    stable_rounds: int,
-    support_stable_rounds: int,
-) -> tuple[bool, int]:
-    """Legacy helper retained for downstream compatibility.
-
-    The two-branch pipeline no longer calls this selected-span REML skip rule:
-    every penalized-ML outer round performs its residual-ML variance update,
-    and selected-span REML is run exactly once after that branch is frozen.
-    """
-    if not (support_same and theta_stable_prev and has_reml_refit):
-        return False, stable_rounds
-    stable_rounds_next = stable_rounds + 1
-    return (
-        stable_rounds_next >= max(1, int(support_stable_rounds)),
-        stable_rounds_next,
-    )
 
 
 def _chive_q_hat_given_active(
@@ -1021,20 +1014,6 @@ def _sparse_estimator_branch_guards(
     }
 
 
-def _primary_sparse_dense_h2(
-    h2_penalized_chive: float,
-    h2_post_gls_diagnostic: float,
-) -> float:
-    """Define the primary estimator; CHIVE-at-post-GLS is diagnostic only.
-
-    CHIVE calibration is designed around a sparse regularized initial estimate.
-    Reapplying that formula to a post-selection GLS coefficient is not the
-    trace-corrected selected-span estimator and is intentionally not primary.
-    """
-    del h2_post_gls_diagnostic
-    return float(h2_penalized_chive)
-
-
 def _selected_span_gls_quadratics(
     *,
     y: np.ndarray,
@@ -1051,7 +1030,7 @@ def _selected_span_gls_quadratics(
     internally standardized phenotype scale.  GLS coefficients and the
     squared fitted score are returned on the raw phenotype scale; the
     fixed-span estimation-noise trace correction is reported on both scales.
-    Output field names retain ``df`` for backward compatibility.
+    Output field names use ``df`` for this analytic trace correction.
     """
     y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
     z_arr = np.asarray(z_active, dtype=np.float64)
@@ -1191,8 +1170,6 @@ def main() -> None:
         raise SystemExit("outer-max must be >= 1.")
     if int(args.minq_iter) < 1:
         raise SystemExit("minq-iter must be >= 1 for both variance blocks.")
-    if float(args.reml_scoring_step_tol) <= 0.0:
-        raise SystemExit("reml-scoring-step-tol must be > 0.")
     if int(args.reml_max_linesearch_trials) < 1:
         raise SystemExit("reml-max-linesearch-trials must be >= 1.")
     if int(args.support_stable_rounds) < 1:
@@ -1212,10 +1189,7 @@ def main() -> None:
     bed_list = [b.strip() for b in args.bed_prefix.split(",") if b.strip()]
     pgen_prefix = args.pgen_prefix.strip()
     component_spec_path = args.component_spec.strip()
-    legacy_component_npz = args.component_indices_npz.strip()
-    if component_spec_path and legacy_component_npz:
-        raise SystemExit("Use only one of --component-spec or --component-indices-npz.")
-    component_spec_source = component_spec_path or legacy_component_npz
+    component_spec_source = component_spec_path
     component_variant_indices = (
         _load_component_variant_indices(component_spec_source)
         if component_spec_source
@@ -1358,7 +1332,6 @@ def main() -> None:
             if component_variant_indices
             else None
         ),
-        precond_type=args.precond_type,
         gpu_free=gpu_free,
         gpu_budget=(args.gpu_budget_gib * 1024**3) if args.gpu_budget_gib > 0 else None,
         n_covar=n_covar,
@@ -1423,9 +1396,8 @@ def main() -> None:
             ring_depth=plan.ring_depth,
             n_rand_vec=args.n_rand_vec, minq_iter=args.minq_iter,
             slq_samples=args.slq_samples, slq_m=args.slq_m,
-            precond_type=args.precond_type, precond_rank=plan.precond_rank,
+            precond_rank=plan.precond_rank,
             reml_pcg_tol=args.pcg_tol,
-            smile_scoring_step_tol=args.reml_scoring_step_tol,
             strict_max_linesearch_trials=args.reml_max_linesearch_trials,
             max_pcg_iters=args.max_pcg_iters, pcg_ridge=args.pcg_ridge,
             verbose=args.verbose,
@@ -1442,9 +1414,8 @@ def main() -> None:
             ring_depth=plan.ring_depth,
             n_rand_vec=args.n_rand_vec, minq_iter=args.minq_iter,
             slq_samples=args.slq_samples, slq_m=args.slq_m,
-            precond_type=args.precond_type, precond_rank=plan.precond_rank,
+            precond_rank=plan.precond_rank,
             reml_pcg_tol=args.pcg_tol,
-            smile_scoring_step_tol=args.reml_scoring_step_tol,
             strict_max_linesearch_trials=args.reml_max_linesearch_trials,
             max_pcg_iters=args.max_pcg_iters, pcg_ridge=args.pcg_ridge,
             verbose=args.verbose,
@@ -1733,7 +1704,7 @@ def main() -> None:
         certified_kkt = False
         penalized_block_failure = None
 
-        max_kkt_rounds = int(args.kkt_max_rounds) if bool(args.kkt_check) else 1
+        max_kkt_rounds = int(args.kkt_max_rounds)
         for kkt_round in range(1, max_kkt_rounds + 1):
             # Z_cand PCG with dictionary warm-start.  Candidate may grow after
             # global KKT scans, so this solve is intentionally inside the loop.
@@ -1818,16 +1789,6 @@ def main() -> None:
                 break
             support_new = np.sort(candidate[active_local])
 
-            if not bool(args.kkt_check):
-                certified_kkt = False
-                kkt_trace.append({
-                    "round": int(kkt_round),
-                    "candidate_size": int(candidate.size),
-                    "support_size": int(support_new.size),
-                    "checked": False,
-                })
-                break
-
             beta_cov = np.asarray(lasso.get("beta_cov", np.empty((0,))), dtype=np.float64)
             beta_snp = np.asarray(lasso["beta_snp"], dtype=np.float64)
             resid_lasso = _lasso_residual(
@@ -1868,7 +1829,6 @@ def main() -> None:
                 "n_violators": n_viol,
                 "pcg_kkt_iters": int(it_kkt),
                 "pcg_kkt_res": float(np.asarray(res_kkt)),
-                "checked": True,
             })
             logger.info(
                 "[outer %s kkt %s] cand=%s active=%s lam=%.3e "
@@ -1896,7 +1856,6 @@ def main() -> None:
 
         if (
             penalized_block_failure is None
-            and bool(args.kkt_check)
             and not certified_kkt
         ):
             penalized_block_failure = (
@@ -1985,10 +1944,9 @@ def main() -> None:
                 ml_res,
                 expected_components=n_grm + 1,
                 stage=f"outer {outer} Lasso residual-ML block",
-                allow_step_rejection=True,
             )
-            # A rejected downhill candidate is still a completed BCD block:
-            # the block update is the unchanged, previously accepted theta.
+            # ``ll_down`` is a converged no-update block: its downhill
+            # candidate is rejected and the previous theta is retained.
             variance_blocks_completed += 1
         except (FloatingPointError, RuntimeError, ValueError) as error:
             penalized_failure_reason = str(error)
@@ -2163,7 +2121,6 @@ def main() -> None:
     # accepted pair is certified on the same finite-tolerance scale.
     if (
         lasso_ml_outer_converged
-        and bool(args.kkt_check)
         and final_lasso is not None
         and not bool(returned_covariance_kkt["passed"])
     ):
@@ -2196,7 +2153,6 @@ def main() -> None:
     )
     alpha_theta_fixed_point_coherent = bool(
         lasso_ml_outer_converged
-        and bool(args.kkt_check)
         and last_round_kkt_certified
         and bool(returned_covariance_kkt["passed"])
         and theta_lasso_to_lasso_ml_rel < float(args.vc_rel_tol)
@@ -2255,7 +2211,6 @@ def main() -> None:
                 selected_span_reml,
                 expected_components=n_grm + 1,
                 stage="selected-span REML refit",
-                allow_step_rejection=True,
             )
             selected_span_reml_iterations = len(
                 selected_span_reml.history
@@ -2294,14 +2249,14 @@ def main() -> None:
     )
     q_chive = unavailable
     q_chive_standardized = unavailable
-    q_chive_reml = unavailable
+    q_chive_post_gls_raw = unavailable
     q_chive_post_gls_standardized = unavailable
     q_chive_term1 = unavailable
     q_chive_term2 = unavailable
     q_chive_term1_standardized = unavailable
     q_chive_term2_standardized = unavailable
-    q_chive_reml_term1 = unavailable
-    q_chive_reml_term2 = unavailable
+    q_chive_post_gls_term1_raw = unavailable
+    q_chive_post_gls_term2_raw = unavailable
     q_chive_post_gls_term1_standardized = unavailable
     q_chive_post_gls_term2_standardized = unavailable
     q_ss_gls_plugin_raw = unavailable
@@ -2426,9 +2381,9 @@ def main() -> None:
         q_ss_gls_df_corrected_standardized = 0.0
         ss_gls_df_correction_raw = 0.0
         ss_gls_df_correction_standardized = 0.0
-        q_chive_reml = 0.0
-        q_chive_reml_term1 = 0.0
-        q_chive_reml_term2 = 0.0
+        q_chive_post_gls_raw = 0.0
+        q_chive_post_gls_term1_raw = 0.0
+        q_chive_post_gls_term2_raw = 0.0
         q_chive_post_gls_standardized = 0.0
         q_chive_post_gls_term1_standardized = 0.0
         q_chive_post_gls_term2_standardized = 0.0
@@ -2538,9 +2493,9 @@ def main() -> None:
                     @ beta_cov_gls
                 )
             (
-                q_chive_reml,
-                q_chive_reml_term1,
-                q_chive_reml_term2,
+                q_chive_post_gls_raw,
+                q_chive_post_gls_term1_raw,
+                q_chive_post_gls_term2_raw,
             ) = _chive_q_hat_given_active(
                 Z_support,
                 y_chive_reml,
@@ -2548,17 +2503,17 @@ def main() -> None:
             )
             q_chive_post_gls_standardized = (
                 _quadratic_variance_to_reml_scale(
-                    q_chive_reml, phenotype_scale
+                    q_chive_post_gls_raw, phenotype_scale
                 )
             )
             q_chive_post_gls_term1_standardized = (
                 _quadratic_variance_to_reml_scale(
-                    q_chive_reml_term1, phenotype_scale
+                    q_chive_post_gls_term1_raw, phenotype_scale
                 )
             )
             q_chive_post_gls_term2_standardized = (
                 _quadratic_variance_to_reml_scale(
-                    q_chive_reml_term2, phenotype_scale
+                    q_chive_post_gls_term2_raw, phenotype_scale
                 )
             )
         except (FloatingPointError, RuntimeError, ValueError) as error:
@@ -2580,9 +2535,9 @@ def main() -> None:
             q_ss_gls_df_corrected_standardized = unavailable
             ss_gls_df_correction_raw = unavailable
             ss_gls_df_correction_standardized = unavailable
-            q_chive_reml = unavailable
-            q_chive_reml_term1 = unavailable
-            q_chive_reml_term2 = unavailable
+            q_chive_post_gls_raw = unavailable
+            q_chive_post_gls_term1_raw = unavailable
+            q_chive_post_gls_term2_raw = unavailable
             q_chive_post_gls_standardized = unavailable
             q_chive_post_gls_term1_standardized = unavailable
             q_chive_post_gls_term2_standardized = unavailable
@@ -2627,9 +2582,6 @@ def main() -> None:
         theta_final_sum,
         theta_e_final,
     )
-    # Compatibility alias for historical result readers.
-    h2_chive_reml = h2_chive_post_gls
-
     branch_guards = _sparse_estimator_branch_guards(
         alpha_theta_pair_certified=(
             alpha_theta_fixed_point_coherent
@@ -2648,7 +2600,7 @@ def main() -> None:
     selected_support_refit_branch_valid = bool(
         branch_guards["selected_support_refit_branch_valid"]
     )
-    guarded_sparse_fit_accepted = bool(
+    all_sparse_branches_valid = bool(
         branch_guards["all_four_estimators_valid"]
     )
     sparse_outputs_finite = bool(
@@ -2657,7 +2609,7 @@ def main() -> None:
     sparse_fit_rejection_reasons = list(
         branch_guards["combined_invalid_reasons"]
     )
-    if not guarded_sparse_fit_accepted:
+    if not all_sparse_branches_valid:
         logger.warning(
             "[WARN] sparse estimator branches incomplete: "
             "lasso_valid=%s selected_support_refit_valid=%s reasons=%s. "
@@ -2667,18 +2619,6 @@ def main() -> None:
             ",".join(sparse_fit_rejection_reasons),
         )
 
-    # Ordinary REML is a separate baseline, never a replacement for any of
-    # the four sparse estimators.  The legacy fallback fields remain present
-    # as explicit nulls so old readers cannot silently reinterpret a sparse
-    # estimator as ordinary REML.
-    theta_primary = theta_lasso_ml.copy()
-    h2_covariates_only_reml_fallback = None
-    primary_fallback_reml_iterations = 0
-    primary_fallback_reml_stop_reason = None
-
-    h2_sparse_dense_hybrid = _primary_sparse_dense_h2(
-        h2_chive, h2_chive_post_gls
-    )
     h2_lasso_plugin_guarded = (
         float(h2_lasso_plugin) if lasso_branch_valid else unavailable
     )
@@ -2694,24 +2634,10 @@ def main() -> None:
         else unavailable
     )
     h2 = h2_chive_guarded
-    primary_fallback = False
-    primary_fallback_reason = None
     primary_h2_method = (
         "penalized_ml_lasso_chive" if lasso_branch_valid else "unavailable"
     )
 
-    # Fix the legacy field meanings: ``var_components`` follows the primary
-    # Lasso/residual-ML branch and never switches identity according to guard
-    # status.  REML-labelled background fields refer only to the independent
-    # selected-support refit and are unavailable when that branch is invalid.
-    theta = theta_lasso_ml.copy()
-    var_components_compatibility_branch = "lasso_ml"
-    h2_background_reml = (
-        _trace_weighted_h2(theta_selected_span_reml)
-        if selected_support_refit_branch_valid
-        else unavailable
-    )
-    h2_reml = h2_background_reml
     h2_background_selected_span_reml = (
         _trace_weighted_h2(theta_selected_span_reml)
         if selected_support_refit_branch_valid
@@ -2723,19 +2649,11 @@ def main() -> None:
         "[RESULT] var_components_selected_span_reml="
         f"{theta_selected_span_reml.tolist() if selected_span_refit_ok else None}"
     )
-    print(f"[RESULT] var_components={theta.tolist()}")
-    print(
-        "[RESULT] var_components_compatibility="
-        f"{var_components_compatibility_branch}"
-    )
-    print(f"[RESULT] var_components_primary={theta_primary.tolist()}")
     print(f"[RESULT] h2={h2:.6f} (primary={primary_h2_method})")
-    if primary_fallback:
-        print(
-            f"[RESULT] h2_sparse_dense_unconverged={h2_sparse_dense_hybrid:.6f} "
-            "(diagnostic only)"
-        )
-    print(f"[RESULT] h2_background_reml={h2_background_reml:.6f}")
+    print(
+        "[RESULT] h2_background_selected_span_reml="
+        f"{h2_background_selected_span_reml:.6f}"
+    )
     print(
         f"[RESULT] h2_lasso_plugin={h2_lasso_plugin:.6f} "
         "(uncorrected penalized-LASSO plug-in)"
@@ -2753,16 +2671,8 @@ def main() -> None:
         f"[RESULT] h2_ss_gls_df_corrected={h2_ss_gls_df_corrected:.6f} "
         "(trace-corrected selected-span GLS)"
     )
-    # Historical stdout labels retained for downstream parsers.
-    print(f"[RESULT] h2_reml={h2_reml:.6f}")
-    print(f"[RESULT] h2_chive_reml={h2_chive_reml:.6f}")
     print(f"[RESULT] support_size={int(support.size)}")
 
-    theta_lasso_to_selected_span_rel = (
-        _max_rel_change(theta_selected_span_reml, theta_lasso)
-        if selected_span_refit_ok
-        else None
-    )
     theta_lasso_ml_to_selected_span_rel = (
         _max_rel_change(theta_selected_span_reml, theta_lasso_ml)
         if selected_span_refit_ok
@@ -2825,7 +2735,7 @@ def main() -> None:
                 "phenotype_mean": float(phenotype_mean),
             },
         }
-        if not guarded_sparse_fit_accepted:
+        if not all_sparse_branches_valid:
             metadata_path = write_sparse_prediction_status(
                 out_prefix=out_prefix,
                 status="not_emitted_incomplete_branch",
@@ -2839,7 +2749,6 @@ def main() -> None:
                     "sparse_fit_rejection_reasons": list(
                         sparse_fit_rejection_reasons
                     ),
-                    "ordinary_reml_fallback_available": False,
                     "branch_outputs_emitted": False,
                 },
             )
@@ -2949,7 +2858,6 @@ def main() -> None:
                 minq_iter=args.minq_iter,
                 slq_samples=args.slq_samples,
                 slq_m=args.slq_m,
-                precond_type=args.precond_type,
                 precond_rank=0,
                 max_pcg_iters=args.max_pcg_iters,
                 pcg_ridge=args.pcg_ridge,
@@ -3067,7 +2975,7 @@ def main() -> None:
             }
 
     summary = {
-        "sparse_output_schema_version": 3,
+        "sparse_output_schema_version": 4,
         "finished_at": datetime.now().isoformat(timespec="seconds"),
         "elapsed_sec": float(time.time() - t0),
         "n_samples": int(y_np.shape[0]),
@@ -3086,17 +2994,8 @@ def main() -> None:
         "component_partition_mode": (
             "snp_id" if component_variant_indices else "input_prefix"
         ),
-        "var_components": theta.tolist(),
-        "var_components_compatibility_branch": (
-            var_components_compatibility_branch
-        ),
         "var_components_lasso_ml": theta_lasso_ml.tolist(),
         "var_components_selected_span_reml": (
-            theta_selected_span_reml.tolist()
-            if selected_span_refit_ok
-            else None
-        ),
-        "var_components_selected_support_reml": (
             theta_selected_span_reml.tolist()
             if selected_span_refit_ok
             else None
@@ -3107,28 +3006,12 @@ def main() -> None:
             "h2_ss_gls_plugin": "var_components_selected_span_reml",
             "h2_ss_gls_df_corrected": "var_components_selected_span_reml",
         },
-        "var_components_primary": theta_primary.tolist(),
-        "var_components_covariates_only_reml_fallback": (
-            theta_primary.tolist() if primary_fallback else None
-        ),
-        "ordinary_reml_fallback_used": False,
-        "ordinary_reml_baseline_h2": None,
-        "ordinary_reml_baseline_var_components": None,
         "var_components_at_lasso": theta_lasso.tolist(),
         "phenotype_mean": phenotype_mean,
         "phenotype_scale": phenotype_scale,
         "variance_component_scale": "standardized_phenotype",
         "primary_h2_method": primary_h2_method,
-        "primary_fallback": primary_fallback,
-        "primary_fallback_reason": primary_fallback_reason,
-        "primary_fallback_reml_iterations": primary_fallback_reml_iterations,
-        "primary_fallback_reml_stop_reason": (
-            primary_fallback_reml_stop_reason
-        ),
-        "guarded_sparse_fit_accepted": guarded_sparse_fit_accepted,
-        "guarded_sparse_fit_accepted_role": (
-            "deprecated_complete_case_alias_of_two_branch_validity_flags"
-        ),
+        "all_sparse_branches_valid": all_sparse_branches_valid,
         "lasso_branch_valid": lasso_branch_valid,
         "lasso_branch_invalid_reasons": list(
             branch_guards["lasso_branch_invalid_reasons"]
@@ -3149,7 +3032,6 @@ def main() -> None:
         ),
         "sparse_outputs_finite": sparse_outputs_finite,
         "sparse_fit_rejection_reasons": sparse_fit_rejection_reasons,
-        "outer_converged": lasso_ml_outer_converged,
         "lasso_ml_outer_converged": lasso_ml_outer_converged,
         "outer_stop_reason": outer_stop_reason,
         "penalized_failure_reason": penalized_failure_reason,
@@ -3163,11 +3045,10 @@ def main() -> None:
         ),
         "selected_span_reml_converged": bool(
             selected_span_reml_stop_reason
-            in {"rel_dll", "scoring_step", "projected_gradient"}
+            in {"rel_dll", "scoring_step", "ll_down"}
         ),
         "selected_span_refit_ok": selected_span_refit_ok,
         "selected_span_refit_error": selected_span_refit_error,
-        "reml_scoring_step_tol": float(args.reml_scoring_step_tol),
         "reml_max_linesearch_trials": int(
             args.reml_max_linesearch_trials
         ),
@@ -3184,12 +3065,6 @@ def main() -> None:
         "theta_lasso_to_lasso_ml_rel_change": (
             theta_lasso_to_lasso_ml_rel
         ),
-        # Deprecated compatibility key: preserve its historical comparison
-        # between the covariance entering the last Lasso and the final
-        # selected-span REML covariance.
-        "theta_lasso_to_final_rel_change": (
-            theta_lasso_to_selected_span_rel
-        ),
         "theta_lasso_ml_to_selected_span_reml_rel_change": (
             theta_lasso_ml_to_selected_span_rel
         ),
@@ -3197,19 +3072,14 @@ def main() -> None:
         "h2_background_selected_span_reml": _finite_float_or_none(
             h2_background_selected_span_reml
         ),
-        "h2_background_reml": h2_background_reml,
-        "h2_reml_background_only": h2_background_reml,
-        "h2_reml": h2_reml,
         "h2_lasso_plugin": _finite_float_or_none(h2_lasso_plugin),
         "h2_lasso_plugin_guarded": h2_lasso_plugin_guarded,
         "h2_lasso_plugin_role": "estimator_1_uncorrected_lasso_ml_plugin",
         "h2_chive": _finite_float_or_none(h2_chive),
         "h2_chive_guarded": h2_chive_guarded,
-        "h2_chive_penalized_lasso": _finite_float_or_none(h2_chive),
         "h2_chive_at_lasso_theta": _finite_float_or_none(
             h2_chive_at_lasso_theta
         ),
-        "h2_chive_reml": _finite_float_or_none(h2_chive_reml),
         "h2_chive_post_gls": _finite_float_or_none(h2_chive_post_gls),
         "h2_chive_post_gls_role": "diagnostic_only",
         "h2_ss_gls_plugin": _finite_float_or_none(h2_ss_gls_plugin),
@@ -3219,20 +3089,7 @@ def main() -> None:
         ),
         "h2_ss_gls_df_guarded": h2_ss_gls_df_guarded,
         "h2_ss_gls_role": "estimators_3_and_4_selected_support_reml_gls",
-        "h2_sparse_dense_hybrid": _finite_float_or_none(
-            h2_sparse_dense_hybrid
-        ),
-        "h2_sparse_dense_unconverged": (
-            _finite_float_or_none(h2_sparse_dense_hybrid)
-            if primary_fallback
-            else None
-        ),
-        "h2_covariates_only_reml_fallback": h2_covariates_only_reml_fallback,
         "h2": h2,
-        # Compatibility fields q_chive/q_chive_reml retain their historical
-        # raw-phenotype units.  Explicit fields below provide both scales.
-        "q_chive": _finite_float_or_none(q_chive),
-        "q_chive_reml": _finite_float_or_none(q_chive_reml),
         "q_lasso_plugin_raw": _finite_float_or_none(q_chive_term1),
         "q_lasso_plugin_standardized": _finite_float_or_none(
             q_chive_term1_standardized
@@ -3241,11 +3098,8 @@ def main() -> None:
         "q_chive_standardized": _finite_float_or_none(
             q_chive_standardized
         ),
-        "q_chive_post_gls_raw": _finite_float_or_none(q_chive_reml),
+        "q_chive_post_gls_raw": _finite_float_or_none(q_chive_post_gls_raw),
         "q_chive_post_gls_standardized": _finite_float_or_none(
-            q_chive_post_gls_standardized
-        ),
-        "q_chive_reml_standardized": _finite_float_or_none(
             q_chive_post_gls_standardized
         ),
         "q_chive_components": {
@@ -3262,12 +3116,12 @@ def main() -> None:
             ),
             "scale": "standardized_phenotype_variance",
         },
-        "q_chive_reml_components": {
+        "q_chive_post_gls_components_raw": {
             "term1_g2_over_n": _finite_float_or_none(
-                q_chive_reml_term1
+                q_chive_post_gls_term1_raw
             ),
             "term2_cross": _finite_float_or_none(
-                q_chive_reml_term2
+                q_chive_post_gls_term2_raw
             ),
             "scale": "raw_phenotype_variance",
         },
@@ -3302,15 +3156,12 @@ def main() -> None:
         "support_size": int(support.size),
         "support_indices": support.tolist(),
         "support_source_indices": grm_index.source_variant_indices(support).tolist(),
-        "kkt_check_enabled": bool(args.kkt_check),
         # Candidate expansion certifies the EBIC-selected lambda in each outer
         # round.  It does not certify every unselected point on the lambda path.
-        "kkt_certification_scope": (
-            "selected_lambda_only" if args.kkt_check else "disabled"
-        ),
+        "kkt_certification_scope": "selected_lambda_only",
         "ebic_path_globally_kkt_certified": False,
         "kkt_certified": bool(
-            args.kkt_check and history and bool(history[-1].get("kkt_certified", False))
+            history and bool(history[-1].get("kkt_certified", False))
         ),
         "returned_covariance_kkt_certified": bool(
             returned_covariance_kkt["passed"]

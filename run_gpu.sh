@@ -22,7 +22,7 @@ Launcher args:
   --prediction-pgen-prefix PATH
   --prediction-covar-txt PATH
   --keep-path PATH
-  --gpu-budget-gb NUM
+  --gpu-budget-gib NUM
   --ring-depth NUM
   --out-prefix PATH
   --log-label NAME
@@ -50,7 +50,7 @@ RARE_PGEN_PREFIX=""
 PHENO_TXT=""
 COVAR_TXT=""
 KEEP_PATH=""
-GPU_BUDGET_GB="${GPU_BUDGET_GB:-40}"
+GPU_BUDGET_GIB="${GPU_BUDGET_GIB:-40}"
 RING_DEPTH="${RING_DEPTH:-0}"
 OUT_PREFIX=""
 LOG_LABEL="${LOG_LABEL:-}"
@@ -131,12 +131,12 @@ while [[ $# -gt 0 ]]; do
       KEEP_PATH="${1#--keep-path=}"
       shift
       ;;
-    --gpu-budget-gb)
-      GPU_BUDGET_GB="${2:-}"
+    --gpu-budget-gib)
+      GPU_BUDGET_GIB="${2:-}"
       shift 2
       ;;
-    --gpu-budget-gb=*)
-      GPU_BUDGET_GB="${1#--gpu-budget-gb=}"
+    --gpu-budget-gib=*)
+      GPU_BUDGET_GIB="${1#--gpu-budget-gib=}"
       shift
       ;;
     --ring-depth)
@@ -281,8 +281,8 @@ fi
 echo "timestamp,rss_kb,hwm_kb,vmsize_kb,threads" > "$CPU_MON_LOG"
 
 GPU_BUDGET_ARGS=()
-if [[ "${GPU_BUDGET_GB}" != "0" ]]; then
-  GPU_BUDGET_ARGS=(--gpu-budget-gb "$GPU_BUDGET_GB")
+if [[ "${GPU_BUDGET_GIB}" != "0" ]]; then
+  GPU_BUDGET_ARGS=(--gpu-budget-gib "$GPU_BUDGET_GIB")
 fi
 
 RING_DEPTH_ARGS=()

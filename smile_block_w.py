@@ -689,18 +689,6 @@ class SmileBlockWeightedOperator:
         return diag
 
     @staticmethod
-    def _compute_trace_per_sample(
-        diag_contrib: np.ndarray,
-        *,
-        normalization: Normalization,
-    ) -> float:
-        diag_arr = np.asarray(diag_contrib, dtype=np.float64)
-        value = float(np.sum(diag_arr) / float(diag_arr.size))
-        if not np.isfinite(value) or value <= 0.0:
-            raise ValueError(f"Invalid SMILE block trace contribution: {value!r}.")
-        return value
-
-    @staticmethod
     def _compute_trace_per_sample_from_block(
         streamer,
         W: np.ndarray | None,

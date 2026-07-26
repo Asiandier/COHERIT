@@ -13,7 +13,7 @@ GPU_REML is organized around one contract: a covariance component must expose
 | Matrix-free operators | `kv_impl.py`, `smile_block_w.py` | Decode blocks and implement standard, partitioned, multi-GRM, admixed, weighted, transpose, and prediction products. |
 | Numerical solver | `reml.py`, `pcg.py`, `precond.py` | Form the REML projection, Hutchinson scores, SLQ objective, AI matrix, constrained updates, and projected-core preconditioner. |
 | Public model API | `reml_model.py` | Build compatible operator bundles, manage preconditioner lifecycle, fit replicates, estimate effects, and predict. |
-| Downstream models | `lasso_cd.py`, `gwas.py`, `relaxation_grouping.py` | Reuse the fitted covariance for sparse GLS, marginal GWAS, and grouping experiments. |
+| Downstream models | `lasso_cd.py`, `gwas.py` | Reuse the fitted covariance for sparse GLS and marginal GWAS. |
 
 ## Fit Lifecycle
 
@@ -26,13 +26,17 @@ GPU_REML is organized around one contract: a covariance component must expose
    `_OperatorBundle`: component matvecs, diagonals, a weighted `H @ V` path, a
    stacked component path, optional residual diagonals, and projected-core atom
    builders.
-5. A randomized Nystrom-style sketch constructs the shared basis `U`; component
-   core atoms are reduced while genotype blocks are streamed.
-6. `fit_reml` fixes Hutchinson/SLQ probes, caches `K_i @ Vrand`, and iterates
-   PCG projection, score/AI evaluation, constrained Fisher steps, and line
-   search. For one GRM plus an identity residual, it also caches the Lanczos
-   tridiagonal of `K` and evaluates every later `theta_g K + theta_e I`
-   candidate by shift/scale of that small matrix.
+5. A randomized Nystrom-style sketch constructs the initial projected-core
+   basis `U`; component core atoms are reduced while genotype blocks are
+   streamed.
+6. `fit_reml` fixes Hutchinson/SLQ probes and one projected-core SLQ reference
+   factorization, caches `K_i @ Vrand`, and iterates PCG projection, score/AI
+   evaluation, constrained Fisher steps, and line search. After each accepted
+   nonterminal step, the model rebuilds only the PCG basis for the next round;
+   the fit-wide SLQ reference remains unchanged. For one GRM plus an identity
+   residual, it instead caches the Lanczos tridiagonal of `K` and evaluates
+   every later `theta_g K + theta_e I` candidate by shift/scale of that small
+   matrix.
 7. Optional effect estimation solves for `P y`, derives SNP effects, and stores
    the phenotype transformation needed to return predictions to the original
    scale.
@@ -54,6 +58,10 @@ GPU_REML is organized around one contract: a covariance component must expose
   manifest remain responsible for equivalent validation.
 - Fixed effects must be full column rank. High-level loaders add an intercept;
   low-level callers control the design matrix explicitly.
+- Every REML fit standardizes its response internally and records the mean and
+  scale needed for effects and predictions. Sparse residual-ML converts its
+  unit-residual variance estimates back to the global standardized-phenotype
+  scale before combining them with sparse quadratic terms.
 - Strict REML requires converged PCG solves and symmetric operators. Approximate
   `smile_scoring` is a separate opt-in optimization policy.
 

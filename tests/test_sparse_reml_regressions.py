@@ -53,10 +53,6 @@ def test_sparse_dense_h2_is_invariant_to_phenotype_rescaling():
     assert abs(h2_old - h2_scaled_old) > 0.05
 
 
-def test_primary_h2_uses_penalized_chive_not_post_selection_gls():
-    assert SPARSE._primary_sparse_dense_h2(0.31, 0.47) == 0.31
-
-
 def test_raw_lasso_plugin_is_chive_first_term_without_calibration():
     rng = np.random.RandomState(1617)
     z_active = rng.standard_normal((100, 5))
@@ -182,10 +178,11 @@ def test_sparse_pipeline_ebic_defaults_to_full_model_space(monkeypatch):
     args = SPARSE.parse_args()
     assert args.ebic_p_mode == "full"
     assert args.minq_iter == 50
-    assert args.kkt_check is True
+    assert not hasattr(args, "kkt_check")
 
     monkeypatch.setattr(sys, "argv", ["gpu-reml-sparse", "--kkt-check"])
-    assert SPARSE.parse_args().kkt_check is True
+    with np.testing.assert_raises(SystemExit):
+        SPARSE.parse_args()
 
     monkeypatch.setattr(
         sys,
@@ -218,12 +215,13 @@ def test_json_safe_value_replaces_nested_nonfinite_diagnostics():
     }
 
 
-def test_reml_state_validation_distinguishes_convergence_from_rejected_step():
+def test_reml_state_validation_accepts_only_coherent_converged_states():
     accepted = SimpleNamespace(
         var_components=np.asarray([0.3, 0.7]),
         history=[
             {
                 "accepted": True,
+                "converged": True,
                 "stop_reason": "rel_dll",
             }
         ],
@@ -236,47 +234,20 @@ def test_reml_state_validation_distinguishes_convergence_from_rejected_step():
     assert np.array_equal(theta, np.asarray([0.3, 0.7]))
     assert reason == "rel_dll"
 
-    stationary = SimpleNamespace(
-        var_components=np.asarray([0.3, 0.7]),
-        history=[
-            {
-                "accepted": False,
-                "returned_state_accepted": True,
-                "converged": True,
-                "stop_reason": "projected_gradient",
-            }
-        ],
-    )
-    theta, reason = SPARSE._accepted_reml_theta(
-        stationary,
-        expected_components=2,
-        stage="test",
-    )
-    assert np.array_equal(theta, np.asarray([0.3, 0.7]))
-    assert reason == "projected_gradient"
-
     rejected_step = SimpleNamespace(
         var_components=np.asarray([0.3, 0.7]),
         history=[
             {
                 "accepted": False,
-                "returned_state_accepted": True,
-                "converged": False,
+                "converged": True,
                 "stop_reason": "ll_down",
             }
         ],
     )
-    with np.testing.assert_raises(RuntimeError):
-        SPARSE._accepted_reml_theta(
-            rejected_step,
-            expected_components=2,
-            stage="test",
-        )
     theta, reason = SPARSE._accepted_reml_theta(
         rejected_step,
         expected_components=2,
         stage="test",
-        allow_step_rejection=True,
     )
     assert np.array_equal(theta, np.asarray([0.3, 0.7]))
     assert reason == "ll_down"
@@ -291,6 +262,7 @@ def test_reml_state_validation_distinguishes_convergence_from_rejected_step():
             history=[
                 {
                     "accepted": True,
+                    "converged": False,
                     "stop_reason": "max_iter",
                 }
             ],
@@ -300,6 +272,7 @@ def test_reml_state_validation_distinguishes_convergence_from_rejected_step():
             history=[
                 {
                     "accepted": True,
+                    "converged": True,
                     "stop_reason": "rel_dll",
                 }
             ],
@@ -352,8 +325,18 @@ def test_lasso_variance_block_uses_an_intercept_contrast_design():
     assert np.array_equal(design, np.ones((37, 1), dtype=np.float32))
 
 
-def test_residual_ml_helper_passes_intercept_and_disables_restandardization():
-    marker = object()
+def test_residual_ml_helper_passes_intercept_on_standardized_fit_path():
+    marker = SimpleNamespace(
+        var_components=REML.jnp.asarray(
+            [0.25, 0.75], dtype=REML.jnp.float32
+        ),
+        rep_var_components=None,
+        monte_carlo_se_var=None,
+        final_grad=None,
+        final_ai=None,
+        diagnostics=None,
+        history=[{"params": [0.25, 0.75], "step_norm": 0.1, "grad_norm": 2.0}],
+    )
 
     class RecordingFitter:
         def fit_infinitesimal(self, y, covar, **kwargs):
@@ -377,10 +360,25 @@ def test_residual_ml_helper_passes_intercept_and_disables_restandardization():
     assert np.array_equal(
         fitter.covar, np.ones((residual.size, 1), dtype=np.float32)
     )
-    assert fitter.kwargs["standardize_y"] is False
+    assert "standardize_y" not in fitter.kwargs
     assert np.isclose(fitter.kwargs["h2_init"], 0.31)
+    _, residual_scale = SPARSE._phenotype_standardization_stats(residual)
+    variance_scale = residual_scale**2
     assert np.array_equal(
-        np.asarray(fitter.kwargs["var_components_init"]), theta
+        np.asarray(fitter.kwargs["var_components_init"]),
+        np.asarray(theta / variance_scale, dtype=np.float32),
+    )
+    np.testing.assert_allclose(
+        np.asarray(result.var_components),
+        np.asarray([0.25, 0.75]) * variance_scale,
+    )
+    np.testing.assert_allclose(
+        result.history[0]["params"],
+        np.asarray([0.25, 0.75]) * variance_scale,
+    )
+    assert np.isclose(
+        result.history[0]["variance_scale_to_standardized_phenotype"],
+        variance_scale,
     )
 
 
@@ -392,7 +390,6 @@ def test_empty_support_reduces_to_background_only_heritability():
 
     assert np.isclose(penalized, expected)
     assert np.isclose(post_gls, expected)
-    assert np.isclose(SPARSE._primary_sparse_dense_h2(penalized, post_gls), expected)
 
 
 def test_same_sample_ols_refit_makes_chive_cross_term_vanish():
@@ -546,7 +543,7 @@ def test_reml_backtracking_reuses_the_accepted_state_warm_anchor(
         return (
             ll,
             grad,
-            jnp.eye(2, dtype=jnp.float32),
+            REML.AverageInfoMatrix(jnp.eye(2, dtype=jnp.float32), ridge=0.0),
             0,
             warm_token,
             jnp.zeros((ctx.n, 2), dtype=jnp.float32),
@@ -583,40 +580,67 @@ def test_reml_backtracking_reuses_the_accepted_state_warm_anchor(
     )
 
     assert np.allclose(np.asarray(theta), [0.5, 0.5])
-    assert history[-1]["stop_reason"] == "projected_gradient"
+    assert history[-1]["stop_reason"] == "ll_down"
     assert history[-1]["accepted"] is False
-    assert history[-1]["returned_state_accepted"] is True
     assert history[-1]["converged"] is True
     assert history[-1]["line_search_trials"] == 3
+    assert np.allclose(history[-1]["params"], [0.5, 0.5])
+    assert history[-1]["loglik"] == history[-1]["loglik_prev"]
     assert calls["candidate_warm_means"] == [10.0, 10.0, 10.0]
 
-    # The same rejected candidates are a nonstationary ``ll_down`` when the
-    # projected-score tolerance is tighter.  The returned value must still be
-    # the old accepted theta, never the downhill candidate.
-    calls["eval"] = 0
-    calls["candidate_warm_means"] = []
-    theta, history = REML.fit_reml(
+
+def test_strict_reml_stops_on_relative_likelihood_increment_alone(
+    monkeypatch,
+):
+    jnp = REML.jnp
+    calls = {"eval": 0}
+
+    def fake_eval_once(ctx, pvec, warm_all, **_kwargs):
+        del pvec
+        call_idx = calls["eval"]
+        calls["eval"] += 1
+        ll = jnp.asarray(1.0 if call_idx == 0 else 1.0005)
+        return (
+            ll,
+            jnp.asarray([0.1, 0.1], dtype=jnp.float32),
+            REML.AverageInfoMatrix(jnp.eye(2, dtype=jnp.float32), ridge=0.0),
+            0,
+            warm_all,
+            jnp.zeros((ctx.n, 2), dtype=jnp.float32),
+            jnp.ones((1,), dtype=jnp.float32),
+            jnp.ones((1,), dtype=jnp.float32),
+            jnp.asarray(0.0, dtype=jnp.float32),
+        )
+
+    monkeypatch.setattr(REML, "_eval_once", fake_eval_once)
+    monkeypatch.setattr(
+        REML,
+        "_compute_traces_from_pcg",
+        lambda _warm, _ctx: (
+            jnp.ones((1,), dtype=jnp.float32),
+            jnp.ones((1,), dtype=jnp.float32),
+        ),
+    )
+
+    _theta, history = REML.fit_reml(
         y=jnp.asarray([0.5, -0.1, 1.2, 0.3], dtype=jnp.float32),
         K_mvs=[lambda value: value],
         diag_list=[jnp.ones((4,), dtype=jnp.float32)],
         covar=None,
         n_rand_vec=2,
         maxiter=8,
-        minq_iter=1,
+        minq_iter=2,
         slq_samples=2,
         slq_m=3,
         precond_conf=None,
         param_init=jnp.asarray([0.5, 0.5], dtype=jnp.float32),
-        max_linesearch_trials=3,
-        scoring_step_tol=1e-6,
+        rel_dll_tol=1e-3,
         verbose=False,
     )
 
-    assert np.allclose(np.asarray(theta), [0.5, 0.5])
-    assert history[-1]["stop_reason"] == "ll_down"
-    assert history[-1]["accepted"] is False
-    assert history[-1]["returned_state_accepted"] is True
-    assert history[-1]["converged"] is False
-    assert np.allclose(history[-1]["params"], [0.5, 0.5])
-    assert history[-1]["loglik"] == history[-1]["loglik_prev"]
-    assert calls["candidate_warm_means"] == [10.0, 10.0, 10.0]
+    assert len(history) == 1
+    assert history[0]["accepted"] is True
+    assert history[0]["rel_dll"] < 1e-3
+    assert history[0]["converged"] is True
+    assert history[0]["stop_reason"] == "rel_dll"
+    assert "proj_grad_inf" not in history[0]

@@ -69,7 +69,6 @@ def _dense_affine_context(*, with_fixed_effects: bool):
         y_col=x_cols,
         rand_stop=x_cols + 1 + int(probes.shape[1]),
         n_XyZ_cols=int(rhs_const.shape[1]),
-        n_GZrand_components=1,
         R_rand=int(probes.shape[1]),
         precond_conf=None,
         kvrand_stack=(kernel @ probes)[None, :, :],
@@ -130,7 +129,11 @@ def test_affine_slq_ai_direction_is_an_ascent_direction_with_fixed_effects():
     context = _dense_affine_context(with_fixed_effects=True)
     theta = np.asarray([0.22, 0.91], dtype=np.float32)
     ll, grad, average_info, *_ = _evaluate(context, theta)
-    direction = np.asarray(REML._newton_step(grad, average_info))
+    ai = np.asarray(average_info.mat, dtype=np.float64)
+    direction = np.linalg.solve(
+        0.5 * (ai + ai.T) + float(average_info.ridge) * np.eye(ai.shape[0]),
+        np.asarray(grad, dtype=np.float64),
+    )
     gradient = np.asarray(grad)
 
     assert float(gradient @ direction) > 0.0

@@ -131,8 +131,9 @@ lower-bound KKT signs in one host-side solve. This avoids recompiling a separate
 JAX Cholesky for every possible active-set dimension when hundreds of variance
 components hit zero together. Strict mode then uses deterministic, fixed-probe
 likelihood backtracking; a numerically invalid candidate is reduced and retried.
-Convergence checks combine likelihood improvement with a KKT-projected gradient
-or a small relative parameter step.
+For strict stochastic REML, an accepted update converges when its relative
+likelihood increment is below `rel_dll_tol`. SMILE scoring retains its separate
+relative-step stopping rule.
 
 ## Hutchinson Trace Identity
 
@@ -212,9 +213,12 @@ M^-1 v = d^-1 v
          + U [(d I + C)^-1 - d^-1 I] U^T v
 ```
 
-The basis is rebuilt only after an accepted step whose maximum relative
-parameter change reaches `precond_refresh_reldp`. Rejected line-search trials
-reuse the current preconditioner.
+The projected-core objects have separate roles during optimization.  Residual
+SLQ fixes one reference factorization for the entire fit, so every likelihood
+comparison uses the same finite-probe approximation.  PCG rebuilds its basis
+after every accepted, nonterminal REML step; rejected line-search trials reuse
+the current PCG basis.  Within each evaluation, the small PCG core is still
+assembled from the candidate variance parameters.
 
 ## Heritability and Initialization
 
@@ -233,5 +237,5 @@ has this meaning for standard, admixed, and effective-rank SMILE kernels.
 
 Repeated `n_reml_reps` fits vary the randomized probes. Their spread estimates
 Monte Carlo uncertainty of the replicate mean; it is not a sample-deletion
-jackknife. The explicit result fields are `monte_carlo_se_var` and
-`monte_carlo_se_h2`; legacy `jackknife_*` fields remain compatibility aliases.
+jackknife. The result fields are `monte_carlo_se_var` and
+`monte_carlo_se_h2`.

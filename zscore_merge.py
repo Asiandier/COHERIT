@@ -284,19 +284,14 @@ def _pipeline_command(args: argparse.Namespace, component_spec: Path, out_prefix
     _add_arg(cmd, "--slq-samples", args.slq_samples)
     _add_arg(cmd, "--slq-m", args.slq_m)
     _add_arg(cmd, "--slq-mode", args.slq_mode)
-    _add_arg(cmd, "--precond-refresh-reldp", args.precond_refresh_reldp)
-    _add_arg(cmd, "--precond-type", args.precond_type)
     _add_arg(cmd, "--minq-iter", args.minq_iter)
+    _add_arg(cmd, "--reml-pcg-tol", args.reml_pcg_tol)
     if not args.verbose:
         cmd.append("--non-verbose")
     return cmd
 
 
 def run_reml_round(args: argparse.Namespace, component_spec: Path, out_prefix: Path) -> None:
-    theta_path = out_prefix.with_suffix(".theta.npy")
-    ai_path = out_prefix.with_suffix(".ai.npy")
-    if theta_path.exists() and ai_path.exists():
-        return
     out_prefix.parent.mkdir(parents=True, exist_ok=True)
     cmd = _pipeline_command(args, component_spec, out_prefix)
     env = os.environ.copy()
@@ -353,8 +348,8 @@ def _validate_merge_args(args: argparse.Namespace) -> Path:
         for name in ("admix_q", "admix_fam", "admix_component_names")
     ):
         raise SystemExit("--merge cannot be combined with ADMIXTURE covariance inputs.")
-    if args.vc_block_sizes or args.component_indices_npz:
-        raise SystemExit("--merge requires --component-spec; do not use --vc-block-sizes or --component-indices-npz.")
+    if args.vc_block_sizes:
+        raise SystemExit("--merge requires --component-spec; do not use --vc-block-sizes.")
     if not args.component_spec:
         raise SystemExit("--merge requires --component-spec.")
     if not args.pheno_txt:
@@ -376,6 +371,20 @@ def _validate_merge_args(args: argparse.Namespace) -> Path:
 def run_from_pipeline_args(args: argparse.Namespace) -> dict[str, object]:
     out_dir = _validate_merge_args(args)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # A merge run is one indivisible workflow. Remove its prior round state so
+    # every result in out_dir belongs to the current inputs and parameters.
+    for round_name in ("round00", "round01"):
+        round_dir = out_dir / round_name
+        if round_dir.exists():
+            shutil.rmtree(round_dir)
+    for stale_name in (
+        "round00.component_spec.json",
+        "round01.component_spec.json",
+    ):
+        stale_path = out_dir / stale_name
+        if stale_path.exists():
+            stale_path.unlink()
 
     components = specs_to_components(args.component_spec)
     if not components:
