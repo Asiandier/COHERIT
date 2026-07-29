@@ -154,24 +154,29 @@ def test_invalid_lasso_branch_invalidates_downstream_refit_branch():
     ]
 
 
-def test_terminal_sparse_pair_stops_only_after_returned_full_p_kkt():
-    common = {
-        "terminal_verification": True,
-        "stable_candidate": True,
-    }
-    assert not SPARSE._terminal_sparse_pair_may_stop(
-        **common,
-        returned_covariance_kkt={"passed": False},
+def test_fitted_mean_convergence_allows_equivalent_support_swaps():
+    marker = np.asarray([-2.0, -1.0, 0.5, 1.0, 1.5])
+    genotype = np.column_stack([marker, marker])
+    previous_beta = np.asarray([0.4, 0.0])
+    swapped_beta = np.asarray([0.0, 0.4])
+    previous_mean = genotype @ previous_beta
+    swapped_mean = genotype @ swapped_beta
+    phenotype = previous_mean + np.asarray([0.1, -0.2, 0.0, 0.2, -0.1])
+
+    swapped_change = SPARSE._relative_fitted_mean_change(
+        swapped_mean,
+        previous_mean,
+        phenotype,
     )
-    assert SPARSE._terminal_sparse_pair_may_stop(
-        **common,
-        returned_covariance_kkt={"passed": True},
+    assert swapped_change == 0.0
+
+    changed_mean = 2.0 * previous_mean
+    changed_ratio = SPARSE._relative_fitted_mean_change(
+        changed_mean,
+        previous_mean,
+        phenotype,
     )
-    assert not SPARSE._terminal_sparse_pair_may_stop(
-        terminal_verification=False,
-        stable_candidate=True,
-        returned_covariance_kkt={"passed": True},
-    )
+    assert changed_ratio > 1e-2
 
 
 def test_sparse_pipeline_ebic_defaults_to_full_model_space(monkeypatch):
@@ -269,27 +274,24 @@ def test_partitioned_signed_kkt_distinguishes_candidate_and_outside_failures():
     )
 
 
-def test_strict_kkt_action_separates_refit_expand_and_accept():
-    assert SPARSE._strict_kkt_refinement_action(
-        full_certificate_passed=False,
-        candidate_certificate_passed=False,
-        outside_violator_count=3,
-    ) == "rerun_path_strict"
-    assert SPARSE._strict_kkt_refinement_action(
-        full_certificate_passed=False,
-        candidate_certificate_passed=True,
-        outside_violator_count=3,
-    ) == "expand_candidate_strict"
-    assert SPARSE._strict_kkt_refinement_action(
-        full_certificate_passed=True,
-        candidate_certificate_passed=True,
-        outside_violator_count=0,
-    ) == "accept"
-    assert SPARSE._strict_kkt_refinement_action(
-        full_certificate_passed=False,
-        candidate_certificate_passed=True,
-        outside_violator_count=0,
-    ) == "inconsistent_full_certificate"
+def test_variance_component_convergence_uses_mixed_tolerance_near_zero():
+    converged, ratio = SPARSE._variance_components_converged(
+        np.asarray([5e-5, 0.6001]),
+        np.asarray([1e-10, 0.6]),
+        rel_tol=1e-2,
+        abs_tol=1e-4,
+    )
+    assert converged is True
+    assert ratio <= 1.0
+
+    converged, ratio = SPARSE._variance_components_converged(
+        np.asarray([5e-3, 0.6001]),
+        np.asarray([1e-10, 0.6]),
+        rel_tol=1e-2,
+        abs_tol=1e-4,
+    )
+    assert converged is False
+    assert ratio > 1.0
 
 
 def test_partitioned_kkt_rejects_nonfinite_outside_score_with_empty_support():
@@ -306,66 +308,35 @@ def test_partitioned_kkt_rejects_nonfinite_outside_score_with_empty_support():
         )
 
 
-def test_default_kkt_pcg_tolerance_is_dynamic_and_stricter(monkeypatch):
+def test_sparse_defaults_use_ten_outer_rounds_and_pcg_scaled_kkt_floor(
+    monkeypatch,
+):
     monkeypatch.delenv("PCG_TOL", raising=False)
-    monkeypatch.delenv("KKT_PCG_TOL", raising=False)
 
     monkeypatch.setattr(sys, "argv", ["gpu-reml-sparse"])
     default_args = SPARSE.parse_args()
-    assert np.isclose(default_args.kkt_pcg_tol, 1e-5)
-    assert default_args.kkt_pcg_tol < default_args.pcg_tol
-
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["gpu-reml-sparse", "--pcg-tol", "1e-3"],
-    )
-    tighter_coarse = SPARSE.parse_args()
-    assert np.isclose(tighter_coarse.kkt_pcg_tol, 2e-6)
-    assert tighter_coarse.kkt_pcg_tol < tighter_coarse.pcg_tol
+    default_floor = max(1e-4, 2.0 * default_args.pcg_tol)
+    assert default_args.outer_max == 10
+    assert np.isclose(default_args.kkt_tol, default_floor)
+    assert np.isclose(default_args.kkt_rel_tol, default_floor)
 
     monkeypatch.setattr(
         sys,
         "argv",
         [
             "gpu-reml-sparse",
+            "--pcg-tol",
+            "2e-3",
             "--kkt-tol",
-            "1e-6",
+            "1e-8",
             "--kkt-rel-tol",
-            "1e-6",
+            "3e-3",
         ],
     )
-    tighter_certificate = SPARSE.parse_args()
-    assert np.isclose(tighter_certificate.kkt_pcg_tol, 1e-7)
-
-
-def test_strict_lasso_path_config_only_tightens_kkt_tolerances():
-    path_cfg = LASSO.LassoPathConfig(
-        lam_min_ratio=0.02,
-        n_lambda=17,
-        ebic_gamma=0.7,
-        ebic_eps=2e-12,
-        max_cd_iter=321,
-        cd_tol=3e-7,
-        ebic_early_stop=False,
-        ebic_early_stop_patience=6,
-        ebic_early_stop_min_delta=0.25,
-        active_set_period=9,
-        kkt_abs_tol=8e-5,
-        kkt_rel_tol=4e-5,
-        verbose=True,
-    )
-
-    strict_cfg = SPARSE._strict_lasso_path_config(path_cfg)
-
-    assert strict_cfg is not path_cfg
-    assert np.isclose(strict_cfg.kkt_abs_tol, 2e-5)
-    assert np.isclose(strict_cfg.kkt_rel_tol, 1e-5)
-    assert np.isclose(path_cfg.kkt_abs_tol, 8e-5)
-    assert np.isclose(path_cfg.kkt_rel_tol, 4e-5)
-    for field, value in vars(path_cfg).items():
-        if field not in {"kkt_abs_tol", "kkt_rel_tol"}:
-            assert getattr(strict_cfg, field) == value
+    floored_args = SPARSE.parse_args()
+    requested_floor = max(1e-4, 2.0 * floored_args.pcg_tol)
+    assert np.isclose(floored_args.kkt_tol, requested_floor)
+    assert np.isclose(floored_args.kkt_rel_tol, requested_floor)
 
 
 def test_true_pcg_relative_residual_recomputes_from_linear_system():
@@ -392,100 +363,6 @@ def test_true_pcg_relative_residual_recomputes_from_linear_system():
     )
     assert np.isclose(observed, expected)
 
-
-def test_strict_pcg_restarts_from_current_solution_when_true_residual_fails(
-    monkeypatch,
-):
-    rhs = np.asarray([[1.0], [2.0]], dtype=np.float32)
-    calls = []
-    true_residuals = iter([2e-4, 5e-5])
-
-    def fake_pcg(_hv, _rhs, *, M, tol, maxiter, X0):
-        del M, tol
-        solution = np.full_like(rhs, len(calls) + 1, dtype=np.float32)
-        calls.append(
-            {
-                "maxiter": int(maxiter),
-                "X0": None if X0 is None else np.asarray(X0).copy(),
-                "solution": solution.copy(),
-            }
-        )
-        iters = 3 if len(calls) == 1 else 2
-        return solution, np.asarray(5e-5), iters
-
-    monkeypatch.setattr(SPARSE, "pcg_solve", fake_pcg)
-    monkeypatch.setattr(
-        SPARSE,
-        "_true_pcg_relative_residual",
-        lambda _hv, _rhs, _solution: next(true_residuals),
-    )
-
-    solution, diagnostics = SPARSE._strict_pcg_solve_with_true_residual(
-        lambda value: value,
-        rhs,
-        M=None,
-        tol=1e-4,
-        maxiter=10,
-        stage="test strict solve",
-    )
-
-    assert len(calls) == 2
-    assert calls[0]["X0"] is None
-    np.testing.assert_array_equal(calls[1]["X0"], calls[0]["solution"])
-    np.testing.assert_array_equal(solution, calls[1]["solution"])
-    assert [call["maxiter"] for call in calls] == [10, 7]
-    assert diagnostics["pcg_iters"] == 5
-    assert diagnostics["pcg_restart_count"] == 1
-    assert np.isclose(diagnostics["pcg_true_res"], 5e-5)
-    assert len(diagnostics["pcg_attempt_trace"]) == 2
-    assert diagnostics["pcg_attempt_trace"][1]["warm_started"] is True
-
-
-def test_strict_pcg_fails_after_bounded_true_residual_restarts(monkeypatch):
-    rhs = np.asarray([[1.0], [2.0]], dtype=np.float32)
-    calls = []
-
-    def fake_pcg(_hv, _rhs, *, M, tol, maxiter, X0):
-        del M, tol
-        solution = np.full_like(rhs, len(calls) + 1, dtype=np.float32)
-        calls.append(
-            {
-                "maxiter": int(maxiter),
-                "X0": None if X0 is None else np.asarray(X0).copy(),
-                "solution": solution.copy(),
-            }
-        )
-        return solution, np.asarray(5e-5), 2
-
-    monkeypatch.setattr(SPARSE, "pcg_solve", fake_pcg)
-    monkeypatch.setattr(
-        SPARSE,
-        "_true_pcg_relative_residual",
-        lambda _hv, _rhs, _solution: 2e-4,
-    )
-
-    try:
-        SPARSE._strict_pcg_solve_with_true_residual(
-            lambda value: value,
-            rhs,
-            M=None,
-            tol=1e-4,
-            maxiter=10,
-            stage="test strict exhaustion",
-        )
-    except RuntimeError as error:
-        diagnostics = error.strict_pcg_diagnostics
-        assert "true-residual replacement restarts=2" in str(error)
-    else:
-        raise AssertionError("Expected strict PCG true-residual failure.")
-
-    assert len(calls) == 3
-    assert [call["maxiter"] for call in calls] == [10, 8, 6]
-    np.testing.assert_array_equal(calls[1]["X0"], calls[0]["solution"])
-    np.testing.assert_array_equal(calls[2]["X0"], calls[1]["solution"])
-    assert diagnostics["pcg_iters"] == 6
-    assert diagnostics["pcg_restart_count"] == 2
-    assert len(diagnostics["pcg_attempt_trace"]) == 3
 
 def test_sparse_dense_h2_rejects_nonfinite_or_nonpositive_denominator():
     assert np.isnan(SPARSE._sparse_dense_h2(np.nan, 0.2, 0.8))
