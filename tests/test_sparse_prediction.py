@@ -90,27 +90,62 @@ def test_prediction_cli_keep_options(monkeypatch):
     assert args.prediction_pgen_prefix == "test"
     assert args.prediction_covar_txt == "test.covar"
     assert args.prediction_keep_path == "test.keep"
+    assert args.compare_four_estimators is False
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["gpu-reml-sparse", "--compare-four-estimators"],
+    )
+    assert RUN_SPARSE.parse_args().compare_four_estimators is True
 
 
 def test_sparse_prediction_branches_follow_estimator_validity():
     branch_names = RUN_SPARSE._sparse_prediction_branch_names
     assert branch_names(
+        comparison_enabled=False,
         lasso_branch_valid=False,
         selected_support_refit_branch_valid=False,
     ) == []
     assert branch_names(
+        comparison_enabled=False,
         lasso_branch_valid=True,
         selected_support_refit_branch_valid=False,
     ) == ["lasso"]
     assert branch_names(
+        comparison_enabled=True,
         lasso_branch_valid=True,
         selected_support_refit_branch_valid=True,
     ) == ["lasso", "selected_span"]
     with pytest.raises(ValueError, match="requires a valid Lasso"):
         branch_names(
+            comparison_enabled=True,
             lasso_branch_valid=False,
             selected_support_refit_branch_valid=True,
         )
+
+    # A downstream refit cannot leak into the default COHERIT prediction.
+    assert branch_names(
+        comparison_enabled=False,
+        lasso_branch_valid=True,
+        selected_support_refit_branch_valid=True,
+    ) == ["lasso"]
+
+
+def test_remove_sparse_prediction_outputs_clears_reused_prefix(tmp_path):
+    prefix = str(tmp_path / "sparse")
+    table = tmp_path / "sparse.sparse_prediction.tsv"
+    metadata = tmp_path / "sparse.sparse_prediction_metadata.json"
+    unrelated = tmp_path / "sparse.summary.json"
+    table.write_text("stale selected-span table\n", encoding="utf-8")
+    metadata.write_text("{}\n", encoding="utf-8")
+    unrelated.write_text("{}\n", encoding="utf-8")
+
+    SPARSE_PRED.remove_sparse_prediction_outputs(prefix)
+
+    assert not table.exists()
+    assert not metadata.exists()
+    assert unrelated.exists()
 
 
 class _ArraySource:

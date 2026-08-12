@@ -76,6 +76,9 @@ write_sparse_prediction_outputs = (
 write_sparse_prediction_status = (
     _sparse_prediction_mod.write_sparse_prediction_status
 )
+remove_sparse_prediction_outputs = (
+    _sparse_prediction_mod.remove_sparse_prediction_outputs
+)
 
 _source_mod = importlib.import_module(f"{pkg_name}.geno_source")
 PgenGenoSource = _source_mod.PgenGenoSource
@@ -489,6 +492,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pcg-ridge", type=float, default=float(env("PCG_RIDGE", "1e-6")))
     p.add_argument("--max-pcg-iters", type=int, default=int(env("MAX_PCG_ITERS", "400")))
     p.add_argument("--outer-max", type=int, default=10)
+    p.add_argument(
+        "--compare-four-estimators",
+        action="store_true",
+        help=(
+            "Opt in to the secondary four-estimator comparison. This runs "
+            "the selected-support REML--GLS refit and emits the uncorrected "
+            "Lasso plug-in, selected-span plug-in, and trace-corrected "
+            "selected-span estimates in addition to the primary COHERIT "
+            "estimate. By default only the COHERIT estimator and Lasso "
+            "prediction branch are produced."
+        ),
+    )
     p.add_argument("--screen-topk", type=int, default=2000)
     p.add_argument("--candidate-k", type=int, default=256)
     p.add_argument("--vc-rel-tol", type=float, default=1e-2)
@@ -1023,6 +1038,7 @@ def _four_estimator_h2_from_branches(
 
 def _sparse_estimator_branch_guards(
     *,
+    comparison_enabled: bool,
     alpha_theta_pair_certified: bool,
     lasso_quadratics_available: bool,
     selected_span_refit_ok: bool,
@@ -1031,9 +1047,10 @@ def _sparse_estimator_branch_guards(
 ) -> dict[str, object]:
     """Validate the Lasso and selected-support estimator branches separately.
 
-    The selected-support REML--GLS refit is downstream of support selection,
-    but its numerical failure must not erase valid Lasso plug-in and CHIVE
-    estimates.  No ordinary-REML value is substituted into either branch.
+    The primary COHERIT branch is validated independently.  When comparison
+    mode is enabled, failure of the downstream selected-support REML--GLS
+    refit must not erase a valid COHERIT estimate.  No ordinary-REML value is
+    substituted into either branch.
     """
     lasso_values = np.asarray(
         lasso_estimator_values, dtype=np.float64
@@ -1041,8 +1058,10 @@ def _sparse_estimator_branch_guards(
     selected_values = np.asarray(
         selected_support_estimator_values, dtype=np.float64
     ).reshape(-1)
+    expected_lasso_outputs = 2 if comparison_enabled else 1
     lasso_outputs_finite = bool(
-        lasso_values.size == 2 and np.all(np.isfinite(lasso_values))
+        lasso_values.size == expected_lasso_outputs
+        and np.all(np.isfinite(lasso_values))
     )
     selected_outputs_finite = bool(
         selected_values.size == 2 and np.all(np.isfinite(selected_values))
@@ -1063,20 +1082,31 @@ def _sparse_estimator_branch_guards(
     )
 
     selected_reasons: list[str] = []
-    if not lasso_branch_valid:
-        selected_reasons.append("lasso_support_branch_not_valid")
-    if not selected_span_refit_ok:
-        selected_reasons.append("selected_support_reml_gls_unavailable")
-    if not selected_outputs_finite:
-        selected_reasons.append("nonfinite_selected_support_estimator")
-
-    selected_support_branch_valid = bool(
-        lasso_branch_valid
-        and selected_span_refit_ok
-        and selected_outputs_finite
-    )
+    selected_support_branch_valid = False
+    if comparison_enabled:
+        if not lasso_branch_valid:
+            selected_reasons.append("lasso_support_branch_not_valid")
+        if not selected_span_refit_ok:
+            selected_reasons.append("selected_support_reml_gls_unavailable")
+        if not selected_outputs_finite:
+            selected_reasons.append("nonfinite_selected_support_estimator")
+        selected_support_branch_valid = bool(
+            lasso_branch_valid
+            and selected_span_refit_ok
+            and selected_outputs_finite
+        )
     all_four_valid = bool(
-        lasso_branch_valid and selected_support_branch_valid
+        comparison_enabled
+        and lasso_branch_valid
+        and selected_support_branch_valid
+    )
+    all_requested_valid = bool(
+        lasso_branch_valid
+        and (not comparison_enabled or selected_support_branch_valid)
+    )
+    all_requested_outputs_finite = bool(
+        lasso_outputs_finite
+        and (not comparison_enabled or selected_outputs_finite)
     )
     combined_reasons = list(lasso_reasons) + list(selected_reasons)
     return {
@@ -1090,26 +1120,81 @@ def _sparse_estimator_branch_guards(
         "selected_support_refit_branch_invalid_reasons": selected_reasons,
         "all_four_estimators_valid": all_four_valid,
         "all_four_outputs_finite": bool(
-            lasso_outputs_finite and selected_outputs_finite
+            comparison_enabled
+            and lasso_outputs_finite
+            and selected_outputs_finite
         ),
+        "all_requested_estimators_valid": all_requested_valid,
+        "all_requested_outputs_finite": all_requested_outputs_finite,
         "combined_invalid_reasons": combined_reasons,
     }
 
 
 def _sparse_prediction_branch_names(
     *,
+    comparison_enabled: bool,
     lasso_branch_valid: bool,
     selected_support_refit_branch_valid: bool,
 ) -> list[str]:
     """Return independently available prediction branches in output order."""
-    if selected_support_refit_branch_valid and not lasso_branch_valid:
+    if (
+        comparison_enabled
+        and selected_support_refit_branch_valid
+        and not lasso_branch_valid
+    ):
         raise ValueError(
             "A selected-support prediction requires a valid Lasso branch."
         )
     names = ["lasso"] if lasso_branch_valid else []
-    if selected_support_refit_branch_valid:
+    if comparison_enabled and selected_support_refit_branch_valid:
         names.append("selected_span")
     return names
+
+
+def _sparse_output_contract(comparison_enabled: bool) -> dict[str, object]:
+    """Return the mode-labelled sparse output contract for one run."""
+    if comparison_enabled:
+        return {
+            "sparse_output_schema_version": 5,
+            "estimator_mode": "four_estimator_comparison",
+            "computed_estimators": [
+                "h2_lasso_plugin",
+                "h2_chive",
+                "h2_ss_gls_plugin",
+                "h2_ss_gls_df_corrected",
+            ],
+            "selected_snp_columns": [
+                "snp_index",
+                "source_snp_index",
+                "grm",
+                "chr",
+                "snp_id",
+                "cm",
+                "bp",
+                "a1",
+                "a2",
+                "beta_lasso",
+                "beta_gls_reml",
+                "selected_span_basis",
+            ],
+        }
+    return {
+        "sparse_output_schema_version": 5,
+        "estimator_mode": "coherit",
+        "computed_estimators": ["h2_chive"],
+        "selected_snp_columns": [
+            "snp_index",
+            "source_snp_index",
+            "grm",
+            "chr",
+            "snp_id",
+            "cm",
+            "bp",
+            "a1",
+            "a2",
+            "beta_lasso",
+        ],
+    }
 
 
 def _selected_span_gls_quadratics(
@@ -2418,8 +2503,9 @@ def main() -> None:
                 "final covariance-aligned EBIC-Lasso.",
                 int(args.outer_max),
             )
-    # Freeze the penalized-ML branch before the independent selected-support
-    # refit.  The final Lasso and theta now come from the same covariance.
+    # Freeze the primary COHERIT branch.  The final Lasso and theta now come
+    # from the same covariance.  A selected-support refit is an explicit,
+    # downstream comparison and is never part of the default estimator.
     theta_lasso_ml = np.asarray(theta, dtype=np.float64).copy()
     lasso_ml_outer_converged = bool(outer_converged)
     theta_lasso_to_lasso_ml_rel = _max_rel_change(
@@ -2451,7 +2537,9 @@ def main() -> None:
         else "outer_max_reached_before_change_tolerances"
     )
 
-    # ---- One selected-support REML refit ---------------------------------
+    comparison_enabled = bool(args.compare_four_estimators)
+
+    # ---- Optional selected-support REML refit ----------------------------
     Z_selected_for_reml = np.empty((n_samples, 0), dtype=np.float32)
     X_selected_span = covar_np
     selected_span_basis_local = np.empty((0,), dtype=np.int64)
@@ -2461,7 +2549,7 @@ def main() -> None:
     selected_span_refit_ok = False
     selected_span_refit_error = None
     theta_selected_span_reml = theta_lasso_ml.copy()
-    if alpha_theta_pair_usable:
+    if comparison_enabled and alpha_theta_pair_usable:
         try:
             Z_selected_for_reml = (
                 grm_index.extract_standardized_columns(support)
@@ -2514,7 +2602,7 @@ def main() -> None:
                 "remains unchanged: %s",
                 selected_span_refit_error,
             )
-    else:
+    elif comparison_enabled:
         selected_span_refit_error = (
             "skipped because the penalized-ML branch was not accepted"
         )
@@ -2539,16 +2627,10 @@ def main() -> None:
     )
     q_chive = unavailable
     q_chive_standardized = unavailable
-    q_chive_post_gls_raw = unavailable
-    q_chive_post_gls_standardized = unavailable
     q_chive_term1 = unavailable
     q_chive_term2 = unavailable
     q_chive_term1_standardized = unavailable
     q_chive_term2_standardized = unavailable
-    q_chive_post_gls_term1_raw = unavailable
-    q_chive_post_gls_term2_raw = unavailable
-    q_chive_post_gls_term1_standardized = unavailable
-    q_chive_post_gls_term2_standardized = unavailable
     q_ss_gls_plugin_raw = unavailable
     q_ss_gls_plugin_standardized = unavailable
     q_ss_gls_df_corrected_raw = unavailable
@@ -2665,10 +2747,10 @@ def main() -> None:
                 )
             )
 
-    # Estimators 3 and 4, the post-GLS diagnostic, and exported refit
-    # coefficients all use this one selected-span REML--GLS solution.  The
-    # independent basis is mapped back to the selected support with zero
-    # coefficients for numerically dependent marker columns.
+    # Comparison estimators 3 and 4 and exported refit coefficients use this
+    # one selected-span REML--GLS solution.  The independent basis is mapped
+    # back to the selected support with zero coefficients for numerically
+    # dependent marker columns.
     if selected_span_refit_ok:
         q_ss_gls_plugin_raw = 0.0
         q_ss_gls_plugin_standardized = 0.0
@@ -2676,12 +2758,6 @@ def main() -> None:
         q_ss_gls_df_corrected_standardized = 0.0
         ss_gls_df_correction_raw = 0.0
         ss_gls_df_correction_standardized = 0.0
-        q_chive_post_gls_raw = 0.0
-        q_chive_post_gls_term1_raw = 0.0
-        q_chive_post_gls_term2_raw = 0.0
-        q_chive_post_gls_standardized = 0.0
-        q_chive_post_gls_term1_standardized = 0.0
-        q_chive_post_gls_term2_standardized = 0.0
         beta_gls_active = np.zeros(support.size, dtype=np.float64)
 
     if selected_span_refit_ok:
@@ -2777,40 +2853,6 @@ def main() -> None:
                     ss_gls["beta_active_basis"], dtype=np.float64
                 ),
             )
-            y_chive_reml = np.asarray(y_np, dtype=np.float64)
-            if (
-                covar_np is not None
-                and covar_np.size > 0
-                and beta_cov_gls.size > 0
-            ):
-                y_chive_reml -= (
-                    np.asarray(covar_np, dtype=np.float64)
-                    @ beta_cov_gls
-                )
-            (
-                q_chive_post_gls_raw,
-                q_chive_post_gls_term1_raw,
-                q_chive_post_gls_term2_raw,
-            ) = _chive_q_hat_given_active(
-                Z_support,
-                y_chive_reml,
-                beta_gls_active,
-            )
-            q_chive_post_gls_standardized = (
-                _quadratic_variance_to_reml_scale(
-                    q_chive_post_gls_raw, phenotype_scale
-                )
-            )
-            q_chive_post_gls_term1_standardized = (
-                _quadratic_variance_to_reml_scale(
-                    q_chive_post_gls_term1_raw, phenotype_scale
-                )
-            )
-            q_chive_post_gls_term2_standardized = (
-                _quadratic_variance_to_reml_scale(
-                    q_chive_post_gls_term2_raw, phenotype_scale
-                )
-            )
         except (FloatingPointError, RuntimeError, ValueError) as error:
             selected_span_refit_ok = False
             selected_span_refit_error = (
@@ -2830,12 +2872,6 @@ def main() -> None:
             q_ss_gls_df_corrected_standardized = unavailable
             ss_gls_df_correction_raw = unavailable
             ss_gls_df_correction_standardized = unavailable
-            q_chive_post_gls_raw = unavailable
-            q_chive_post_gls_term1_raw = unavailable
-            q_chive_post_gls_term2_raw = unavailable
-            q_chive_post_gls_standardized = unavailable
-            q_chive_post_gls_term1_standardized = unavailable
-            q_chive_post_gls_term2_standardized = unavailable
             beta_cov_gls = np.empty((0,), dtype=np.float64)
             beta_gls_active = np.empty((0,), dtype=np.float64)
             selected_span_basis_positions = np.empty(
@@ -2843,46 +2879,44 @@ def main() -> None:
             )
             ss_gls_basis_size = 0
 
-    # The two Lasso-row estimators use the residual-ML covariance from the
-    # penalized branch.  The two selected-span estimators above use the
-    # independent REML refit covariance.  ``theta_lasso`` is retained only as
-    # the covariance input to the last KKT-certified sparse solve.
-    h2_chive_at_lasso_theta = (
-        _sparse_dense_h2(
-            q_chive_standardized,
-            _trace_weighted_genetic_var(theta_lasso),
-            float(theta_lasso[-1]),
+    # The primary COHERIT estimate always uses the calibrated Lasso quadratic
+    # and the residual-ML covariance from the same penalized branch.  The other
+    # three estimators are constructed only in explicit comparison mode.
+    h2_chive = _sparse_dense_h2(
+        q_chive_standardized,
+        theta_lasso_ml_sum,
+        theta_e_lasso_ml,
+    )
+    h2_lasso_plugin = unavailable
+    h2_ss_gls_plugin = unavailable
+    h2_ss_gls_df_corrected = unavailable
+    if comparison_enabled:
+        four_h2 = _four_estimator_h2_from_branches(
+            q_lasso_plugin_standardized=q_chive_term1_standardized,
+            q_lasso_calibrated_standardized=q_chive_standardized,
+            q_selected_span_plugin_standardized=q_ss_gls_plugin_standardized,
+            q_selected_span_trace_standardized=(
+                q_ss_gls_df_corrected_standardized
+            ),
+            lasso_ml_background_variance=theta_lasso_ml_sum,
+            lasso_ml_residual_variance=theta_e_lasso_ml,
+            selected_span_reml_background_variance=theta_final_sum,
+            selected_span_reml_residual_variance=theta_e_final,
         )
-        if lasso_quadratics_available
-        else unavailable
-    )
-    four_h2 = _four_estimator_h2_from_branches(
-        q_lasso_plugin_standardized=q_chive_term1_standardized,
-        q_lasso_calibrated_standardized=q_chive_standardized,
-        q_selected_span_plugin_standardized=q_ss_gls_plugin_standardized,
-        q_selected_span_trace_standardized=(
-            q_ss_gls_df_corrected_standardized
-        ),
-        lasso_ml_background_variance=theta_lasso_ml_sum,
-        lasso_ml_residual_variance=theta_e_lasso_ml,
-        selected_span_reml_background_variance=theta_final_sum,
-        selected_span_reml_residual_variance=theta_e_final,
-    )
-    h2_lasso_plugin = four_h2["h2_lasso_plugin"]
-    h2_chive = four_h2["h2_chive"]
-    h2_ss_gls_plugin = four_h2["h2_ss_gls_plugin"]
-    h2_ss_gls_df_corrected = four_h2["h2_ss_gls_df_corrected"]
-    h2_chive_post_gls = _sparse_dense_h2(
-        q_chive_post_gls_standardized,
-        theta_final_sum,
-        theta_e_final,
-    )
+        h2_lasso_plugin = four_h2["h2_lasso_plugin"]
+        h2_chive = four_h2["h2_chive"]
+        h2_ss_gls_plugin = four_h2["h2_ss_gls_plugin"]
+        h2_ss_gls_df_corrected = four_h2["h2_ss_gls_df_corrected"]
     branch_guards = _sparse_estimator_branch_guards(
+        comparison_enabled=comparison_enabled,
         alpha_theta_pair_certified=alpha_theta_pair_usable,
         lasso_quadratics_available=lasso_quadratics_available,
         selected_span_refit_ok=selected_span_refit_ok,
         lasso_estimator_values=np.asarray(
-            [h2_lasso_plugin, h2_chive], dtype=np.float64
+            [h2_lasso_plugin, h2_chive]
+            if comparison_enabled
+            else [h2_chive],
+            dtype=np.float64,
         ),
         selected_support_estimator_values=np.asarray(
             [h2_ss_gls_plugin, h2_ss_gls_df_corrected],
@@ -2893,27 +2927,37 @@ def main() -> None:
     selected_support_refit_branch_valid = bool(
         branch_guards["selected_support_refit_branch_valid"]
     )
-    all_sparse_branches_valid = bool(
-        branch_guards["all_four_estimators_valid"]
+    all_requested_estimators_valid = bool(
+        branch_guards["all_requested_estimators_valid"]
     )
     sparse_outputs_finite = bool(
-        branch_guards["all_four_outputs_finite"]
+        branch_guards["all_requested_outputs_finite"]
     )
     sparse_fit_rejection_reasons = list(
         branch_guards["combined_invalid_reasons"]
     )
-    if not all_sparse_branches_valid:
-        logger.warning(
-            "[WARN] sparse estimator branches incomplete: "
-            "lasso_valid=%s selected_support_refit_valid=%s reasons=%s. "
-            "No ordinary-REML value will replace a sparse estimator.",
-            lasso_branch_valid,
-            selected_support_refit_branch_valid,
-            ",".join(sparse_fit_rejection_reasons),
-        )
+    if not all_requested_estimators_valid:
+        if comparison_enabled:
+            logger.warning(
+                "[WARN] requested sparse estimator branches incomplete: "
+                "lasso_valid=%s selected_support_refit_valid=%s reasons=%s. "
+                "No ordinary-REML value will replace a sparse estimator.",
+                lasso_branch_valid,
+                selected_support_refit_branch_valid,
+                ",".join(sparse_fit_rejection_reasons),
+            )
+        else:
+            logger.warning(
+                "[WARN] COHERIT estimator unavailable: lasso_valid=%s "
+                "reasons=%s. No ordinary-REML value will replace it.",
+                lasso_branch_valid,
+                ",".join(sparse_fit_rejection_reasons),
+            )
 
     h2_lasso_plugin_guarded = (
-        float(h2_lasso_plugin) if lasso_branch_valid else unavailable
+        float(h2_lasso_plugin)
+        if comparison_enabled and lasso_branch_valid
+        else unavailable
     )
     h2_chive_guarded = float(h2_chive) if lasso_branch_valid else unavailable
     h2_ss_gls_plugin_guarded = (
@@ -2938,32 +2982,29 @@ def main() -> None:
     )
 
     print(f"[RESULT] var_components_lasso_ml={theta_lasso_ml.tolist()}")
-    print(
-        "[RESULT] var_components_selected_span_reml="
-        f"{theta_selected_span_reml.tolist() if selected_span_refit_ok else None}"
-    )
     print(f"[RESULT] h2={h2:.6f} (primary={primary_h2_method})")
-    print(
-        "[RESULT] h2_background_selected_span_reml="
-        f"{h2_background_selected_span_reml:.6f}"
-    )
-    print(
-        f"[RESULT] h2_lasso_plugin={h2_lasso_plugin:.6f} "
-        "(uncorrected penalized-LASSO plug-in)"
-    )
     print(f"[RESULT] h2_chive={h2_chive:.6f} (penalized LASSO calibration)")
-    print(
-        f"[RESULT] h2_chive_post_gls={h2_chive_post_gls:.6f} "
-        "(diagnostic only)"
-    )
-    print(
-        f"[RESULT] h2_ss_gls_plugin={h2_ss_gls_plugin:.6f} "
-        "(selected-span GLS plug-in)"
-    )
-    print(
-        f"[RESULT] h2_ss_gls_df_corrected={h2_ss_gls_df_corrected:.6f} "
-        "(trace-corrected selected-span GLS)"
-    )
+    if comparison_enabled:
+        print(
+            "[RESULT] var_components_selected_span_reml="
+            f"{theta_selected_span_reml.tolist() if selected_span_refit_ok else None}"
+        )
+        print(
+            "[RESULT] h2_background_selected_span_reml="
+            f"{h2_background_selected_span_reml:.6f}"
+        )
+        print(
+            f"[RESULT] h2_lasso_plugin={h2_lasso_plugin:.6f} "
+            "(uncorrected penalized-LASSO plug-in)"
+        )
+        print(
+            f"[RESULT] h2_ss_gls_plugin={h2_ss_gls_plugin:.6f} "
+            "(selected-span GLS plug-in)"
+        )
+        print(
+            f"[RESULT] h2_ss_gls_df_corrected={h2_ss_gls_df_corrected:.6f} "
+            "(trace-corrected selected-span GLS)"
+        )
     print(f"[RESULT] support_size={int(support.size)}")
 
     theta_lasso_ml_to_selected_span_rel = (
@@ -2986,14 +3027,24 @@ def main() -> None:
         "requested": bool(prediction_active),
         "status": "not_requested",
     }
+    if not prediction_active:
+        # A reused output prefix must not retain a prediction table from an
+        # earlier comparison run when the current run did not request one.
+        remove_sparse_prediction_outputs(out_prefix)
     if prediction_active:
         emitted_branches = _sparse_prediction_branch_names(
+            comparison_enabled=comparison_enabled,
             lasso_branch_valid=lasso_branch_valid,
             selected_support_refit_branch_valid=(
                 selected_support_refit_branch_valid
             ),
         )
         prediction_request_metadata = {
+            "estimator_mode": (
+                "four_estimator_comparison"
+                if comparison_enabled
+                else "coherit"
+            ),
             "test_phenotype_used": False,
             "genotype_standardization_source": "training_samples_only",
             "covariate_transform_source": "training_samples_only",
@@ -3028,16 +3079,20 @@ def main() -> None:
             },
         }
         if not emitted_branches:
+            unavailable_branch_metadata = {
+                "lasso_branch_valid": lasso_branch_valid,
+            }
+            if comparison_enabled:
+                unavailable_branch_metadata[
+                    "selected_support_refit_branch_valid"
+                ] = selected_support_refit_branch_valid
             metadata_path = write_sparse_prediction_status(
                 out_prefix=out_prefix,
                 status="not_emitted_no_valid_branch",
                 metadata={
                     **prediction_request_metadata,
                     "reason": "no_valid_sparse_prediction_branch",
-                    "lasso_branch_valid": lasso_branch_valid,
-                    "selected_support_refit_branch_valid": (
-                        selected_support_refit_branch_valid
-                    ),
+                    **unavailable_branch_metadata,
                     "sparse_fit_rejection_reasons": list(
                         sparse_fit_rejection_reasons
                     ),
@@ -3053,15 +3108,21 @@ def main() -> None:
                                 ]
                             ),
                         },
-                        "selected_span": {
-                            "estimator_valid": False,
-                            "output_emitted": False,
-                            "invalid_reasons": list(
-                                branch_guards[
-                                    "selected_support_refit_branch_invalid_reasons"
-                                ]
-                            ),
-                        },
+                        **(
+                            {
+                                "selected_span": {
+                                    "estimator_valid": False,
+                                    "output_emitted": False,
+                                    "invalid_reasons": list(
+                                        branch_guards[
+                                            "selected_support_refit_branch_invalid_reasons"
+                                        ]
+                                    ),
+                                }
+                            }
+                            if comparison_enabled
+                            else {}
+                        ),
                     },
                 },
             )
@@ -3257,7 +3318,9 @@ def main() -> None:
                     "pcg_rel_res": lasso_prediction.pcg_rel_res,
                     "pcg_iters": lasso_prediction.pcg_iters,
                 },
-                "selected_span": {
+            }
+            if comparison_enabled:
+                branch_metadata["selected_span"] = {
                     "estimator_valid": bool(
                         selected_support_refit_branch_valid
                     ),
@@ -3269,8 +3332,7 @@ def main() -> None:
                             "selected_support_refit_branch_invalid_reasons"
                         ]
                     ),
-                },
-            }
+                }
             if "selected_span" in emitted_branches:
                 assert selected_span_prediction is not None
                 branch_metadata["selected_span"].update({
@@ -3310,8 +3372,16 @@ def main() -> None:
                 "paths": prediction_paths,
             }
 
+    output_contract = _sparse_output_contract(comparison_enabled)
     summary = {
-        "sparse_output_schema_version": 4,
+        # Schema 5 makes the estimator mode explicit and removes the former
+        # post-GLS diagnostic.  Historical schema-4 files remain readable by
+        # the experiment collectors but are never emitted by new runs.
+        "sparse_output_schema_version": output_contract[
+            "sparse_output_schema_version"
+        ],
+        "estimator_mode": output_contract["estimator_mode"],
+        "computed_estimators": output_contract["computed_estimators"],
         "finished_at": datetime.now().isoformat(timespec="seconds"),
         "elapsed_sec": float(time.time() - t0),
         "n_samples": int(y_np.shape[0]),
@@ -3331,40 +3401,21 @@ def main() -> None:
             "snp_id" if component_variant_indices else "input_prefix"
         ),
         "var_components_lasso_ml": theta_lasso_ml.tolist(),
-        "var_components_selected_span_reml": (
-            theta_selected_span_reml.tolist()
-            if selected_span_refit_ok
-            else None
-        ),
         "variance_component_branch_mapping": {
-            "h2_lasso_plugin": "var_components_lasso_ml",
             "h2_chive": "var_components_lasso_ml",
-            "h2_ss_gls_plugin": "var_components_selected_span_reml",
-            "h2_ss_gls_df_corrected": "var_components_selected_span_reml",
         },
         "var_components_at_lasso": theta_lasso.tolist(),
         "phenotype_mean": phenotype_mean,
         "phenotype_scale": phenotype_scale,
         "variance_component_scale": "standardized_phenotype",
         "primary_h2_method": primary_h2_method,
-        "all_sparse_branches_valid": all_sparse_branches_valid,
+        "all_requested_estimators_valid": all_requested_estimators_valid,
         "lasso_branch_valid": lasso_branch_valid,
         "lasso_branch_invalid_reasons": list(
             branch_guards["lasso_branch_invalid_reasons"]
         ),
         "lasso_outputs_finite": bool(
             branch_guards["lasso_outputs_finite"]
-        ),
-        "selected_support_refit_branch_valid": (
-            selected_support_refit_branch_valid
-        ),
-        "selected_support_refit_branch_invalid_reasons": list(
-            branch_guards[
-                "selected_support_refit_branch_invalid_reasons"
-            ]
-        ),
-        "selected_support_outputs_finite": bool(
-            branch_guards["selected_support_outputs_finite"]
         ),
         "sparse_outputs_finite": sparse_outputs_finite,
         "sparse_fit_rejection_reasons": sparse_fit_rejection_reasons,
@@ -3382,26 +3433,8 @@ def main() -> None:
         "lasso_variance_update": "intercept_contrast_residual_ml",
         "lasso_variance_contrast": "orthogonal_to_intercept",
         "lasso_variance_analysis_dimension": int(y_np.shape[0] - 1),
-        "selected_span_reml_iterations": selected_span_reml_iterations,
-        "selected_span_reml_history": selected_span_reml_history,
-        "selected_span_reml_stop_reason": (
-            selected_span_reml_stop_reason or None
-        ),
-        "selected_span_reml_converged": bool(
-            selected_span_reml_stop_reason
-            in {"rel_dll", "scoring_step", "ll_down"}
-        ),
-        "selected_span_refit_ok": selected_span_refit_ok,
-        "selected_span_refit_error": selected_span_refit_error,
         "reml_max_linesearch_trials": int(
             args.reml_max_linesearch_trials
-        ),
-        "selected_span_basis_size": ss_gls_basis_size,
-        "selected_span_basis_support_positions": (
-            selected_span_basis_positions.tolist()
-        ),
-        "selected_span_basis_support_indices": (
-            selected_span_basis_support_indices
         ),
         "alpha_theta_fixed_point_coherent": alpha_theta_fixed_point_coherent,
         "alpha_theta_pair_usable": alpha_theta_pair_usable,
@@ -3413,42 +3446,13 @@ def main() -> None:
         "theta_lasso_to_lasso_ml_rel_change": (
             theta_lasso_to_lasso_ml_rel
         ),
-        "theta_lasso_ml_to_selected_span_reml_rel_change": (
-            theta_lasso_ml_to_selected_span_rel
-        ),
         "h2_background_lasso_ml": _trace_weighted_h2(theta_lasso_ml),
-        "h2_background_selected_span_reml": _finite_float_or_none(
-            h2_background_selected_span_reml
-        ),
-        "h2_lasso_plugin": _finite_float_or_none(h2_lasso_plugin),
-        "h2_lasso_plugin_guarded": h2_lasso_plugin_guarded,
-        "h2_lasso_plugin_role": "estimator_1_uncorrected_lasso_ml_plugin",
         "h2_chive": _finite_float_or_none(h2_chive),
         "h2_chive_guarded": h2_chive_guarded,
-        "h2_chive_at_lasso_theta": _finite_float_or_none(
-            h2_chive_at_lasso_theta
-        ),
-        "h2_chive_post_gls": _finite_float_or_none(h2_chive_post_gls),
-        "h2_chive_post_gls_role": "diagnostic_only",
-        "h2_ss_gls_plugin": _finite_float_or_none(h2_ss_gls_plugin),
-        "h2_ss_gls_plugin_guarded": h2_ss_gls_plugin_guarded,
-        "h2_ss_gls_df_corrected": _finite_float_or_none(
-            h2_ss_gls_df_corrected
-        ),
-        "h2_ss_gls_df_guarded": h2_ss_gls_df_guarded,
-        "h2_ss_gls_role": "estimators_3_and_4_selected_support_reml_gls",
         "h2": h2,
-        "q_lasso_plugin_raw": _finite_float_or_none(q_chive_term1),
-        "q_lasso_plugin_standardized": _finite_float_or_none(
-            q_chive_term1_standardized
-        ),
         "q_chive_raw": _finite_float_or_none(q_chive),
         "q_chive_standardized": _finite_float_or_none(
             q_chive_standardized
-        ),
-        "q_chive_post_gls_raw": _finite_float_or_none(q_chive_post_gls_raw),
-        "q_chive_post_gls_standardized": _finite_float_or_none(
-            q_chive_post_gls_standardized
         ),
         "q_chive_components": {
             "term1_g2_over_n": _finite_float_or_none(q_chive_term1),
@@ -3464,43 +3468,6 @@ def main() -> None:
             ),
             "scale": "standardized_phenotype_variance",
         },
-        "q_chive_post_gls_components_raw": {
-            "term1_g2_over_n": _finite_float_or_none(
-                q_chive_post_gls_term1_raw
-            ),
-            "term2_cross": _finite_float_or_none(
-                q_chive_post_gls_term2_raw
-            ),
-            "scale": "raw_phenotype_variance",
-        },
-        "q_chive_post_gls_components_standardized": {
-            "term1_g2_over_n": _finite_float_or_none(
-                q_chive_post_gls_term1_standardized
-            ),
-            "term2_cross": _finite_float_or_none(
-                q_chive_post_gls_term2_standardized
-            ),
-            "scale": "standardized_phenotype_variance",
-        },
-        "q_ss_gls_plugin_raw": _finite_float_or_none(
-            q_ss_gls_plugin_raw
-        ),
-        "q_ss_gls_plugin_standardized": _finite_float_or_none(
-            q_ss_gls_plugin_standardized
-        ),
-        "q_ss_gls_df_corrected_raw": _finite_float_or_none(
-            q_ss_gls_df_corrected_raw
-        ),
-        "q_ss_gls_df_corrected_standardized": _finite_float_or_none(
-            q_ss_gls_df_corrected_standardized
-        ),
-        "ss_gls_df_correction_raw": _finite_float_or_none(
-            ss_gls_df_correction_raw
-        ),
-        "ss_gls_df_correction_standardized": _finite_float_or_none(
-            ss_gls_df_correction_standardized
-        ),
-        "ss_gls_basis_size": ss_gls_basis_size,
         "support_size": int(support.size),
         "support_indices": support.tolist(),
         "support_source_indices": grm_index.source_variant_indices(support).tolist(),
@@ -3520,6 +3487,96 @@ def main() -> None:
         "outer_history": history,
         "sparse_prediction": prediction_summary,
     }
+
+    if comparison_enabled:
+        summary.update({
+            "var_components_selected_span_reml": (
+                theta_selected_span_reml.tolist()
+                if selected_span_refit_ok
+                else None
+            ),
+            "variance_component_branch_mapping": {
+                "h2_lasso_plugin": "var_components_lasso_ml",
+                "h2_chive": "var_components_lasso_ml",
+                "h2_ss_gls_plugin": "var_components_selected_span_reml",
+                "h2_ss_gls_df_corrected": "var_components_selected_span_reml",
+            },
+            "all_sparse_branches_valid": bool(
+                branch_guards["all_four_estimators_valid"]
+            ),
+            "selected_support_refit_branch_valid": (
+                selected_support_refit_branch_valid
+            ),
+            "selected_support_refit_branch_invalid_reasons": list(
+                branch_guards[
+                    "selected_support_refit_branch_invalid_reasons"
+                ]
+            ),
+            "selected_support_outputs_finite": bool(
+                branch_guards["selected_support_outputs_finite"]
+            ),
+            "selected_span_reml_iterations": selected_span_reml_iterations,
+            "selected_span_reml_history": selected_span_reml_history,
+            "selected_span_reml_stop_reason": (
+                selected_span_reml_stop_reason or None
+            ),
+            "selected_span_reml_converged": bool(
+                selected_span_reml_stop_reason
+                in {"rel_dll", "scoring_step", "ll_down"}
+            ),
+            "selected_span_refit_ok": selected_span_refit_ok,
+            "selected_span_refit_error": selected_span_refit_error,
+            "selected_span_basis_size": ss_gls_basis_size,
+            "selected_span_basis_support_positions": (
+                selected_span_basis_positions.tolist()
+            ),
+            "selected_span_basis_support_indices": (
+                selected_span_basis_support_indices
+            ),
+            "theta_lasso_ml_to_selected_span_reml_rel_change": (
+                theta_lasso_ml_to_selected_span_rel
+            ),
+            "h2_background_selected_span_reml": _finite_float_or_none(
+                h2_background_selected_span_reml
+            ),
+            "h2_lasso_plugin": _finite_float_or_none(h2_lasso_plugin),
+            "h2_lasso_plugin_guarded": h2_lasso_plugin_guarded,
+            "h2_lasso_plugin_role": (
+                "estimator_1_uncorrected_lasso_ml_plugin"
+            ),
+            "h2_ss_gls_plugin": _finite_float_or_none(h2_ss_gls_plugin),
+            "h2_ss_gls_plugin_guarded": h2_ss_gls_plugin_guarded,
+            "h2_ss_gls_df_corrected": _finite_float_or_none(
+                h2_ss_gls_df_corrected
+            ),
+            "h2_ss_gls_df_guarded": h2_ss_gls_df_guarded,
+            "h2_ss_gls_role": (
+                "estimators_3_and_4_selected_support_reml_gls"
+            ),
+            "q_lasso_plugin_raw": _finite_float_or_none(q_chive_term1),
+            "q_lasso_plugin_standardized": _finite_float_or_none(
+                q_chive_term1_standardized
+            ),
+            "q_ss_gls_plugin_raw": _finite_float_or_none(
+                q_ss_gls_plugin_raw
+            ),
+            "q_ss_gls_plugin_standardized": _finite_float_or_none(
+                q_ss_gls_plugin_standardized
+            ),
+            "q_ss_gls_df_corrected_raw": _finite_float_or_none(
+                q_ss_gls_df_corrected_raw
+            ),
+            "q_ss_gls_df_corrected_standardized": _finite_float_or_none(
+                q_ss_gls_df_corrected_standardized
+            ),
+            "ss_gls_df_correction_raw": _finite_float_or_none(
+                ss_gls_df_correction_raw
+            ),
+            "ss_gls_df_correction_standardized": _finite_float_or_none(
+                ss_gls_df_correction_standardized
+            ),
+            "ss_gls_basis_size": ss_gls_basis_size,
+        })
 
     with open(out_prefix + ".summary.json", "w") as f:
         json.dump(
@@ -3575,11 +3632,7 @@ def main() -> None:
         int(v) for v in selected_span_basis_support_indices
     )
     with open(out_prefix + ".selected_snps.tsv", "w") as f:
-        f.write(
-            "snp_index\tsource_snp_index\tgrm\tchr\tsnp_id\tcm\tbp"
-            "\ta1\ta2\tbeta_lasso\tbeta_gls_reml"
-            "\tselected_span_basis\n"
-        )
+        f.write("\t".join(output_contract["selected_snp_columns"]) + "\n")
         for snp_idx in support.tolist():
             chr_, snp_id, cm, bp, a1, a2 = bim_rows.get(
                 int(snp_idx),
@@ -3588,16 +3641,19 @@ def main() -> None:
             grm_id = _snp_grm_map.get(int(snp_idx), -1)
             source_snp_idx = source_index_map.get(int(snp_idx), int(snp_idx))
             beta_val = beta_map.get(int(snp_idx), 0.0)
-            beta_reml = (
-                beta_reml_map.get(int(snp_idx), 0.0)
-                if selected_span_refit_ok
-                else float("nan")
+            row = (
+                f"{int(snp_idx)}\t{source_snp_idx}\t{grm_id}\t{chr_}\t"
+                f"{snp_id}\t{cm}\t{bp}\t{a1}\t{a2}\t{beta_val:.8e}"
             )
-            basis_member = int(int(snp_idx) in selected_span_basis_set)
-            f.write(
-                f"{int(snp_idx)}\t{source_snp_idx}\t{grm_id}\t{chr_}\t{snp_id}\t{cm}\t{bp}\t{a1}\t{a2}\t"
-                f"{beta_val:.8e}\t{beta_reml:.8e}\t{basis_member}\n"
-            )
+            if comparison_enabled:
+                beta_reml = (
+                    beta_reml_map.get(int(snp_idx), 0.0)
+                    if selected_span_refit_ok
+                    else float("nan")
+                )
+                basis_member = int(int(snp_idx) in selected_span_basis_set)
+                row += f"\t{beta_reml:.8e}\t{basis_member}"
+            f.write(row + "\n")
 
     logger.info("[INFO] done @ %s elapsed=%.1fs", datetime.now().isoformat(timespec='seconds'), time.time() - t0)
     logger.info("[INFO] summary -> %s.summary.json", out_prefix)

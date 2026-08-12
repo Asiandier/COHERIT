@@ -107,29 +107,40 @@ exactly one final EBIC-LASSO update at the returned covariance, without another
 variance update.  Reaching the outer limit is reported as a warning and does
 not invalidate a finite final pair.  If that final update itself is unavailable,
 the most recent complete covariance-aligned pair is returned with a warning.
-The selected span is then frozen and one
-separate REML--GLS refit produces `(zeta_R, theta_R)`; that refit is not fed
-back into the LASSO.  The default EBIC penalty uses the full eligible marker
-count.
+The default run stops with this covariance-aligned LASSO pair and reports the
+COHERIT estimator.  The default EBIC penalty uses the full eligible marker
+count.  A secondary four-estimator comparison can be requested with
+`--compare-four-estimators`; only in that mode is the selected span frozen and
+one separate REML--GLS refit performed.  That refit is not fed back into the
+LASSO.
 
 Sparse-run output semantics are deliberately explicit:
 
-- `var_components_lasso_ml` and
-  `var_components_selected_span_reml` expose the two variance branches.
-- `h2` is the primary total estimate.  For a valid covariance-aligned LASSO
+- By default, `estimator_mode` is `coherit` and `computed_estimators` contains
+  only `h2_chive`.  No selected-support REML--GLS refit is run.
+- New sparse runs use output schema version 5, which records the estimator
+  mode explicitly.  Historical schema-4 comparison outputs remain valid
+  artifacts but are not produced by the current pipeline.
+- `var_components_lasso_ml` exposes the variance components used by COHERIT.
+- `h2` is the primary total estimate. For a valid covariance-aligned LASSO
   pair it combines the calibrated LASSO quadratic with the
   `var_components_lasso_ml` background and residual components.
+- `h2_chive_guarded` is the validated counterpart of `h2_chive`
+  and equals the top-level `h2` field whenever the COHERIT branch is valid.
+- `q_chive_components` and `q_chive_components_standardized` retain the Lasso
+  plug-in and residual-correction terms that together form the COHERIT sparse
+  variance contribution; the plug-in term is not exposed as a standalone
+  heritability estimator in the default mode.
+- Sparse prediction emits only the `lasso_*` branch by default: the Lasso
+  fixed-SNP score plus its matched background BLUP.
+- With `--compare-four-estimators`, `estimator_mode` becomes
+  `four_estimator_comparison`, and the following secondary outputs are added:
+  `var_components_selected_span_reml`, `h2_lasso_plugin`,
+  `h2_ss_gls_plugin`, and `h2_ss_gls_df_corrected`.
 - `h2_background_selected_span_reml` is background-only once SNPs enter the
   fixed-effect design; it is not total heritability.
 - `h2_lasso_plugin` combines the uncorrected squared penalized-LASSO score
-  with the residual-ML LASSO-branch variance components.  Its validated
-  counterpart is `h2_lasso_plugin_guarded` (estimator 1).
-- `h2_chive_guarded` is the validated counterpart of `h2_chive`
-  (estimator 2) and equals the top-level `h2` field whenever the Lasso branch
-  is valid.
-- `h2_chive_post_gls` is a same-sample diagnostic obtained by inserting a
-  post-selection GLS coefficient back into the CHIVE formula; it is not
-  primary.
+  with the residual-ML LASSO-branch variance components.
 - `h2_ss_gls_plugin` is the uncorrected fitted-score plug-in after the
   selected-span REML variance refit and final GLS coefficient recovery; its
   guarded counterpart is `h2_ss_gls_plugin_guarded`.
@@ -139,24 +150,25 @@ Sparse-run output semantics are deliberately explicit:
   correction, but the quantity has phenotype-variance units and is
   not generally a dimension count.  The trace correction does not remove
   same-sample selection bias, so this is a secondary estimator.
-- Estimators 3 and 4, the post-GLS diagnostic, and `beta_gls_reml` in
+- Estimators 3 and 4 and `beta_gls_reml` in
   `selected_snps.tsv` use exactly the same full-rank selected-marker basis.
   Numerically dependent selected columns receive coefficient zero and the
   `selected_span_basis` column identifies retained basis markers.
 - Raw-scale sparse quadratic terms and standardized-phenotype REML components
   are never added directly.  The summary records both quadratic scales and the
   phenotype scale used for conversion.
-- `lasso_branch_valid` independently validates estimators 1 and 2;
+- `lasso_branch_valid` validates the default COHERIT output and, in comparison
+  mode, estimators 1 and 2;
   `selected_support_refit_branch_valid` validates estimators 3 and 4.  A
   failed selected-support refit therefore does not erase valid Lasso/CHIVE
   estimates.  An invalid branch has JSON `null` in its guarded fields.
-- Ordinary REML is a separate baseline and is never substituted into any of
-  the four estimator fields. `all_sparse_branches_valid` is the conjunction of
-  the two branch-validity flags.
-- Sparse prediction follows the same branch contract. A valid Lasso branch
-  emits `lasso_*` scores even if the downstream refit is invalid;
-  `selected_span_*` scores are emitted only for a valid refit. The prediction
-  metadata lists the actual `emitted_branches`, with no baseline substitution.
+- Ordinary REML is a separate baseline and is never substituted into any
+  sparse estimator. `all_requested_estimators_valid` refers only to outputs
+  enabled by the selected mode.
+- Sparse prediction follows the same mode contract. A valid default run emits
+  only `lasso_*` scores. In comparison mode, `selected_span_*` scores are added
+  only for a valid refit. The prediction metadata lists the actual
+  `emitted_branches`, with no baseline substitution.
 - In REML history, `accepted` refers to the current line-search candidate.
   A terminal `ll_down` rejects that candidate and returns the most recent
   accepted variance vector; an intermediate BCD variance block records this
@@ -487,6 +499,10 @@ fit lifecycle.
   `max(1e-4, 2*pcg_tol)`, so the certificate does not demand more precision
   than its PCG inputs provide.
 - `--outer-max`: maximum number of variance updates; the default is `10`.
+- `--compare-four-estimators`: opt in to the secondary four-estimator and
+  selected-span prediction comparison.  Without it, sparse runs compute only
+  COHERIT and, when prediction inputs are supplied, only the matched Lasso
+  fixed-score plus background-BLUP prediction.
 - `--effect-rel-tol`: relative tolerance for change in the complete fitted
   fixed mean; the default is `1e-2`.
 

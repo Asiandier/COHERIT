@@ -107,6 +107,7 @@ def test_four_estimator_h2_uses_lasso_ml_and_reml_branches():
 
 def test_branch_guards_preserve_valid_lasso_when_refit_is_unavailable():
     guards = SPARSE._sparse_estimator_branch_guards(
+        comparison_enabled=True,
         alpha_theta_pair_certified=True,
         lasso_quadratics_available=True,
         selected_span_refit_ok=True,
@@ -119,6 +120,7 @@ def test_branch_guards_preserve_valid_lasso_when_refit_is_unavailable():
     assert guards["combined_invalid_reasons"] == []
 
     guards = SPARSE._sparse_estimator_branch_guards(
+        comparison_enabled=True,
         alpha_theta_pair_certified=True,
         lasso_quadratics_available=True,
         selected_span_refit_ok=False,
@@ -138,6 +140,7 @@ def test_branch_guards_preserve_valid_lasso_when_refit_is_unavailable():
 
 def test_invalid_lasso_branch_invalidates_downstream_refit_branch():
     guards = SPARSE._sparse_estimator_branch_guards(
+        comparison_enabled=True,
         alpha_theta_pair_certified=False,
         lasso_quadratics_available=True,
         selected_span_refit_ok=True,
@@ -151,6 +154,67 @@ def test_invalid_lasso_branch_invalidates_downstream_refit_branch():
     ]
     assert "lasso_support_branch_not_valid" in guards[
         "selected_support_refit_branch_invalid_reasons"
+    ]
+
+
+def test_coherit_only_guard_does_not_require_unrequested_comparators():
+    guards = SPARSE._sparse_estimator_branch_guards(
+        comparison_enabled=False,
+        alpha_theta_pair_certified=True,
+        lasso_quadratics_available=True,
+        selected_span_refit_ok=False,
+        lasso_estimator_values=np.asarray([0.3]),
+        selected_support_estimator_values=np.asarray([np.nan, np.nan]),
+    )
+    assert guards["lasso_branch_valid"] is True
+    assert guards["selected_support_refit_branch_valid"] is False
+    assert guards["all_requested_estimators_valid"] is True
+    assert guards["all_requested_outputs_finite"] is True
+    assert guards["combined_invalid_reasons"] == []
+
+
+def test_estimator_guard_requires_mode_specific_output_count():
+    coherit = SPARSE._sparse_estimator_branch_guards(
+        comparison_enabled=False,
+        alpha_theta_pair_certified=True,
+        lasso_quadratics_available=True,
+        selected_span_refit_ok=False,
+        lasso_estimator_values=np.asarray([0.2, 0.3]),
+        selected_support_estimator_values=np.asarray([np.nan, np.nan]),
+    )
+    comparison = SPARSE._sparse_estimator_branch_guards(
+        comparison_enabled=True,
+        alpha_theta_pair_certified=True,
+        lasso_quadratics_available=True,
+        selected_span_refit_ok=True,
+        lasso_estimator_values=np.asarray([0.3]),
+        selected_support_estimator_values=np.asarray([0.4, 0.5]),
+    )
+    assert coherit["lasso_branch_valid"] is False
+    assert comparison["lasso_branch_valid"] is False
+
+
+def test_sparse_output_contract_hides_comparison_fields_by_default():
+    default = SPARSE._sparse_output_contract(False)
+    comparison = SPARSE._sparse_output_contract(True)
+
+    assert default["sparse_output_schema_version"] == 5
+    assert default["estimator_mode"] == "coherit"
+    assert default["computed_estimators"] == ["h2_chive"]
+    assert default["selected_snp_columns"][-1] == "beta_lasso"
+    assert "beta_gls_reml" not in default["selected_snp_columns"]
+
+    assert comparison["sparse_output_schema_version"] == 5
+    assert comparison["estimator_mode"] == "four_estimator_comparison"
+    assert comparison["computed_estimators"] == [
+        "h2_lasso_plugin",
+        "h2_chive",
+        "h2_ss_gls_plugin",
+        "h2_ss_gls_df_corrected",
+    ]
+    assert comparison["selected_snp_columns"][-2:] == [
+        "beta_gls_reml",
+        "selected_span_basis",
     ]
 
 

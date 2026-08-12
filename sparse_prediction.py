@@ -196,6 +196,13 @@ def _table_path(out_prefix: str) -> str:
     return out_prefix + ".sparse_prediction.tsv"
 
 
+def remove_sparse_prediction_outputs(out_prefix: str) -> None:
+    """Remove prediction artifacts when a run did not request prediction."""
+    for path in (_table_path(out_prefix), _metadata_path(out_prefix)):
+        if os.path.exists(path):
+            os.remove(path)
+
+
 def write_sparse_prediction_status(
     *, out_prefix: str, status: str, metadata: Mapping[str, object]
 ) -> str:
