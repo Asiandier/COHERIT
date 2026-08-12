@@ -674,24 +674,26 @@ def test_ebic_path_failure_does_not_fall_back_to_valid_null(monkeypatch):
         )
 
 
-def test_lasso_variance_block_uses_an_intercept_contrast_design():
-    design = SPARSE._intercept_contrast_fixed_effect(37)
-
-    assert design.shape == (37, 1)
-    assert design.dtype == np.float32
-    assert np.array_equal(design, np.ones((37, 1), dtype=np.float32))
-
-
-def test_residual_ml_helper_passes_intercept_on_standardized_fit_path():
+def test_covariate_contrast_reml_passes_full_design_and_maps_scale():
     marker = SimpleNamespace(
         var_components=REML.jnp.asarray(
             [0.25, 0.75], dtype=REML.jnp.float32
         ),
-        rep_var_components=None,
-        monte_carlo_se_var=None,
-        final_grad=None,
-        final_ai=None,
-        diagnostics=None,
+        rep_var_components=REML.jnp.asarray(
+            [[0.2, 0.8], [0.3, 0.7]], dtype=REML.jnp.float32
+        ),
+        monte_carlo_se_var=REML.jnp.asarray(
+            [0.01, 0.02], dtype=REML.jnp.float32
+        ),
+        final_grad=REML.jnp.asarray([2.0, 4.0], dtype=REML.jnp.float32),
+        final_ai=REML.jnp.asarray(
+            [[3.0, 0.5], [0.5, 5.0]], dtype=REML.jnp.float32
+        ),
+        diagnostics={
+            "theta": REML.jnp.asarray([0.25, 0.75]),
+            "grad": REML.jnp.asarray([2.0, 4.0]),
+            "ai": REML.jnp.asarray([[3.0, 0.5], [0.5, 5.0]]),
+        },
         history=[{"params": [0.25, 0.75], "step_norm": 0.1, "grad_norm": 2.0}],
     )
 
@@ -704,19 +706,25 @@ def test_residual_ml_helper_passes_intercept_on_standardized_fit_path():
 
     fitter = RecordingFitter()
     residual = np.linspace(-1.0, 1.0, 19, dtype=np.float32)
+    nuisance = np.column_stack(
+        [
+            np.ones(residual.size, dtype=np.float32),
+            np.linspace(-2.0, 2.0, residual.size, dtype=np.float32),
+            np.sin(np.linspace(0.0, 2.0, residual.size, dtype=np.float32)),
+        ]
+    ).astype(np.float32)
     theta = np.asarray([0.31, 0.69], dtype=np.float32)
-    result = SPARSE._fit_intercept_contrast_residual_ml(
+    result = SPARSE._fit_covariate_contrast_residual_reml(
         fitter,
         residual,
         theta,
+        covar=nuisance,
         h2_init=0.31,
     )
 
     assert result is marker
     assert np.array_equal(fitter.y, residual)
-    assert np.array_equal(
-        fitter.covar, np.ones((residual.size, 1), dtype=np.float32)
-    )
+    assert np.array_equal(fitter.covar, nuisance)
     assert "standardize_y" not in fitter.kwargs
     assert np.isclose(fitter.kwargs["h2_init"], 0.31)
     _, residual_scale = SPARSE._phenotype_standardization_stats(residual)
@@ -730,12 +738,210 @@ def test_residual_ml_helper_passes_intercept_on_standardized_fit_path():
         np.asarray([0.25, 0.75]) * variance_scale,
     )
     np.testing.assert_allclose(
+        np.asarray(result.rep_var_components),
+        np.asarray([[0.2, 0.8], [0.3, 0.7]]) * variance_scale,
+    )
+    np.testing.assert_allclose(
+        np.asarray(result.monte_carlo_se_var),
+        np.asarray([0.01, 0.02]) * variance_scale,
+    )
+    np.testing.assert_allclose(
+        np.asarray(result.final_grad),
+        np.asarray([2.0, 4.0]) / variance_scale,
+    )
+    np.testing.assert_allclose(
+        np.asarray(result.final_ai),
+        np.asarray([[3.0, 0.5], [0.5, 5.0]]) / variance_scale**2,
+    )
+    np.testing.assert_allclose(
+        np.asarray(result.diagnostics["theta"]),
+        np.asarray([0.25, 0.75]) * variance_scale,
+    )
+    np.testing.assert_allclose(
+        np.asarray(result.diagnostics["grad"]),
+        np.asarray([2.0, 4.0]) / variance_scale,
+    )
+    np.testing.assert_allclose(
+        np.asarray(result.diagnostics["ai"]),
+        np.asarray([[3.0, 0.5], [0.5, 5.0]]) / variance_scale**2,
+    )
+    np.testing.assert_allclose(
         result.history[0]["params"],
         np.asarray([0.25, 0.75]) * variance_scale,
     )
     assert np.isclose(
+        result.history[0]["step_norm"], 0.1 * variance_scale
+    )
+    assert np.isclose(
+        result.history[0]["grad_norm"], 2.0 / variance_scale
+    )
+    assert np.isclose(
         result.history[0]["variance_scale_to_standardized_phenotype"],
         variance_scale,
+    )
+
+
+def test_covariate_contrast_reml_intercept_fallback_matches_legacy_design():
+    class RecordingFitter:
+        def fit_infinitesimal(self, y, covar, **kwargs):
+            self.y = np.asarray(y)
+            self.covar = np.asarray(covar)
+            self.kwargs = kwargs
+            return SimpleNamespace(
+                var_components=REML.jnp.asarray([0.4, 0.6]),
+                rep_var_components=None,
+                monte_carlo_se_var=None,
+                final_grad=None,
+                final_ai=None,
+                diagnostics=None,
+                history=[],
+            )
+
+    residual = np.linspace(-0.8, 1.2, 23, dtype=np.float32)
+    theta = np.asarray([0.37, 0.63], dtype=np.float32)
+    explicit = RecordingFitter()
+    fallback = RecordingFitter()
+
+    SPARSE._fit_covariate_contrast_residual_reml(
+        explicit,
+        residual,
+        theta,
+        covar=np.ones((residual.size, 1), dtype=np.float32),
+        h2_init=0.37,
+    )
+    SPARSE._fit_covariate_contrast_residual_reml(
+        fallback,
+        residual,
+        theta,
+        covar=None,
+        h2_init=0.37,
+    )
+
+    assert np.array_equal(explicit.y, fallback.y)
+    assert np.array_equal(explicit.covar, fallback.covar)
+    assert explicit.kwargs.keys() == fallback.kwargs.keys()
+    assert explicit.kwargs["h2_init"] == fallback.kwargs["h2_init"]
+    assert np.array_equal(
+        np.asarray(explicit.kwargs["var_components_init"]),
+        np.asarray(fallback.kwargs["var_components_init"]),
+    )
+
+
+def test_covariate_contrast_quadratic_is_invariant_to_nuisance_shift():
+    rng = np.random.RandomState(90210)
+    n = 41
+    nuisance = np.column_stack(
+        [np.ones(n), rng.standard_normal(n), rng.standard_normal(n)]
+    )
+    a = rng.standard_normal((n, n))
+    covariance = a @ a.T / n + 0.4 * np.eye(n)
+    precision = np.linalg.inv(covariance)
+    gram = nuisance.T @ precision @ nuisance
+    projector = (
+        precision
+        - precision
+        @ nuisance
+        @ np.linalg.solve(gram, nuisance.T @ precision)
+    )
+    response = rng.standard_normal(n)
+    shifted = response + nuisance @ rng.standard_normal(nuisance.shape[1])
+
+    assert np.allclose(projector @ nuisance, 0.0, atol=2e-12)
+    assert np.isclose(
+        response @ projector @ response,
+        shifted @ projector @ shifted,
+        rtol=1e-12,
+        atol=1e-11,
+    )
+
+
+def test_covariate_contrast_reml_core_is_invariant_to_nuisance_shift():
+    """Exercise the real REML projection and the helper's scale mapping."""
+    rng = np.random.RandomState(427)
+    n_samples, n_markers = 36, 9
+    geno = rng.standard_normal((n_samples, n_markers))
+    geno = (geno - geno.mean(axis=0)) / geno.std(axis=0)
+    geno_jax = REML.jnp.asarray(geno, dtype=REML.jnp.float32)
+    diagonal = REML.jnp.asarray(
+        np.mean(np.square(geno), axis=1), dtype=REML.jnp.float32
+    )
+    nuisance = np.column_stack(
+        [np.ones(n_samples), np.linspace(-1.0, 1.0, n_samples)]
+    ).astype(np.float32)
+    residual = rng.standard_normal(n_samples).astype(np.float32)
+    shifted = (
+        residual
+        + nuisance @ np.asarray([2.3, -1.7], dtype=np.float32)
+    ).astype(np.float32)
+    theta = np.asarray([0.27, 0.73], dtype=np.float32)
+
+    def genetic_mv(value):
+        return geno_jax @ (geno_jax.T @ value) / float(n_markers)
+
+    class DirectREMLFitter:
+        def fit_infinitesimal(
+            self, response, covar, *, h2_init, var_components_init
+        ):
+            params, history, diagnostics = REML.fit_reml(
+                y=response,
+                K_mvs=[genetic_mv],
+                diag_list=[diagonal],
+                covar=covar,
+                n_rand_vec=32,
+                maxiter=100,
+                seed=123,
+                h2_init=h2_init,
+                param_init=var_components_init,
+                minq_iter=0,
+                slq_samples=32,
+                slq_m=24,
+                precond_conf=None,
+                pcg_tol=1e-7,
+                return_diagnostics=True,
+                verbose=False,
+            )
+            return SimpleNamespace(
+                var_components=params,
+                rep_var_components=None,
+                monte_carlo_se_var=None,
+                final_grad=diagnostics["grad"],
+                final_ai=diagnostics["ai"],
+                diagnostics=diagnostics,
+                history=history,
+            )
+
+    fit = SPARSE._fit_covariate_contrast_residual_reml(
+        DirectREMLFitter(),
+        residual,
+        theta,
+        covar=nuisance,
+        h2_init=0.27,
+    )
+    shifted_fit = SPARSE._fit_covariate_contrast_residual_reml(
+        DirectREMLFitter(),
+        shifted,
+        theta,
+        covar=nuisance,
+        h2_init=0.27,
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(fit.var_components),
+        np.asarray(shifted_fit.var_components),
+        rtol=2e-6,
+        atol=2e-6,
+    )
+    np.testing.assert_allclose(
+        np.asarray(fit.final_grad),
+        np.asarray(shifted_fit.final_grad),
+        rtol=2e-5,
+        atol=2e-6,
+    )
+    np.testing.assert_allclose(
+        np.asarray(fit.final_ai),
+        np.asarray(shifted_fit.final_ai),
+        rtol=2e-5,
+        atol=2e-6,
     )
 
 

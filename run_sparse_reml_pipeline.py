@@ -710,38 +710,51 @@ def _accepted_reml_theta(
     return theta, stop_reason
 
 
-def _intercept_contrast_fixed_effect(n_samples: int) -> np.ndarray:
-    """Return the nuisance column whose REML contrasts remove the intercept."""
-    n_samples = int(n_samples)
-    if n_samples < 2:
-        raise ValueError("Intercept contrasts require at least two samples.")
-    return np.ones((n_samples, 1), dtype=np.float32)
-
-
-def _fit_intercept_contrast_residual_ml(
+def _fit_covariate_contrast_residual_reml(
     fitter,
     residual_standardized: np.ndarray,
     theta_init: np.ndarray,
     *,
+    covar: np.ndarray | None,
     h2_init: float,
 ):
-    """Fit residual covariance and return it on the standardized-phenotype scale.
+    """Profile the full nuisance design in the sparse variance-component block.
 
-    Core REML always standardizes its response. The Lasso residual already has
-    units of the globally standardized phenotype, so the unit-residual-scale
-    variance estimates are multiplied by the residual variance before they are
-    combined with sparse quadratic terms.
+    The supplied residual may already subtract a fitted nuisance score.  This
+    does not change the restricted likelihood because ``P_C C = 0``; passing
+    the complete design ``C`` here is what makes the update equivalent to
+    profiling the nuisance coefficients at every candidate covariance.
+
+    Core REML standardizes its response internally.  The Lasso residual already
+    has units of the globally standardized phenotype, so estimates on the
+    internal unit-residual scale are mapped back before they are combined with
+    sparse quadratic terms.
     """
     residual = np.asarray(residual_standardized, dtype=np.float32).reshape(-1)
     theta = np.asarray(theta_init, dtype=np.float32).reshape(-1)
+    if residual.size < 2:
+        raise ValueError("Covariate-contrast REML requires at least two samples.")
+    if covar is None:
+        nuisance_design = np.ones((residual.size, 1), dtype=np.float32)
+    else:
+        nuisance_design = np.asarray(covar, dtype=np.float32)
+        if nuisance_design.ndim == 1:
+            nuisance_design = nuisance_design[:, None]
+        if (
+            nuisance_design.ndim != 2
+            or nuisance_design.shape[0] != residual.size
+            or nuisance_design.shape[1] == 0
+        ):
+            raise ValueError(
+                "Covariate design must have shape (n_samples, n_covariates)."
+            )
+        if not np.all(np.isfinite(nuisance_design)):
+            raise ValueError("Covariate design contains non-finite values.")
     _, residual_scale = _phenotype_standardization_stats(residual)
     variance_scale = float(residual_scale) ** 2
     fit_result = fitter.fit_infinitesimal(
         jnp.asarray(residual, dtype=jnp.float32),
-        jnp.asarray(
-            _intercept_contrast_fixed_effect(residual.size),
-            dtype=jnp.float32,
-        ),
+        jnp.asarray(nuisance_design, dtype=jnp.float32),
         h2_init=float(h2_init),
         var_components_init=jnp.asarray(
             theta / variance_scale, dtype=jnp.float32
@@ -1814,7 +1827,7 @@ def main() -> None:
     final_pair_source = "unavailable"
     final_alignment_warning = None
     last_aligned_pair = None
-    lasso_ml_stop_reason = ""
+    lasso_reml_stop_reason = ""
     penalized_failure_reason = None
 
     # ---- Precompute loop-invariant B_screen = [y | covar] on device --------
@@ -2295,14 +2308,12 @@ def main() -> None:
                 bool(certified_kkt),
             )
 
-        # ---- Step 5: contrast residual-ML variance block ------------------
-        # Hold the complete Lasso mean fixed and maximize the Gaussian
-        # likelihood in the subspace orthogonal to the intercept, exactly as
-        # in the manuscript's m=n-1 contrast coordinates.  Passing a constant
-        # fixed-effect column to fit_infinitesimal is algebraically equivalent
-        # to that contrast likelihood.  Omitting it would retain a zero-energy
-        # constant mode of the centered GRM and spuriously drive residual
-        # variance toward its numerical floor.
+        # ---- Step 5: covariate-contrast REML variance block ---------------
+        # Hold the sparse genetic score fixed and maximize the restricted
+        # likelihood after projecting out the complete nuisance design C.
+        # Although the response below already subtracts C beta_cov, passing C
+        # remains essential: P_C C = 0 makes this exactly equivalent to
+        # profiling beta_cov at every candidate covariance, as in the paper.
         beta_cov_current = np.asarray(
             lasso.get("beta_cov", np.empty((0,))), dtype=np.float64
         )
@@ -2359,23 +2370,24 @@ def main() -> None:
 
         residual_standardized = residual_raw / float(phenotype_scale)
         try:
-            ml_res = _fit_intercept_contrast_residual_ml(
+            ml_res = _fit_covariate_contrast_residual_reml(
                 fitter,
                 residual_standardized,
                 theta,
+                covar=covar_np,
                 h2_init=_trace_weighted_h2(theta),
             )
-            theta_new, lasso_ml_stop_reason = _accepted_reml_theta(
+            theta_new, lasso_reml_stop_reason = _accepted_reml_theta(
                 ml_res,
                 expected_components=n_grm + 1,
-                stage=f"outer {outer} Lasso residual-ML block",
+                stage=f"outer {outer} Lasso covariate-contrast REML block",
             )
             # ``ll_down`` is a converged no-update block: its downhill
             # candidate is rejected and the previous theta is retained.
             variance_blocks_completed += 1
         except (FloatingPointError, RuntimeError, ValueError) as error:
             penalized_failure_reason = str(error)
-            outer_stop_reason = "residual_ml_failed"
+            outer_stop_reason = "covariate_contrast_reml_failed"
             support = support_new
             final_candidate = candidate
             final_lasso = lasso
@@ -2395,17 +2407,17 @@ def main() -> None:
                 }
             )
             logger.warning(
-                "[WARN] residual-ML block rejected at outer=%s: %s",
+                "[WARN] covariate-contrast REML block rejected at outer=%s: %s",
                 outer,
                 penalized_failure_reason,
             )
             break
         if args.verbose:
             logger.info(
-                "[outer %s] residual_ml_init_theta=%s stop=%s",
+                "[outer %s] covariate_contrast_reml_init_theta=%s stop=%s",
                 outer,
                 theta.tolist(),
-                lasso_ml_stop_reason,
+                lasso_reml_stop_reason,
             )
 
         # ---- Convergence checks ------------------------------------------
@@ -2446,13 +2458,13 @@ def main() -> None:
             "kkt_trace": kkt_trace,
             "final_alignment": False,
             "variance_update": (
-                "intercept_contrast_residual_ml_no_update"
-                if lasso_ml_stop_reason == "ll_down"
-                else "intercept_contrast_residual_ml"
+                "covariate_contrast_residual_reml_no_update"
+                if lasso_reml_stop_reason == "ll_down"
+                else "covariate_contrast_residual_reml"
             ),
-            "variance_stop_reason": lasso_ml_stop_reason,
+            "variance_stop_reason": lasso_reml_stop_reason,
             "variance_step_rejected": bool(
-                lasso_ml_stop_reason == "ll_down"
+                lasso_reml_stop_reason == "ll_down"
             ),
         })
 
@@ -2880,8 +2892,9 @@ def main() -> None:
             ss_gls_basis_size = 0
 
     # The primary COHERIT estimate always uses the calibrated Lasso quadratic
-    # and the residual-ML covariance from the same penalized branch.  The other
-    # three estimators are constructed only in explicit comparison mode.
+    # and the covariate-contrast REML covariance from the same penalized
+    # branch. The other three estimators are constructed only in explicit
+    # comparison mode.
     h2_chive = _sparse_dense_h2(
         q_chive_standardized,
         theta_lasso_ml_sum,
@@ -2972,7 +2985,7 @@ def main() -> None:
     )
     h2 = h2_chive_guarded
     primary_h2_method = (
-        "penalized_ml_lasso_chive" if lasso_branch_valid else "unavailable"
+        "penalized_reml_lasso_chive" if lasso_branch_valid else "unavailable"
     )
 
     h2_background_selected_span_reml = (
@@ -3308,7 +3321,7 @@ def main() -> None:
                     "output_emitted": True,
                     "invalid_reasons": [],
                     "mean_estimator": "final_weighted_lasso",
-                    "covariance_estimator": "lasso_residual_ml",
+                    "covariance_estimator": "lasso_covariate_contrast_reml",
                     "theta_standardized": theta_lasso_ml.tolist(),
                     "residual": (
                         "(y-X_beta_cov_lasso-Z_support_beta_lasso)"
@@ -3430,9 +3443,11 @@ def main() -> None:
         "outer_stop_reason": outer_stop_reason,
         "outer_convergence_warning": outer_convergence_warning,
         "penalized_failure_reason": penalized_failure_reason,
-        "lasso_variance_update": "intercept_contrast_residual_ml",
-        "lasso_variance_contrast": "orthogonal_to_intercept",
-        "lasso_variance_analysis_dimension": int(y_np.shape[0] - 1),
+        "lasso_variance_update": "covariate_contrast_residual_reml",
+        "lasso_variance_contrast": "orthogonal_to_complete_nuisance_design",
+        "lasso_variance_analysis_dimension": int(
+            y_np.shape[0] - n_covar
+        ),
         "reml_max_linesearch_trials": int(
             args.reml_max_linesearch_trials
         ),

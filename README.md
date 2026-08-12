@@ -86,11 +86,13 @@ $$
 (\hat\alpha_\lambda,\hat b_\lambda)=\arg\min_{\alpha,b}\frac{1}{2}(y-C\alpha-Z_Sb)^TV(\theta)^{-1}(y-C\alpha-Z_Sb)+\lambda\|b\|_1.
 $$
 
-The sparse command first alternates this weighted-LASSO step with Gaussian ML
-for the residual `y-C alpha-Z b` in the \(n-1\) dimensional space orthogonal
-to the intercept.  In the full sample space this is implemented by supplying
-an intercept to the REML routine; it prevents the zero-energy constant mode of
-a centered GRM from spuriously driving residual variance to its lower bound.
+The sparse command first alternates this weighted-LASSO step with REML for the
+residual `y-C alpha-Z b` in the \(n-\operatorname{rank}(C)\) dimensional space
+orthogonal to the complete nuisance design. Supplying the full `C` matrix to
+the REML routine profiles its unpenalized coefficients at every candidate
+covariance. Since \(P_C C=0\), using a residual that already subtracts the
+current nuisance score is algebraically equivalent to applying \(P_C\) to
+`y-Z b`, while retaining the numerically convenient residual scale.
 Within each candidate problem, coordinate descent is accepted solely when the
 active and inactive score-KKT conditions pass at the configured numerical
 tolerance; coefficient change is only an active-set scheduling heuristic.
@@ -140,7 +142,7 @@ Sparse-run output semantics are deliberately explicit:
 - `h2_background_selected_span_reml` is background-only once SNPs enter the
   fixed-effect design; it is not total heritability.
 - `h2_lasso_plugin` combines the uncorrected squared penalized-LASSO score
-  with the residual-ML LASSO-branch variance components.
+  with the covariate-contrast REML variance components from the LASSO branch.
 - `h2_ss_gls_plugin` is the uncorrected fitted-score plug-in after the
   selected-span REML variance refit and final GLS coefficient recovery; its
   guarded counterpart is `h2_ss_gls_plugin_guarded`.
