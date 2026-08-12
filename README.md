@@ -500,7 +500,7 @@ fit lifecycle.
   the signed score-KKT conditions.  Their effective minimum is
   `max(1e-4, 2*pcg_tol)`, so the certificate does not demand more precision
   than its PCG inputs provide.
-- `--outer-max`: maximum number of variance updates; the default is `10`.
+- `--outer-max`: maximum number of variance updates; the default is `20`.
 - `--compare-four-estimators`: opt in to the secondary four-estimator and
   selected-span prediction comparison.  Without it, sparse runs compute only
   COHERIT and, when prediction inputs are supplied, only the matched Lasso

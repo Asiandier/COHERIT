@@ -372,7 +372,7 @@ def test_partitioned_kkt_rejects_nonfinite_outside_score_with_empty_support():
         )
 
 
-def test_sparse_defaults_use_ten_outer_rounds_and_pcg_scaled_kkt_floor(
+def test_sparse_defaults_use_twenty_outer_rounds_and_pcg_scaled_kkt_floor(
     monkeypatch,
 ):
     monkeypatch.delenv("PCG_TOL", raising=False)
@@ -380,7 +380,7 @@ def test_sparse_defaults_use_ten_outer_rounds_and_pcg_scaled_kkt_floor(
     monkeypatch.setattr(sys, "argv", ["gpu-reml-sparse"])
     default_args = SPARSE.parse_args()
     default_floor = max(1e-4, 2.0 * default_args.pcg_tol)
-    assert default_args.outer_max == 10
+    assert default_args.outer_max == 20
     assert np.isclose(default_args.kkt_tol, default_floor)
     assert np.isclose(default_args.kkt_rel_tol, default_floor)
 

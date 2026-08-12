@@ -491,7 +491,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pcg-tol", type=float, default=float(env("PCG_TOL", "5e-3")))
     p.add_argument("--pcg-ridge", type=float, default=float(env("PCG_RIDGE", "1e-6")))
     p.add_argument("--max-pcg-iters", type=int, default=int(env("MAX_PCG_ITERS", "400")))
-    p.add_argument("--outer-max", type=int, default=10)
+    p.add_argument("--outer-max", type=int, default=20)
     p.add_argument(
         "--compare-four-estimators",
         action="store_true",
