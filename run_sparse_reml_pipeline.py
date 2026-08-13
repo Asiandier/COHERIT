@@ -228,6 +228,9 @@ class MultiGRMIndex:
 
     With G GRMs having m_0, m_1, … SNPs, the global index space is
     [0, m_0) for GRM 0, [m_0, m_0+m_1) for GRM 1, etc.
+    For a component-partitioned single source, this is the streamer's
+    canonical component-concatenated cache order.  Source BIM/PVAR indices are
+    obtained explicitly through :meth:`source_variant_indices`.
     """
 
     def __init__(self, streamers, call_plan=(), component_variant_indices=None):
@@ -239,22 +242,69 @@ class MultiGRMIndex:
         )
         self._source_variant_indices = None
         if self._partitioned_single_streamer:
-            groups = [
+            if len(streamers) != 1:
+                raise ValueError(
+                    "Single-source component partitioning requires exactly one streamer."
+                )
+            streamer = streamers[0]
+            if not bool(getattr(streamer, "has_component_partition", False)):
+                raise ValueError(
+                    "component_variant_indices were supplied, but the genotype "
+                    "streamer is not component-partitioned."
+                )
+            requested_groups = [
                 np.asarray(group, dtype=np.int64).reshape(-1)
                 for group in component_variant_indices
             ]
-            self.n_grm = len(groups)
-            self.m_per_grm = np.array([group.size for group in groups], dtype=np.int64)
-            if groups:
-                self._source_variant_indices = np.concatenate(groups, axis=0)
-            else:
-                self._source_variant_indices = np.empty((0,), dtype=np.int64)
+            self.n_grm = int(streamer.n_components)
+            component_offsets = np.asarray(
+                streamer._component_snp_offsets, dtype=np.int64
+            ).reshape(-1)
+            if component_offsets.shape != (self.n_grm + 1,):
+                raise ValueError("Invalid component offsets in partitioned streamer.")
+            self.m_per_grm = np.diff(component_offsets)
+            cache_to_source = np.asarray(
+                streamer._cache_to_source_variant_indices, dtype=np.int64
+            ).reshape(-1)
+            if cache_to_source.size != int(streamer.m):
+                raise ValueError(
+                    "Partitioned streamer's cache-to-source SNP map has the wrong length."
+                )
+            if len(requested_groups) != self.n_grm:
+                raise ValueError(
+                    "Component count mismatch between component spec and genotype streamer."
+                )
+            for component_idx, requested in enumerate(requested_groups):
+                start = int(component_offsets[component_idx])
+                stop = int(component_offsets[component_idx + 1])
+                actual = cache_to_source[start:stop]
+                # The streamer canonicalizes each component to increasing
+                # source order.  Validate the requested membership, then use
+                # that canonical map as the sole coordinate source for sparse
+                # output, BIM/PVAR lookup and prediction auditing.
+                expected = np.unique(requested)
+                if not np.array_equal(actual, expected):
+                    raise ValueError(
+                        "Component SNP mapping mismatch between component spec "
+                        f"and genotype streamer for component {component_idx}."
+                    )
+            self._source_variant_indices = cache_to_source.copy()
         else:
             self.n_grm = len(streamers)
             self.m_per_grm = np.array([st.m for st in streamers], dtype=np.int64)
         self.offsets = np.zeros(self.n_grm + 1, dtype=np.int64)
         np.cumsum(self.m_per_grm, out=self.offsets[1:])
         self.m_total = int(self.offsets[-1])
+
+    def _validated_global_indices(self, global_idx: np.ndarray) -> np.ndarray:
+        gidx = np.asarray(global_idx, dtype=np.int64)
+        if gidx.ndim != 1:
+            raise ValueError("global_idx must be one-dimensional.")
+        if np.any((gidx < 0) | (gidx >= self.m_total)):
+            raise IndexError(
+                f"Global SNP indices must lie in [0, {self.m_total})."
+            )
+        return gidx
 
     def global_to_local(
         self, global_idx: np.ndarray
@@ -266,7 +316,7 @@ class MultiGRMIndex:
         where positions_in_input are the positions in the original global_idx
         array so results can be assembled back.
         """
-        gidx = np.asarray(global_idx, dtype=np.int64)
+        gidx = self._validated_global_indices(global_idx)
         grm_ids = np.searchsorted(self.offsets[1:], gidx, side="right")
         grm_ids = np.clip(grm_ids, 0, self.n_grm - 1)
         groups: list[tuple[int, np.ndarray, np.ndarray]] = []
@@ -321,7 +371,7 @@ class MultiGRMIndex:
         Dispatches to the correct streamer for each GRM and assembles
         columns in the original order.
         """
-        gidx = np.asarray(global_idx, dtype=np.int64)
+        gidx = self._validated_global_indices(global_idx)
         if self._partitioned_single_streamer:
             return self.streamers[0].extract_standardized_columns(gidx)
         n = self.streamers[0].n
@@ -332,7 +382,7 @@ class MultiGRMIndex:
         return out
 
     def source_variant_indices(self, global_idx: np.ndarray) -> np.ndarray:
-        gidx = np.asarray(global_idx, dtype=np.int64)
+        gidx = self._validated_global_indices(global_idx)
         if self._source_variant_indices is None:
             return gidx.copy()
         return np.asarray(self._source_variant_indices[gidx], dtype=np.int64)
