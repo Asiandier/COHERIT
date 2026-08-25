@@ -354,13 +354,20 @@ class MultiGRMIndex:
                 dtype=np.float64,
             )
 
-        scores = np.zeros(self.m_total, dtype=np.float64)
+        scores = None
         for g, st in enumerate(self.streamers):
             off = int(self.offsets[g])
             block = np.asarray(
                 st.xtv(u_jax, normalize=normalize), dtype=np.float64
             )
-            scores[off : off + st.m] = block
+            if scores is None:
+                scores = np.zeros(
+                    (self.m_total, *block.shape[1:]),
+                    dtype=np.float64,
+                )
+            scores[off : off + st.m, ...] = block
+        if scores is None:
+            raise RuntimeError("xtv_all requires at least one genotype streamer.")
         return scores
 
     def extract_standardized_columns(
@@ -474,6 +481,34 @@ def parse_args() -> argparse.Namespace:
         "--component-spec",
         default=env("COMPONENT_SPEC", ""),
         help="Structured component spec (.json or .npz) defining SNP-ID/index GRM partitions.",
+    )
+    p.add_argument(
+        "--variance-components-init",
+        default="",
+        help=(
+            "Optional JSON array with one initial value per GRM followed by "
+            "the residual variance. Used by the Adaptive COHERIT warm start."
+        ),
+    )
+    p.add_argument(
+        "--marker-score-out",
+        default="",
+        help=(
+            "Optional .npz output for covariance-standardized residual marker "
+            "scores used by Adaptive COHERIT."
+        ),
+    )
+    p.add_argument(
+        "--marker-score-probes",
+        type=int,
+        default=32,
+        help="Rademacher probes for the marker-information diagonal estimate.",
+    )
+    p.add_argument(
+        "--marker-score-seed",
+        type=int,
+        default=0,
+        help="Deterministic Rademacher seed for --marker-score-out.",
     )
     p.add_argument("--pheno-txt", default=env("PHENO_TXT", ""))
     p.add_argument("--covar-txt", default=env("COVAR_TXT", ""))
@@ -1510,6 +1545,196 @@ def _build_lasso_candidate(
     return np.asarray(sorted(keep_list), dtype=np.int64)
 
 
+def _parse_variance_components_init(
+    value: str,
+    *,
+    n_grm: int,
+) -> np.ndarray:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as error:
+        raise ValueError(
+            "--variance-components-init must be a JSON array."
+        ) from error
+    theta = np.asarray(parsed, dtype=np.float64).reshape(-1)
+    if theta.shape != (int(n_grm) + 1,):
+        raise ValueError(
+            "--variance-components-init must contain one value per GRM "
+            f"followed by residual variance; expected {int(n_grm) + 1}, "
+            f"got {int(theta.size)}."
+        )
+    if (
+        not np.all(np.isfinite(theta))
+        or np.any(theta[:-1] < 0.0)
+        or theta[-1] <= 0.0
+    ):
+        raise ValueError(
+            "Initial genetic variance components must be nonnegative and "
+            "the residual component must be positive."
+        )
+    return theta
+
+
+def _compute_adaptive_marker_scores(
+    *,
+    output_path: str,
+    residual_raw: np.ndarray,
+    fitter,
+    ops,
+    grm_index: MultiGRMIndex,
+    theta: np.ndarray,
+    n_probes: int,
+    seed: int,
+    pcg_tol: float,
+    max_pcg_iters: int,
+) -> dict[str, object]:
+    """Write |x'V^-1 r| / sqrt(x'V^-1 x) for every source marker.
+
+    The marker-information diagonal is estimated without materializing X or V.
+    For a sample-space Rademacher probe q,
+    E[(X' q) * (X' V^-1 q)] = diag(X' V^-1 X).
+    """
+    if int(n_probes) < 1:
+        raise ValueError("marker-score-probes must be >= 1.")
+    if not output_path.lower().endswith(".npz"):
+        raise ValueError("--marker-score-out must end in .npz.")
+    residual = np.asarray(residual_raw, dtype=np.float32).reshape(-1)
+    n_samples = int(fitter.streamers[0].n)
+    if residual.shape != (n_samples,) or not np.all(np.isfinite(residual)):
+        raise ValueError("Adaptive marker-score residual is malformed.")
+
+    theta_values = np.asarray(theta, dtype=np.float64).reshape(-1)
+    if theta_values.shape != (grm_index.n_grm + 1,):
+        raise ValueError("Adaptive marker-score theta has the wrong length.")
+    theta_g = jnp.asarray(theta_values[:-1], dtype=jnp.float32)
+    theta_e = jnp.asarray(theta_values[-1], dtype=jnp.float32)
+    hv = fitter._make_hv(ops, theta_g, theta_e)
+    precond = fitter._make_effect_precond(ops, theta_g, theta_e)
+
+    rng = np.random.default_rng(int(seed))
+    probes = rng.integers(
+        0,
+        2,
+        size=(n_samples, int(n_probes)),
+        dtype=np.int8,
+    ).astype(np.float32)
+    probes *= 2.0
+    probes -= 1.0
+    rhs = np.concatenate([residual[:, None], probes], axis=1).astype(
+        np.float32,
+        copy=False,
+    )
+    rhs_dev = jnp.asarray(rhs, dtype=jnp.float32)
+    solution, reported_residual, iterations = pcg_solve(
+        hv,
+        rhs_dev,
+        M=precond,
+        tol=float(pcg_tol),
+        maxiter=int(max_pcg_iters),
+    )
+    reported = _require_pcg_converged(
+        reported_residual,
+        tol=float(pcg_tol),
+        iters=iterations,
+        maxiter=int(max_pcg_iters),
+        stage="adaptive marker score",
+    )
+    true_residual = _true_pcg_relative_residual(hv, rhs_dev, solution)
+    if not np.isfinite(true_residual):
+        raise RuntimeError("Adaptive marker-score PCG true residual is non-finite.")
+
+    xt_solution = np.asarray(
+        grm_index.xtv_all(solution, normalize=False),
+        dtype=np.float64,
+    )
+    xt_probe = np.asarray(
+        grm_index.xtv_all(
+            jnp.asarray(probes, dtype=jnp.float32),
+            normalize=False,
+        ),
+        dtype=np.float64,
+    )
+    expected_shape = (grm_index.m_total, int(n_probes) + 1)
+    if xt_solution.shape != expected_shape:
+        raise RuntimeError(
+            "Adaptive marker-score X'V^-1 RHS has the wrong shape: "
+            f"{xt_solution.shape} != {expected_shape}."
+        )
+    if xt_probe.shape != (grm_index.m_total, int(n_probes)):
+        raise RuntimeError("Adaptive marker-score X'probe has the wrong shape.")
+
+    numerator = xt_solution[:, 0]
+    information = np.mean(
+        xt_probe * xt_solution[:, 1:],
+        axis=1,
+        dtype=np.float64,
+    )
+    positive = information[np.isfinite(information) & (information > 0.0)]
+    if positive.size == 0:
+        raise RuntimeError(
+            "Hutchinson marker-information estimate has no positive entries."
+        )
+    information_floor = max(
+        float(np.median(positive)) * 1e-6,
+        float(np.finfo(np.float32).tiny),
+    )
+    clipped = ~np.isfinite(information) | (information <= information_floor)
+    information_safe = np.where(clipped, information_floor, information)
+    signal_score = np.abs(numerator) / np.sqrt(information_safe)
+    if not np.all(np.isfinite(signal_score)):
+        raise RuntimeError("Adaptive marker score contains non-finite values.")
+
+    global_indices = np.arange(grm_index.m_total, dtype=np.int64)
+    source_indices = grm_index.source_variant_indices(global_indices)
+    source_order = np.argsort(source_indices, kind="stable")
+    if not np.array_equal(
+        source_indices[source_order],
+        np.arange(grm_index.m_total, dtype=np.int64),
+    ):
+        raise RuntimeError(
+            "Adaptive marker scores require a one-to-one source variant order."
+        )
+    component_global = np.empty(grm_index.m_total, dtype=np.int32)
+    for component_index in range(grm_index.n_grm):
+        component_global[
+            int(grm_index.offsets[component_index]) :
+            int(grm_index.offsets[component_index + 1])
+        ] = int(component_index)
+
+    ensure_parent_dir(output_path)
+    temporary = f"{output_path}.tmp.{os.getpid()}"
+    with open(temporary, "wb") as handle:
+        np.savez_compressed(
+            handle,
+            source_variant_index=source_indices[source_order],
+            parent_component_index=component_global[source_order],
+            signal_score=signal_score[source_order].astype(np.float32),
+            score_numerator=numerator[source_order].astype(np.float32),
+            information_diagonal=information_safe[source_order].astype(
+                np.float32
+            ),
+        )
+    os.replace(temporary, output_path)
+    return {
+        "requested": True,
+        "status": "emitted",
+        "path": os.path.abspath(output_path),
+        "definition": "abs(x_t_Vinv_residual)/sqrt(x_t_Vinv_x)",
+        "information_diagonal_estimator": (
+            "sample_space_rademacher_hutchinson"
+        ),
+        "n_markers": int(grm_index.m_total),
+        "n_probes": int(n_probes),
+        "seed": int(seed),
+        "information_floor": float(information_floor),
+        "information_clipped_count": int(np.count_nonzero(clipped)),
+        "information_clipped_fraction": float(np.mean(clipped)),
+        "pcg_reported_relative_residual": float(reported),
+        "pcg_true_relative_residual": float(true_residual),
+        "pcg_iterations": int(iterations),
+    }
+
+
 def main() -> None:
     args = parse_args()
     if int(args.screen_topk) < int(args.candidate_k):
@@ -1540,6 +1765,8 @@ def main() -> None:
         or float(args.pcg_tol) <= 0.0
     ):
         raise SystemExit("pcg-tol must be finite and > 0.")
+    if args.marker_score_out and int(args.marker_score_probes) < 1:
+        raise SystemExit("marker-score-probes must be >= 1.")
 
     logger.info("[INFO] sparse pipeline start @ %s", datetime.now().isoformat(timespec='seconds'))
     t0 = time.time()
@@ -1824,26 +2051,38 @@ def main() -> None:
         theta_arr = np.asarray(theta_values, dtype=np.float64).reshape(-1)
         return float(np.dot(theta_arr[:n_grm], genetic_trace_atoms))
 
-    # Match fit_reml's trace-calibrated default initialization.
+    # Match fit_reml's trace-calibrated default initialization unless an
+    # adaptive parent fit supplies an exactly covariance-preserving child init.
     h2_init_default = 0.5
     trace_sum = float(np.sum(genetic_trace_atoms))
     if trace_sum <= 0.0:
         raise RuntimeError("Sparse REML requires at least one positive-trace GRM.")
-    theta_g0 = np.where(
-        genetic_trace_atoms > 0.0,
-        h2_init_default / trace_sum,
-        0.0,
-    )
-    theta_e0 = np.array([1.0 - h2_init_default], dtype=np.float64)
-    theta = np.concatenate([theta_g0, theta_e0], axis=0)
+    supplied_theta_init = args.variance_components_init.strip()
+    if supplied_theta_init:
+        theta = _parse_variance_components_init(
+            supplied_theta_init,
+            n_grm=n_grm,
+        )
+        theta_init_source = "command_line_json"
+    else:
+        theta_g0 = np.where(
+            genetic_trace_atoms > 0.0,
+            h2_init_default / trace_sum,
+            0.0,
+        )
+        theta_e0 = np.array([1.0 - h2_init_default], dtype=np.float64)
+        theta = np.concatenate([theta_g0, theta_e0], axis=0)
+        theta_init_source = "trace_calibrated_default"
+    theta_initial = theta.copy()
     fitter._ensure_projected_core_precond_ready(
         ops,
         var_components_init=jnp.asarray(theta, dtype=jnp.float32),
     )
     logger.info(
-        "[INFO] init theta (fit_reml default) @ %s: "
-        "%s",
-        datetime.now().isoformat(timespec='seconds'), theta.tolist(),
+        "[INFO] init theta (%s) @ %s: %s",
+        theta_init_source,
+        datetime.now().isoformat(timespec='seconds'),
+        theta.tolist(),
     )
 
     path_cfg = LassoPathConfig(
@@ -3044,6 +3283,42 @@ def main() -> None:
         else unavailable
     )
 
+    adaptive_marker_score_summary = None
+    marker_score_output = args.marker_score_out.strip()
+    if marker_score_output:
+        if not lasso_branch_valid:
+            raise RuntimeError(
+                "Adaptive marker scores require a valid covariance-aligned "
+                "COHERIT Lasso branch."
+            )
+        marker_score_residual = _lasso_residual(
+            y=y_np,
+            covar=covar_np,
+            geno=Z_support,
+            beta_cov=beta_cov_lasso,
+            beta_snp=beta_lasso_active,
+        )
+        adaptive_marker_score_summary = _compute_adaptive_marker_scores(
+            output_path=marker_score_output,
+            residual_raw=marker_score_residual,
+            fitter=fitter,
+            ops=ops,
+            grm_index=grm_index,
+            theta=theta_lasso_ml,
+            n_probes=int(args.marker_score_probes),
+            seed=int(args.marker_score_seed),
+            pcg_tol=float(args.pcg_tol),
+            max_pcg_iters=int(args.max_pcg_iters),
+        )
+        logger.info(
+            "[adaptive] marker scores -> %s (probes=%s clipped=%s)",
+            marker_score_output,
+            int(args.marker_score_probes),
+            adaptive_marker_score_summary[
+                "information_clipped_count"
+            ],
+        )
+
     print(f"[RESULT] var_components_lasso_ml={theta_lasso_ml.tolist()}")
     print(f"[RESULT] h2={h2:.6f} (primary={primary_h2_method})")
     print(f"[RESULT] h2_chive={h2_chive:.6f} (penalized LASSO calibration)")
@@ -3552,6 +3827,12 @@ def main() -> None:
         "outer_history": history,
         "sparse_prediction": prediction_summary,
     }
+
+    if supplied_theta_init:
+        summary["variance_components_initial"] = theta_initial.tolist()
+        summary["variance_components_init_source"] = theta_init_source
+    if adaptive_marker_score_summary is not None:
+        summary["adaptive_marker_score"] = adaptive_marker_score_summary
 
     if comparison_enabled:
         summary.update({
