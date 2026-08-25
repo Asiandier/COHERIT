@@ -46,6 +46,8 @@ class LassoPathConfig:
     active_set_period: int = 5
     kkt_abs_tol: float = 1e-4
     kkt_rel_tol: float = 1e-4
+    selection_mode: str = "ebic"
+    fixed_lam_ratio: float | None = None
     verbose: bool = False
 
 
@@ -399,7 +401,7 @@ def solve_lasso_path_and_select_ebic(
     cfg: LassoPathConfig,
 ) -> dict:
     """
-    Solve a lambda path and select lambda by EBIC.
+    Solve a lambda path and select lambda by EBIC or a frozen lambda ratio.
 
     Args:
         Q, q: weighted quadratic system.
@@ -414,6 +416,22 @@ def solve_lasso_path_and_select_ebic(
     if Q.shape != (q.size, q.size):
         raise ValueError("Q/q shape mismatch.")
 
+    selection_mode = str(cfg.selection_mode)
+    if selection_mode not in {"ebic", "fixed_ratio"}:
+        raise ValueError(
+            "Lasso selection_mode must be 'ebic' or 'fixed_ratio'."
+        )
+    fixed_lam_ratio = cfg.fixed_lam_ratio
+    if selection_mode == "fixed_ratio":
+        if (
+            fixed_lam_ratio is None
+            or not math.isfinite(float(fixed_lam_ratio))
+            or not 0.0 < float(fixed_lam_ratio) <= 1.0
+        ):
+            raise ValueError(
+                "fixed_ratio Lasso selection requires fixed_lam_ratio in (0, 1]."
+            )
+
     lam_max = float(np.max(np.abs(q))) if q.size > 0 else 0.0
     lam_seq = make_lambda_sequence(lam_max, cfg.lam_min_ratio, cfg.n_lambda)
 
@@ -426,6 +444,7 @@ def solve_lasso_path_and_select_ebic(
     best_ebic = float("inf")
     beta_warm = np.zeros_like(q)
     path = []
+    beta_path: list[np.ndarray] = []
     beta_best = np.zeros_like(q)
     lam_best = float(lam_seq[0]) if lam_seq.size > 0 else 0.0
     es_counter = 0  # early-stop patience counter
@@ -472,6 +491,9 @@ def solve_lasso_path_and_select_ebic(
         path.append(
             {
                 "lam": float(lam),
+                "lam_ratio": (
+                    float(lam / lam_max) if lam_max > 0.0 else 1.0
+                ),
                 "k": k,
                 "rss": rss,
                 "ebic": float(ebic),
@@ -483,6 +505,7 @@ def solve_lasso_path_and_select_ebic(
                 "max_inactive_kkt_excess": max_inactive_kkt_excess,
             }
         )
+        beta_path.append(beta.copy())
 
         # Never silently drop an unsolved lower-lambda point and select the
         # last valid (often empty) model.  That would be an implicit fallback,
@@ -516,13 +539,34 @@ def solve_lasso_path_and_select_ebic(
             )
 
         # Early stop: if EBIC hasn't improved for `patience` consecutive lambdas
-        if cfg.ebic_early_stop and es_counter >= es_patience and i >= 2:
+        if (
+            selection_mode == "ebic"
+            and cfg.ebic_early_stop
+            and es_counter >= es_patience
+            and i >= 2
+        ):
             if cfg.verbose:
                 logger.info(
                     "[lasso_path] EBIC early stop at %d/%d: no improvement for %d steps",
                     i + 1, len(lam_seq), es_counter,
                 )
             break
+
+    beta_path_array = np.stack(beta_path, axis=0).astype(
+        np.float64, copy=False
+    )
+    if selection_mode == "fixed_ratio":
+        target_log_ratio = math.log(float(fixed_lam_ratio))
+        best_idx = min(
+            range(len(path)),
+            key=lambda idx: (
+                abs(math.log(float(path[idx]["lam_ratio"])) - target_log_ratio),
+                -float(path[idx]["lam_ratio"]),
+            ),
+        )
+        beta_best = beta_path_array[best_idx].copy()
+        lam_best = float(path[best_idx]["lam"])
+        best_ebic = float(path[best_idx]["ebic"])
 
     beta_best = np.asarray(beta_best, dtype=np.float64)
     active_idx = np.flatnonzero(beta_best != 0.0).astype(np.int64)
@@ -533,6 +577,11 @@ def solve_lasso_path_and_select_ebic(
         "active_idx": active_idx,
         "best_ebic": float(best_ebic),
         "path": path,
+        "beta_path": beta_path_array,
+        "lam_max": float(lam_max),
+        "selected_index": int(best_idx),
+        "selection_mode": selection_mode,
+        "selected_lam_ratio": float(path[best_idx]["lam_ratio"]),
     }
 
 
@@ -662,12 +711,27 @@ def fit_weighted_lasso_with_covariates(
     )
 
     beta_snp = np.asarray(lasso["beta"], dtype=np.float64)
+    beta_snp_path = np.asarray(lasso["beta_path"], dtype=np.float64)
 
     if covar is not None and covar.size > 0:
         if GCC is None or GCZ is None or gCy is None:
             raise RuntimeError("Internal error: covariate normal equations were not built.")
         rhs = gCy - GCZ @ beta_snp
         beta_cov = _solve_factorized_system(gcc_factor, rhs)
+        beta_cov_path = np.stack(
+            [
+                _solve_factorized_system(
+                    gcc_factor,
+                    gCy - GCZ @ beta_path_row,
+                )
+                for beta_path_row in beta_snp_path
+            ],
+            axis=0,
+        )
+    else:
+        beta_cov_path = np.empty(
+            (beta_snp_path.shape[0], 0), dtype=np.float64
+        )
 
     active_idx = np.flatnonzero(beta_snp != 0.0).astype(np.int64)
 
@@ -678,6 +742,12 @@ def fit_weighted_lasso_with_covariates(
         "lam": float(lasso["lam"]),
         "best_ebic": float(lasso["best_ebic"]),
         "path": lasso["path"],
+        "beta_snp_path": beta_snp_path,
+        "beta_cov_path": beta_cov_path,
+        "lam_max": float(lasso["lam_max"]),
+        "selected_index": int(lasso["selected_index"]),
+        "selection_mode": str(lasso["selection_mode"]),
+        "selected_lam_ratio": float(lasso["selected_lam_ratio"]),
     }
 
 

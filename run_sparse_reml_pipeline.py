@@ -56,6 +56,9 @@ _component_spec_mod = importlib.import_module(f"{pkg_name}.component_spec")
 _sparse_prediction_mod = importlib.import_module(
     f"{pkg_name}.sparse_prediction"
 )
+_sparsity_selection_mod = importlib.import_module(
+    f"{pkg_name}.sparsity_selection"
+)
 
 InfinitesimalREMLFitter = _inf_mod.InfinitesimalREMLFitter
 FitConfig = _inf_mod.FitConfig
@@ -70,6 +73,9 @@ fit_weighted_lasso_with_covariates = _lasso_mod.fit_weighted_lasso_with_covariat
 pcg_solve = _pcg_mod.pcg_solve
 load_component_specs = _component_spec_mod.load_component_specs
 predict_sparse_branch = _sparse_prediction_mod.predict_sparse_branch
+predict_sparse_path_partitioned = (
+    _sparse_prediction_mod.predict_sparse_path_partitioned
+)
 write_sparse_prediction_outputs = (
     _sparse_prediction_mod.write_sparse_prediction_outputs
 )
@@ -79,6 +85,13 @@ write_sparse_prediction_status = (
 remove_sparse_prediction_outputs = (
     _sparse_prediction_mod.remove_sparse_prediction_outputs
 )
+evaluate_prediction_path = _sparsity_selection_mod.evaluate_prediction_path
+merge_path_diagnostics = _sparsity_selection_mod.merge_path_diagnostics
+read_phenotype_aligned = _sparsity_selection_mod.read_phenotype_aligned
+select_validation_path_index = (
+    _sparsity_selection_mod.select_validation_path_index
+)
+write_selection_outputs = _sparsity_selection_mod.write_selection_outputs
 
 _source_mod = importlib.import_module(f"{pkg_name}.geno_source")
 PgenGenoSource = _source_mod.PgenGenoSource
@@ -604,6 +617,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lasso-lam-min-ratio", type=float, default=0.05)
     p.add_argument("--lasso-n-lambda", type=int, default=60)
     p.add_argument("--lasso-ebic-gamma", type=float, default=0.5)
+    p.add_argument(
+        "--lasso-selection-mode",
+        choices=["ebic", "fixed_ratio"],
+        default="ebic",
+        help=(
+            "Select the Lasso path point by EBIC or by a frozen "
+            "lambda/lambda_max ratio chosen on separate validation data."
+        ),
+    )
+    p.add_argument(
+        "--lasso-fixed-lam-ratio",
+        type=float,
+        default=None,
+        help=(
+            "Required with --lasso-selection-mode fixed_ratio; must lie in "
+            "(0, 1]."
+        ),
+    )
     p.add_argument("--lasso-ebic-early-stop", action="store_true")
     p.add_argument("--no-lasso-ebic-early-stop", dest="lasso_ebic_early_stop", action="store_false")
     p.set_defaults(lasso_ebic_early_stop=True)
@@ -612,6 +643,22 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lasso-cd-tol", type=float, default=1e-6)
     p.add_argument("--lasso-active-set-period", type=int, default=5)
     p.add_argument("--lasso-ridge", type=float, default=1e-6)
+    p.add_argument(
+        "--sparsity-validation-pheno-txt",
+        default="",
+        help=(
+            "Phenotype for the prediction samples used to evaluate the full "
+            "Lasso lambda path. Never supply the held-out test phenotype."
+        ),
+    )
+    p.add_argument(
+        "--sparsity-validation-out",
+        default="",
+        help=(
+            "Optional JSON output for validation-selected lambda-path "
+            "diagnostics at the final fitted covariance."
+        ),
+    )
     p.add_argument("--proj-ridge", type=float, default=1e-6)
     p.add_argument(
         "--ebic-p-mode",
@@ -1735,6 +1782,388 @@ def _compute_adaptive_marker_scores(
     }
 
 
+def _run_sparsity_validation_selection(
+    *,
+    args,
+    fitter,
+    prediction_fitter,
+    ops,
+    grm_index: MultiGRMIndex,
+    prediction_grm_index: MultiGRMIndex,
+    y_train: np.ndarray,
+    train_covar: np.ndarray | None,
+    validation_covar: np.ndarray | None,
+    validation_ids: list[str],
+    theta_standardized: np.ndarray,
+    phenotype_scale: float,
+    initial_candidate: np.ndarray,
+    path_cfg: LassoPathConfig,
+) -> dict[str, object]:
+    """Select a Lasso path point by validation prediction and certify it."""
+    if (
+        getattr(fitter, "_partitioned_streamer", None) is None
+        or getattr(prediction_fitter, "_partitioned_streamer", None) is None
+    ):
+        raise ValueError(
+            "Validation path selection requires a single-source component "
+            "partition."
+        )
+
+    y = np.asarray(y_train, dtype=np.float64).reshape(-1)
+    theta = np.asarray(theta_standardized, dtype=np.float64).reshape(-1)
+    candidate = np.unique(
+        np.asarray(initial_candidate, dtype=np.int64).reshape(-1)
+    )
+    if candidate.size < 1:
+        raise RuntimeError(
+            "Validation path selection requires a non-empty final candidate."
+        )
+    if np.any(candidate < 0) or np.any(candidate >= grm_index.m_total):
+        raise ValueError("Initial validation candidate is out of range.")
+
+    validation_outcome = read_phenotype_aligned(
+        args.sparsity_validation_pheno_txt,
+        validation_ids,
+    )
+    theta_dev = jnp.asarray(theta, dtype=jnp.float32)
+    fitter._ensure_projected_core_precond_ready(
+        ops, var_components_init=theta_dev
+    )
+    hv = fitter._make_hv(ops, theta_dev[:-1], theta_dev[-1])
+    precond = fitter._make_effect_precond(
+        ops, theta_dev[:-1], theta_dev[-1]
+    )
+
+    base_parts = [y[:, None]]
+    n_covar = 0
+    if train_covar is not None:
+        base_parts.append(np.asarray(train_covar, dtype=np.float64))
+        n_covar = int(train_covar.shape[1])
+    base_rhs = np.concatenate(base_parts, axis=1).astype(
+        np.float32, copy=False
+    )
+    base_rhs_dev = jnp.asarray(base_rhs, dtype=jnp.float32)
+    base_solution, base_reported_res, base_iters = pcg_solve(
+        hv,
+        base_rhs_dev,
+        M=precond,
+        tol=float(args.pcg_tol),
+        maxiter=int(args.max_pcg_iters),
+    )
+    _require_pcg_converged(
+        base_reported_res,
+        tol=float(args.pcg_tol),
+        iters=base_iters,
+        maxiter=int(args.max_pcg_iters),
+        stage="validation path base solve",
+    )
+    base_true_res = _true_pcg_relative_residual(
+        hv, base_rhs_dev, base_solution
+    )
+    if not np.isfinite(base_true_res):
+        raise RuntimeError("Validation path base solve has non-finite residual.")
+    base_solution_np = np.asarray(base_solution, dtype=np.float64)
+    Hinv_y = base_solution_np[:, 0]
+    Hinv_covar = (
+        base_solution_np[:, 1 : 1 + n_covar]
+        if n_covar > 0
+        else None
+    )
+
+    candidate_warm: dict[int, np.ndarray] = {}
+    expansion_trace: list[dict[str, object]] = []
+    accepted: dict[str, object] | None = None
+    final_lasso_path = None
+    final_path_prediction = None
+    final_metrics = None
+    final_selected_index = -1
+
+    for round_index in range(1, int(args.kkt_max_rounds) + 1):
+        train_candidate = grm_index.extract_standardized_columns(
+            candidate
+        ).astype(np.float32, copy=False)
+        candidate_rhs = jnp.asarray(train_candidate, dtype=jnp.float32)
+        candidate_x0 = None
+        if candidate_warm:
+            warm = np.zeros_like(train_candidate, dtype=np.float32)
+            hit = 0
+            for column, marker_index in enumerate(candidate.tolist()):
+                previous = candidate_warm.get(int(marker_index))
+                if previous is not None:
+                    warm[:, column] = previous
+                    hit += 1
+            if hit:
+                candidate_x0 = jnp.asarray(warm, dtype=jnp.float32)
+
+        candidate_solution, candidate_reported_res, candidate_iters = pcg_solve(
+            hv,
+            candidate_rhs,
+            M=precond,
+            tol=float(args.pcg_tol),
+            maxiter=int(args.max_pcg_iters),
+            X0=candidate_x0,
+        )
+        _require_pcg_converged(
+            candidate_reported_res,
+            tol=float(args.pcg_tol),
+            iters=candidate_iters,
+            maxiter=int(args.max_pcg_iters),
+            stage=f"validation path candidate round {round_index}",
+        )
+        candidate_true_res = _true_pcg_relative_residual(
+            hv, candidate_rhs, candidate_solution
+        )
+        if not np.isfinite(candidate_true_res):
+            raise RuntimeError(
+                "Validation path candidate solve has non-finite residual."
+            )
+        candidate_solution_np = np.asarray(
+            candidate_solution, dtype=np.float32
+        )
+        candidate_warm = {
+            int(marker_index): candidate_solution_np[:, column]
+            for column, marker_index in enumerate(candidate.tolist())
+        }
+
+        p_for_ebic = (
+            int(candidate.size)
+            if args.ebic_p_mode == "candidate"
+            else int(grm_index.m_total)
+        )
+        lasso_path = fit_weighted_lasso_with_covariates(
+            y=y,
+            covar=train_covar,
+            geno=train_candidate,
+            Hinv_y=Hinv_y,
+            Hinv_covar=Hinv_covar,
+            Hinv_geno=candidate_solution_np,
+            p_total=p_for_ebic,
+            cfg=path_cfg,
+            ridge=float(args.lasso_ridge),
+        )
+        validation_candidate = (
+            prediction_grm_index.extract_standardized_columns(candidate)
+            .astype(np.float32, copy=False)
+        )
+        path_prediction = predict_sparse_path_partitioned(
+            fitter=fitter,
+            test_fitter=prediction_fitter,
+            y_train_raw=y,
+            train_covar=train_covar,
+            test_covar=validation_covar,
+            train_candidate_geno=train_candidate,
+            test_candidate_geno=validation_candidate,
+            beta_cov_path_raw=lasso_path["beta_cov_path"],
+            beta_candidate_path_raw=lasso_path["beta_snp_path"],
+            theta_standardized=theta,
+            phenotype_scale=float(phenotype_scale),
+            pcg_tol=float(args.pcg_tol),
+            max_pcg_iters=int(args.max_pcg_iters),
+        )
+        metrics = evaluate_prediction_path(
+            path_prediction.phenotype_prediction_raw,
+            validation_outcome,
+        )
+        selected_index = select_validation_path_index(
+            lasso_path["path"], metrics
+        )
+        selected_row = lasso_path["path"][selected_index]
+        selected_beta = np.asarray(
+            lasso_path["beta_snp_path"][selected_index],
+            dtype=np.float64,
+        )
+        if not (
+            bool(selected_row.get("converged", False))
+            and bool(selected_row.get("kkt_passed", False))
+        ):
+            raise RuntimeError(
+                "Validation-selected path point failed candidate KKT "
+                "convergence."
+            )
+
+        selected_dual = jnp.asarray(
+            path_prediction.dual_raw_objective_scale[:, selected_index],
+            dtype=jnp.float32,
+        )
+        score_signed = np.asarray(
+            grm_index.xtv_all(selected_dual, normalize=False),
+            dtype=np.float64,
+        )
+        partitioned = _partitioned_lasso_kkt_from_scores(
+            score=score_signed,
+            candidate=candidate,
+            beta_candidate=selected_beta,
+            lam=float(selected_row["lam"]),
+            abs_tol=float(args.kkt_tol),
+            rel_tol=float(args.kkt_rel_tol),
+        )
+        violators = np.asarray(
+            partitioned["outside_violators"], dtype=np.int64
+        )
+        n_add = min(int(args.kkt_add_topk), int(violators.size))
+        added = np.empty((0,), dtype=np.int64)
+        if n_add:
+            added = violators[
+                np.argsort(np.abs(score_signed[violators]))[-n_add:]
+            ]
+            added = np.sort(added.astype(np.int64, copy=False))
+        selected_metric = metrics[selected_index]
+        round_record = {
+            "round": int(round_index),
+            "candidate_size": int(candidate.size),
+            "selected_path_index": int(selected_index),
+            "selected_lam": float(selected_row["lam"]),
+            "selected_lam_ratio": float(selected_row["lam_ratio"]),
+            "selected_support_size": int(np.count_nonzero(selected_beta)),
+            "validation_correlation_squared": float(
+                selected_metric["correlation_squared"]
+            ),
+            "max_outside_score": float(partitioned["max_outside_score"]),
+            "kkt_threshold": float(partitioned["threshold"]),
+            "n_outside_violators": int(violators.size),
+            "added_indices": added.tolist(),
+            "added_source_indices": (
+                grm_index.source_variant_indices(added).tolist()
+                if added.size
+                else []
+            ),
+            "candidate_pcg_reported_res": float(
+                np.asarray(candidate_reported_res)
+            ),
+            "candidate_pcg_true_res": float(candidate_true_res),
+            "candidate_pcg_iters": int(candidate_iters),
+            "path_prediction_pcg_reported_res": float(
+                path_prediction.pcg_rel_res
+            ),
+            "path_prediction_pcg_iters": int(path_prediction.pcg_iters),
+            "decision": "accept" if not violators.size else "expand_candidate",
+        }
+        expansion_trace.append(round_record)
+        logger.info(
+            "[validation sparsity %s] cand=%s selected_ratio=%.6g "
+            "active=%s val_r2=%.6g violators=%s decision=%s",
+            round_index,
+            candidate.size,
+            float(selected_row["lam_ratio"]),
+            int(np.count_nonzero(selected_beta)),
+            float(selected_metric["correlation_squared"]),
+            violators.size,
+            round_record["decision"],
+        )
+
+        final_lasso_path = lasso_path
+        final_path_prediction = path_prediction
+        final_metrics = metrics
+        final_selected_index = int(selected_index)
+        if not violators.size:
+            accepted = dict(partitioned)
+            break
+
+        candidate = np.unique(np.concatenate([candidate, added])).astype(
+            np.int64
+        )
+        candidate.sort()
+        max_candidate = int(args.kkt_max_candidate)
+        if max_candidate > 0 and candidate.size > max_candidate:
+            raise RuntimeError(
+                "Validation KKT expansion exceeded --kkt-max-candidate "
+                f"({candidate.size} > {max_candidate})."
+            )
+
+    if (
+        accepted is None
+        or final_lasso_path is None
+        or final_path_prediction is None
+        or final_metrics is None
+        or final_selected_index < 0
+    ):
+        raise RuntimeError(
+            "Validation-selected Lasso point was not globally KKT certified "
+            f"within {int(args.kkt_max_rounds)} rounds."
+        )
+
+    selected_row = final_lasso_path["path"][final_selected_index]
+    selected_beta = np.asarray(
+        final_lasso_path["beta_snp_path"][final_selected_index],
+        dtype=np.float64,
+    )
+    support_local = np.flatnonzero(selected_beta != 0.0).astype(np.int64)
+    selected_support = candidate[support_local]
+    merged_path = merge_path_diagnostics(
+        final_lasso_path["path"], final_metrics
+    )
+    selected_metric = final_metrics[final_selected_index]
+    payload = {
+        "schema_version": 1,
+        "selection_role": "validation_only",
+        "selection_metric": "squared_pearson_correlation_total_phenotype_prediction",
+        "test_phenotype_used": False,
+        "validation_phenotype_path": os.path.abspath(
+            args.sparsity_validation_pheno_txt
+        ),
+        "n_validation_samples": int(validation_outcome.size),
+        "theta_standardized_fixed": theta.tolist(),
+        "phenotype_scale": float(phenotype_scale),
+        "path_config": {
+            "lam_min_ratio": float(path_cfg.lam_min_ratio),
+            "n_lambda_requested": int(path_cfg.n_lambda),
+            "n_lambda_evaluated": int(len(merged_path)),
+            "ebic_gamma": float(path_cfg.ebic_gamma),
+            "ebic_early_stop": bool(path_cfg.ebic_early_stop),
+        },
+        "base_pcg": {
+            "reported_relative_residual": float(
+                np.asarray(base_reported_res)
+            ),
+            "true_relative_residual": float(base_true_res),
+            "iterations": int(base_iters),
+        },
+        "candidate_expansion": expansion_trace,
+        "final_candidate_size": int(candidate.size),
+        "final_candidate_indices": candidate.tolist(),
+        "final_candidate_source_indices": (
+            grm_index.source_variant_indices(candidate).tolist()
+        ),
+        "selected": {
+            "path_index": int(final_selected_index),
+            "lam": float(selected_row["lam"]),
+            "lam_max": float(final_lasso_path["lam_max"]),
+            "lam_ratio": float(selected_row["lam_ratio"]),
+            "support_size": int(selected_support.size),
+            "support_indices": selected_support.tolist(),
+            "support_source_indices": (
+                grm_index.source_variant_indices(selected_support).tolist()
+            ),
+            **dict(selected_metric),
+        },
+        "global_kkt": {
+            "passed": True,
+            "candidate_certificate": accepted["candidate_certificate"],
+            "full_certificate": accepted["full_certificate"],
+            "max_outside_score": accepted["max_outside_score"],
+            "threshold": accepted["threshold"],
+        },
+        "path": merged_path,
+    }
+    safe_payload = _json_safe_value(payload)
+    output_paths = write_selection_outputs(
+        args.sparsity_validation_out, safe_payload
+    )
+    return {
+        "requested": True,
+        "status": "emitted",
+        "selection_metric": payload["selection_metric"],
+        "selected_lam_ratio": float(selected_row["lam_ratio"]),
+        "selected_support_size": int(selected_support.size),
+        "validation_correlation_squared": float(
+            selected_metric["correlation_squared"]
+        ),
+        "final_candidate_size": int(candidate.size),
+        "kkt_rounds": int(len(expansion_trace)),
+        "outputs": output_paths,
+    }
+
+
 def main() -> None:
     args = parse_args()
     if int(args.screen_topk) < int(args.candidate_k):
@@ -1767,6 +2196,60 @@ def main() -> None:
         raise SystemExit("pcg-tol must be finite and > 0.")
     if args.marker_score_out and int(args.marker_score_probes) < 1:
         raise SystemExit("marker-score-probes must be >= 1.")
+    if (
+        not np.isfinite(float(args.lasso_lam_min_ratio))
+        or not 0.0 < float(args.lasso_lam_min_ratio) <= 1.0
+    ):
+        raise SystemExit("lasso-lam-min-ratio must lie in (0, 1].")
+    if int(args.lasso_n_lambda) < 1:
+        raise SystemExit("lasso-n-lambda must be >= 1.")
+    if args.lasso_selection_mode == "fixed_ratio":
+        if (
+            args.lasso_fixed_lam_ratio is None
+            or not np.isfinite(float(args.lasso_fixed_lam_ratio))
+            or not 0.0 < float(args.lasso_fixed_lam_ratio) <= 1.0
+        ):
+            raise SystemExit(
+                "fixed_ratio selection requires --lasso-fixed-lam-ratio "
+                "in (0, 1]."
+            )
+        if float(args.lasso_fixed_lam_ratio) < float(
+            args.lasso_lam_min_ratio
+        ):
+            raise SystemExit(
+                "lasso-fixed-lam-ratio must be at least "
+                "--lasso-lam-min-ratio so it lies on the fitted path."
+            )
+    elif args.lasso_fixed_lam_ratio is not None:
+        raise SystemExit(
+            "--lasso-fixed-lam-ratio is only valid with "
+            "--lasso-selection-mode fixed_ratio."
+        )
+
+    sparsity_validation_requested = bool(
+        args.sparsity_validation_pheno_txt
+        or args.sparsity_validation_out
+    )
+    if bool(args.sparsity_validation_pheno_txt) != bool(
+        args.sparsity_validation_out
+    ):
+        raise SystemExit(
+            "--sparsity-validation-pheno-txt and "
+            "--sparsity-validation-out must be supplied together."
+        )
+    if sparsity_validation_requested:
+        if args.lasso_selection_mode != "ebic":
+            raise SystemExit(
+                "Validation path scanning must use --lasso-selection-mode "
+                "ebic; use fixed_ratio only for the final refit."
+            )
+        if not os.path.exists(args.sparsity_validation_pheno_txt):
+            raise SystemExit(
+                "--sparsity-validation-pheno-txt does not exist: "
+                f"{args.sparsity_validation_pheno_txt}"
+            )
+        if not args.sparsity_validation_out.lower().endswith(".json"):
+            raise SystemExit("--sparsity-validation-out must end in .json.")
 
     logger.info("[INFO] sparse pipeline start @ %s", datetime.now().isoformat(timespec='seconds'))
     t0 = time.time()
@@ -1814,6 +2297,15 @@ def main() -> None:
         raise SystemExit(
             "Prediction covariate/keep inputs require a prediction BED or "
             "PGEN prefix."
+        )
+    if sparsity_validation_requested and not prediction_active:
+        raise SystemExit(
+            "Sparsity validation requires a prediction BED or PGEN prefix."
+        )
+    if sparsity_validation_requested and not component_variant_indices:
+        raise SystemExit(
+            "Sparsity validation requires --component-spec, including for "
+            "a single K=1 component."
         )
     if component_variant_indices:
         if len(bed_list) > 1:
@@ -2093,6 +2585,8 @@ def main() -> None:
         ebic_early_stop_min_delta=args.lasso_ebic_es_min_delta,
         cd_tol=args.lasso_cd_tol, active_set_period=args.lasso_active_set_period,
         kkt_abs_tol=args.kkt_tol, kkt_rel_tol=args.kkt_rel_tol,
+        selection_mode=args.lasso_selection_mode,
+        fixed_lam_ratio=args.lasso_fixed_lam_ratio,
         verbose=args.verbose,
     )
 
@@ -3365,6 +3859,12 @@ def main() -> None:
         "requested": bool(prediction_active),
         "status": "not_requested",
     }
+    sparsity_validation_summary = {
+        "requested": bool(sparsity_validation_requested),
+        "status": (
+            "pending" if sparsity_validation_requested else "not_requested"
+        ),
+    }
     if not prediction_active:
         # A reused output prefix must not retain a prediction table from an
         # earlier comparison run when the current run did not request one.
@@ -3470,6 +3970,11 @@ def main() -> None:
                 "emitted_branches": [],
                 "metadata_path": metadata_path,
             }
+            if sparsity_validation_requested:
+                raise RuntimeError(
+                    "Sparsity validation cannot proceed because the final "
+                    "Lasso branch is invalid."
+                )
         else:
             write_sparse_prediction_status(
                 out_prefix=out_prefix,
@@ -3598,6 +4103,25 @@ def main() -> None:
                         component_variant_indices or None
                     ),
                 )
+                if sparsity_validation_requested:
+                    sparsity_validation_summary = (
+                        _run_sparsity_validation_selection(
+                            args=args,
+                            fitter=fitter,
+                            prediction_fitter=prediction_fitter,
+                            ops=ops,
+                            grm_index=grm_index,
+                            prediction_grm_index=prediction_grm_index,
+                            y_train=y_np,
+                            train_covar=covar_np,
+                            validation_covar=prediction_covar,
+                            validation_ids=prediction_ids,
+                            theta_standardized=theta_lasso_ml,
+                            phenotype_scale=phenotype_scale,
+                            initial_candidate=final_candidate,
+                            path_cfg=path_cfg,
+                        )
+                    )
                 prediction_support = (
                     prediction_grm_index.extract_standardized_columns(
                         support
@@ -3729,6 +4253,13 @@ def main() -> None:
         "m_per_grm": grm_index.m_per_grm.tolist(),
         "genetic_trace_atoms": genetic_trace_atoms.tolist(),
         "ebic_p_mode": args.ebic_p_mode,
+        "lasso_selection_mode": args.lasso_selection_mode,
+        "lasso_fixed_lam_ratio_requested": args.lasso_fixed_lam_ratio,
+        "lasso_selected_lam_ratio": (
+            float(final_lasso["selected_lam_ratio"])
+            if final_lasso is not None
+            else None
+        ),
         "ebic_model_space_size": (
             grm_index.m_total
             if args.ebic_p_mode == "full"
@@ -3826,6 +4357,7 @@ def main() -> None:
         ),
         "outer_history": history,
         "sparse_prediction": prediction_summary,
+        "sparsity_validation": sparsity_validation_summary,
     }
 
     if supplied_theta_init:

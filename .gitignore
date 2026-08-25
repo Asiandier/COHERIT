@@ -27,6 +27,9 @@ tests/*
 !tests/test_multi_slq_score_consistency.py
 !tests/test_adaptive_partition.py
 !tests/test_adaptive_driver.py
+!tests/test_lasso_cd.py
+!tests/test_sparsity_selection.py
+!tests/test_validation_sparsity_driver.py
 
 # Local backup snapshot
 bolt_jax_副本 22-47-38-277/

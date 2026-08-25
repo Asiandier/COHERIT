@@ -27,6 +27,9 @@ FitConfig = REML_MODEL.FitConfig
 InfinitesimalREMLFitter = REML_MODEL.InfinitesimalREMLFitter
 SparseBranchPrediction = SPARSE_PRED.SparseBranchPrediction
 predict_sparse_branch = SPARSE_PRED.predict_sparse_branch
+predict_sparse_path_partitioned = (
+    SPARSE_PRED.predict_sparse_path_partitioned
+)
 write_sparse_prediction_outputs = SPARSE_PRED.write_sparse_prediction_outputs
 write_sparse_prediction_status = SPARSE_PRED.write_sparse_prediction_status
 load_pheno_covar_aligned_with_transform = (
@@ -508,6 +511,67 @@ def test_partitioned_sparse_prediction_uses_matching_source_coordinates():
             np.testing.assert_allclose(
                 observed,
                 expected,
+                rtol=5e-4,
+                atol=5e-4,
+            )
+
+        beta_cov_path = np.stack([beta_cov, beta_cov + 0.1], axis=0)
+        beta_active_path = np.stack(
+            [beta_active, 0.5 * beta_active], axis=0
+        )
+        path_prediction = predict_sparse_path_partitioned(
+            fitter=train,
+            test_fitter=test,
+            y_train_raw=y,
+            train_covar=c_train,
+            test_covar=c_test,
+            train_candidate_geno=z_active_train,
+            test_candidate_geno=z_active_test,
+            beta_cov_path_raw=beta_cov_path,
+            beta_candidate_path_raw=beta_active_path,
+            theta_standardized=theta,
+            phenotype_scale=phenotype_scale,
+            pcg_tol=1e-7,
+            max_pcg_iters=1000,
+        )
+        for path_index in range(beta_active_path.shape[0]):
+            branch = predict_sparse_branch(
+                name=f"path_{path_index}",
+                fitter=train,
+                test_fitter=test,
+                y_train_raw=y,
+                train_covar=c_train,
+                test_covar=c_test,
+                train_active_geno=z_active_train,
+                test_active_geno=z_active_test,
+                beta_cov_raw=beta_cov_path[path_index],
+                beta_active_raw=beta_active_path[path_index],
+                theta_standardized=theta,
+                phenotype_scale=phenotype_scale,
+                pcg_tol=1e-7,
+                max_pcg_iters=1000,
+            )
+            np.testing.assert_allclose(
+                path_prediction.residual_standardized[:, path_index],
+                branch.residual_standardized,
+                rtol=5e-5,
+                atol=5e-5,
+            )
+            np.testing.assert_allclose(
+                path_prediction.fixed_snp_score_raw[:, path_index],
+                branch.fixed_snp_score_raw,
+                rtol=5e-5,
+                atol=5e-5,
+            )
+            np.testing.assert_allclose(
+                path_prediction.background_blup_raw[:, path_index],
+                branch.background_blup_raw,
+                rtol=5e-4,
+                atol=5e-4,
+            )
+            np.testing.assert_allclose(
+                path_prediction.phenotype_prediction_raw[:, path_index],
+                branch.phenotype_prediction_raw,
                 rtol=5e-4,
                 atol=5e-4,
             )

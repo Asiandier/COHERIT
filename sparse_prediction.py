@@ -12,7 +12,11 @@ import jax.numpy as jnp
 import numpy as np
 
 from .pcg import pcg_solve
-from .reml_model import EffectEstimates
+from .reml_model import (
+    EffectEstimates,
+    _copy_training_standardization_to_test_streamer,
+    _validate_dense_prediction_streamers,
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -26,6 +30,21 @@ class SparseBranchPrediction:
     fixed_snp_score_raw: np.ndarray
     background_blup_raw: np.ndarray
     background_components_raw: tuple[np.ndarray, ...]
+    genetic_score_raw: np.ndarray
+    phenotype_prediction_raw: np.ndarray
+    pcg_rel_res: float
+    pcg_iters: int
+
+
+@dataclasses.dataclass(frozen=True)
+class SparsePathPrediction:
+    """Vectorized predictions for a coefficient path at one fixed covariance."""
+
+    residual_standardized: np.ndarray
+    dual_raw_objective_scale: np.ndarray
+    nuisance_fixed_score_raw: np.ndarray
+    fixed_snp_score_raw: np.ndarray
+    background_blup_raw: np.ndarray
     genetic_score_raw: np.ndarray
     phenotype_prediction_raw: np.ndarray
     pcg_rel_res: float
@@ -181,6 +200,242 @@ def predict_sparse_branch(
         fixed_snp_score_raw=fixed_snp_raw,
         background_blup_raw=background_raw,
         background_components_raw=component_raw,
+        genetic_score_raw=genetic_raw,
+        phenotype_prediction_raw=phenotype_raw,
+        pcg_rel_res=rel,
+        pcg_iters=int(iters),
+    )
+
+
+def _as_coefficient_path(
+    value,
+    *,
+    n_columns: int,
+    name: str,
+) -> np.ndarray:
+    arr = np.asarray(value, dtype=np.float64)
+    if arr.ndim != 2 or int(arr.shape[1]) != int(n_columns):
+        raise ValueError(
+            f"{name} must have shape (path_length, {int(n_columns)})."
+        )
+    if int(arr.shape[0]) < 1 or not np.all(np.isfinite(arr)):
+        raise ValueError(f"{name} must contain a finite, non-empty path.")
+    return arr
+
+
+def _pack_effect_path_by_call(streamer, effect_path: np.ndarray) -> jnp.ndarray:
+    effects = np.asarray(effect_path, dtype=np.float32)
+    if effects.ndim != 2 or int(effects.shape[0]) != int(streamer.m):
+        raise ValueError(
+            "effect_path must contain one row per partitioned-stream marker."
+        )
+    n_path = int(effects.shape[1])
+    packed = np.zeros(
+        (
+            n_path,
+            int(streamer._n_calls),
+            int(streamer._max_unpack_width),
+        ),
+        dtype=np.float32,
+    )
+    for call_index in range(int(streamer._n_calls)):
+        start = int(streamer._call_snp_starts[call_index])
+        width = int(streamer._call_true_widths[call_index])
+        packed[:, call_index, :width] = effects[
+            start : start + width, :
+        ].T
+    return jax.device_put(jnp.asarray(packed), streamer.dev)
+
+
+def predict_sparse_path_partitioned(
+    *,
+    fitter,
+    test_fitter,
+    y_train_raw: np.ndarray,
+    train_covar: np.ndarray | None,
+    test_covar: np.ndarray | None,
+    train_candidate_geno: np.ndarray,
+    test_candidate_geno: np.ndarray,
+    beta_cov_path_raw: np.ndarray,
+    beta_candidate_path_raw: np.ndarray,
+    theta_standardized: np.ndarray,
+    phenotype_scale: float,
+    pcg_tol: float,
+    max_pcg_iters: int,
+) -> SparsePathPrediction:
+    """Predict an entire Lasso path in one PCG and one genotype pass.
+
+    Path points share a fixed covariance estimate.  This is the inexpensive
+    validation scan used to select ``lambda / lambda_max`` before a full refit.
+    """
+    train_streamer = getattr(fitter, "_partitioned_streamer", None)
+    test_streamer = getattr(test_fitter, "_partitioned_streamer", None)
+    if train_streamer is None or test_streamer is None:
+        raise ValueError(
+            "Sparse path prediction requires a single-source component partition."
+        )
+    _validate_dense_prediction_streamers(
+        fitter.streamers, test_fitter.streamers
+    )
+    _copy_training_standardization_to_test_streamer(
+        train_streamer, test_streamer
+    )
+
+    y = np.asarray(y_train_raw, dtype=np.float64).reshape(-1)
+    n_train = int(y.size)
+    n_test = int(test_streamer.n)
+    c_train = _as_design(train_covar, n_rows=n_train, name="train_covar")
+    c_test = _as_design(test_covar, n_rows=n_test, name="test_covar")
+    z_train = _as_design(
+        train_candidate_geno,
+        n_rows=n_train,
+        name="train_candidate_geno",
+    )
+    z_test = _as_design(
+        test_candidate_geno,
+        n_rows=n_test,
+        name="test_candidate_geno",
+    )
+    if c_train.shape[1] != c_test.shape[1]:
+        raise ValueError("Training and validation covariate widths do not match.")
+    if z_train.shape[1] != z_test.shape[1]:
+        raise ValueError("Training and validation candidate widths do not match.")
+
+    beta_cov_path = _as_coefficient_path(
+        beta_cov_path_raw,
+        n_columns=c_train.shape[1],
+        name="beta_cov_path_raw",
+    )
+    beta_candidate_path = _as_coefficient_path(
+        beta_candidate_path_raw,
+        n_columns=z_train.shape[1],
+        name="beta_candidate_path_raw",
+    )
+    if beta_cov_path.shape[0] != beta_candidate_path.shape[0]:
+        raise ValueError("Covariate and candidate coefficient paths differ in length.")
+    n_path = int(beta_candidate_path.shape[0])
+
+    theta = np.asarray(theta_standardized, dtype=np.float64).reshape(-1)
+    scale = float(phenotype_scale)
+    if not np.isfinite(scale) or scale <= 0.0:
+        raise ValueError("phenotype_scale must be positive and finite.")
+    if (
+        theta.shape != (int(train_streamer.n_components) + 1,)
+        or not np.all(np.isfinite(theta))
+        or np.any(theta[:-1] < 0.0)
+        or theta[-1] <= 0.0
+    ):
+        raise ValueError("theta_standardized is incompatible with the partition.")
+
+    nuisance_train = c_train @ beta_cov_path.T
+    fixed_train = z_train @ beta_candidate_path.T
+    residual_raw = y[:, None] - nuisance_train - fixed_train
+    residual_standardized = residual_raw / scale
+
+    ops = fitter._assemble_reml_operators()
+    theta_dev = jnp.asarray(theta, dtype=jnp.float32)
+    fitter._ensure_projected_core_precond_ready(
+        ops, var_components_init=theta_dev
+    )
+    hv = fitter._make_hv(ops, theta_dev[:-1], theta_dev[-1])
+    precond = fitter._make_effect_precond(
+        ops, theta_dev[:-1], theta_dev[-1]
+    )
+    rhs = jnp.asarray(residual_standardized, dtype=jnp.float32)
+    x0 = precond(rhs) if precond is not None else jnp.zeros_like(rhs)
+    dual_standardized, rel_res, iters = pcg_solve(
+        hv,
+        rhs,
+        M=precond,
+        tol=float(pcg_tol),
+        maxiter=int(max_pcg_iters),
+        X0=x0,
+    )
+    rel = float(np.asarray(jax.device_get(rel_res)))
+    if not np.isfinite(rel) or rel > float(pcg_tol) * 1.05:
+        raise RuntimeError(
+            "Sparse path background-BLUP PCG did not converge: "
+            f"relative residual={rel:.3e}."
+        )
+
+    xt_dual = np.asarray(
+        jax.device_get(
+            train_streamer.xtv(dual_standardized, normalize=False)
+        ),
+        dtype=np.float32,
+    )
+    expected_xt_shape = (int(train_streamer.m), n_path)
+    if xt_dual.shape != expected_xt_shape:
+        raise RuntimeError(
+            "Partitioned X'V^-1 residual path has the wrong shape: "
+            f"{xt_dual.shape} != {expected_xt_shape}."
+        )
+    random_effect_path = np.zeros_like(xt_dual, dtype=np.float32)
+    for component_index in range(int(train_streamer.n_components)):
+        start = int(train_streamer._component_snp_offsets[component_index])
+        stop = int(train_streamer._component_snp_offsets[component_index + 1])
+        effective_m = float(
+            train_streamer._component_eff_m_host[component_index]
+        )
+        if effective_m > 0.0:
+            random_effect_path[start:stop, :] = (
+                float(theta[component_index])
+                / effective_m
+                * xt_dual[start:stop, :]
+            )
+
+    from .kv_impl import zxb_impl_same_stream_multi
+
+    test_streamer._prepare_kv_pass()
+    packed = _pack_effect_path_by_call(
+        train_streamer, random_effect_path
+    )
+    _summed_paths, path_predictions = zxb_impl_same_stream_multi(
+        packed,
+        test_streamer._true_widths_dev,
+        test_streamer._means_by_call,
+        test_streamer._inv_by_call,
+        n=n_test,
+        n_calls=int(test_streamer._n_calls),
+        pop_block=test_streamer._pop_cached,
+        missing_val=int(test_streamer._missing_val),
+    )
+    background_raw = scale * np.column_stack(
+        [
+            np.asarray(jax.device_get(values), dtype=np.float64)
+            for values in path_predictions
+        ]
+    )
+    if background_raw.shape != (n_test, n_path):
+        raise RuntimeError("Sparse path background prediction shape mismatch.")
+
+    nuisance_raw = c_test @ beta_cov_path.T
+    fixed_raw = z_test @ beta_candidate_path.T
+    genetic_raw = fixed_raw + background_raw
+    phenotype_raw = nuisance_raw + genetic_raw
+    arrays = (
+        residual_standardized,
+        nuisance_raw,
+        fixed_raw,
+        background_raw,
+        genetic_raw,
+        phenotype_raw,
+    )
+    if any(not np.all(np.isfinite(values)) for values in arrays):
+        raise RuntimeError("Sparse path prediction contains non-finite values.")
+
+    return SparsePathPrediction(
+        residual_standardized=residual_standardized,
+        # The Lasso objective uses H_std^-1 applied to the raw-scale residual.
+        dual_raw_objective_scale=(
+            scale
+            * np.asarray(
+                jax.device_get(dual_standardized), dtype=np.float64
+            )
+        ),
+        nuisance_fixed_score_raw=nuisance_raw,
+        fixed_snp_score_raw=fixed_raw,
+        background_blup_raw=background_raw,
         genetic_score_raw=genetic_raw,
         phenotype_prediction_raw=phenotype_raw,
         pcg_rel_res=rel,
