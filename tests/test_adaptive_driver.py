@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import sys
 
@@ -107,10 +108,150 @@ def test_sparse_parser_accepts_adaptive_score_and_warm_start_args(monkeypatch):
 def test_adaptive_driver_defaults_to_k1024_and_rejects_deeper_search(tmp_path):
     required = _required_driver_args(tmp_path)
 
-    assert DRIVER.parse_args(required).max_depth == 5
+    defaults = DRIVER.parse_args(required)
+    assert defaults.max_depth == 5
+    assert defaults.lam_min_ratio == pytest.approx(1e-3)
+    assert defaults.n_lambda == 80
+    assert defaults.lasso_cd_max_iter == 10000
     assert DRIVER.parse_args([*required, "--max-depth", "5"]).max_depth == 5
     with pytest.raises(SystemExit):
         DRIVER.parse_args([*required, "--max-depth", "6"])
+
+
+def test_adaptive_driver_contract_uses_two_means_without_signal_fraction(tmp_path):
+    args = DRIVER.parse_args(_required_driver_args(tmp_path))
+
+    algorithm = DRIVER._algorithm_config(args)
+
+    assert algorithm["sparse_path_mode"] == "adaptive_k_validation_lambda"
+    assert algorithm["lambda_selection"] == (
+        "validation_r2_inside_every_alpha_theta_outer_iteration"
+    )
+    assert algorithm["lambda_path"] == {
+        "lam_min_ratio": 1e-3,
+        "n_lambda": 80,
+        "lasso_cd_max_iter": 10000,
+        "complete_path": True,
+        "early_stopping": False,
+    }
+    assert algorithm["signal_split"] == "exact_1d_two_means"
+    assert "signal_high_fraction" not in algorithm
+    assert algorithm["k_path"] == [1, 4, 16, 64, 256, 1024]
+
+
+def test_adaptive_sparse_commands_isolate_validation_and_final_test_stages(tmp_path):
+    args = DRIVER.parse_args(_required_driver_args(tmp_path))
+    args.python_bin = tmp_path / "python"
+    args.sparse_pipeline = tmp_path / "pipeline.py"
+    args.bed_prefix = tmp_path / "geno"
+    args.covar_txt = tmp_path / "covar"
+    component = tmp_path / "component.npz"
+
+    selection = DRIVER._sparse_command(
+        args=args,
+        component_spec=component,
+        phenotype=tmp_path / "train.pheno",
+        keep=tmp_path / "train.keep",
+        prediction_keep=tmp_path / "validation.keep",
+        prefix=tmp_path / "selection",
+        selection_pheno=tmp_path / "validation.pheno",
+        selection_output=tmp_path / "validation_path.json",
+        fixed_lam_ratio=None,
+        marker_score_path=tmp_path / "marker_score.npz",
+        marker_score_seed=17,
+        marker_score_min_validation_r2=0.2,
+        theta_init=None,
+    )
+    final = DRIVER._sparse_command(
+        args=args,
+        component_spec=component,
+        phenotype=tmp_path / "fit.pheno",
+        keep=tmp_path / "fit.keep",
+        prediction_keep=tmp_path / "test.keep",
+        prefix=tmp_path / "final",
+        selection_pheno=None,
+        selection_output=None,
+        fixed_lam_ratio=0.125,
+        marker_score_path=None,
+        marker_score_seed=17,
+        marker_score_min_validation_r2=None,
+        theta_init=np.asarray([0.2, 0.8]),
+    )
+
+    assert "--sparsity-validation-pheno-txt" in selection
+    assert "--lasso-fixed-lam-ratio" not in selection
+    assert str(tmp_path / "validation.pheno") in selection
+    assert str(tmp_path / "test.keep") not in selection
+    assert selection[selection.index("--lasso-n-lambda") + 1] == "80"
+    assert selection[selection.index("--lasso-lam-min-ratio") + 1] == "0.001"
+    assert "--marker-score-out" in selection
+    assert float(
+        selection[
+            selection.index("--marker-score-min-validation-r2") + 1
+        ]
+    ) == pytest.approx(0.2)
+
+    assert "--sparsity-validation-pheno-txt" not in final
+    assert float(final[final.index("--lasso-fixed-lam-ratio") + 1]) == pytest.approx(
+        0.125
+    )
+    assert str(tmp_path / "validation.pheno") not in final
+    assert "--marker-score-out" not in final
+
+
+def test_adaptive_layer_requires_iterative_validation_contract(tmp_path):
+    prefix = tmp_path / "coherit"
+    summary = {
+        "n_grms": 1,
+        "lasso_branch_valid": True,
+        "sparse_prediction": {"status": "emitted"},
+        "lambda_selection_method": "validation_r2",
+        "lasso_path_role": "complete_validation_grid",
+        "validation_selection_inside_outer_loop": True,
+        "lasso_selected_lam_ratio": 0.25,
+        "var_components_lasso_ml": [0.2, 0.8],
+    }
+    (tmp_path / "coherit.summary.json").write_text(
+        json.dumps(summary), encoding="utf-8"
+    )
+    (tmp_path / "coherit.sparse_prediction.tsv").write_text(
+        "sample_index\tiid\tlasso_phenotype_prediction_raw\n"
+        "0\ti1\t1\n1\ti2\t2\n2\ti3\t3\n",
+        encoding="utf-8",
+    )
+    phenotype = tmp_path / "validation.pheno"
+    phenotype.write_text("f1 i1 1\nf2 i2 2\nf3 i3 3\n", encoding="utf-8")
+    selection_output = tmp_path / "validation_path.json"
+    selection_output.write_text(
+        json.dumps(
+            {
+                "selection_role": "inside_every_alpha_theta_outer_iteration",
+                "test_phenotype_used": False,
+                "n_path_selections": 3,
+                "final_selected": {
+                    "lam": 2.0,
+                    "lam_ratio": 0.25,
+                    "correlation_squared": 1.0,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded, metrics, score, audit = DRIVER._validate_sparse_layer(
+        prefix=prefix,
+        expected_k=1,
+        prediction_phenotype=phenotype,
+        marker_score_path=None,
+        n_variants=4,
+        expected_selection_method="validation_r2",
+        selection_output=selection_output,
+    )
+
+    assert loaded["lambda_selection_method"] == "validation_r2"
+    assert metrics["correlation_squared"] == pytest.approx(1.0)
+    assert score is None
+    assert audit["final_selected"]["lam_ratio"] == pytest.approx(0.25)
 
 
 def test_validation_decline_is_strict_with_numerical_tolerance():

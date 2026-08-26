@@ -172,7 +172,6 @@ def write_selection_outputs(path: str, payload: Mapping[str, object]) -> dict[st
         "mse",
         "calibration_slope",
         "predictive_r2",
-        "ebic",
         "rss",
         "cd_iter",
         "converged",

@@ -70,7 +70,6 @@ def test_write_selection_outputs_emits_json_and_tsv(tmp_path):
                 "mse": 1.0,
                 "calibration_slope": 0.3,
                 "predictive_r2": -0.1,
-                "ebic": 5.0,
                 "rss": 2.0,
                 "cd_iter": 1,
                 "converged": True,

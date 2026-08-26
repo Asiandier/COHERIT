@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prediction-first Adaptive COHERIT with iterative four-way GRM splits."""
+"""Adaptive-K COHERIT with validation-selected sparsity at every K."""
 from __future__ import annotations
 
 import argparse
@@ -24,6 +24,8 @@ if str(PARENT) not in sys.path:
     sys.path.insert(0, str(PARENT))
 PKG_NAME = REPO_ROOT.name
 _partition_mod = importlib.import_module(f"{PKG_NAME}.adaptive_partition")
+_lasso_mod = importlib.import_module(f"{PKG_NAME}.lasso_cd")
+_selection_mod = importlib.import_module(f"{PKG_NAME}.sparsity_selection")
 
 AdaptiveComponent = _partition_mod.AdaptiveComponent
 covariance_preserving_warm_start = (
@@ -35,7 +37,12 @@ validate_partition = _partition_mod.validate_partition
 write_component_spec = _partition_mod.write_component_spec
 
 
-SIGNAL_HIGH_FRACTION = 0.15
+ADAPTIVE_ALGORITHM_NAME = (
+    "adaptive_k_validation_lambda_exact_two_means_four_split"
+)
+SPARSE_PATH_MODE = "adaptive_k_validation_lambda"
+SIGNAL_SPLIT_METHOD = "exact_1d_two_means"
+LD_SPLIT_METHOD = "within_signal_bin_median_stable_rank"
 MAX_ADAPTIVE_DEPTH = 5
 VALIDATION_DECLINE_TOLERANCE = 1e-12
 INPUT_PATH_NAMES = (
@@ -55,6 +62,54 @@ INPUT_PATH_NAMES = (
 
 def _now() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _algorithm_identity(args: argparse.Namespace) -> dict[str, Any]:
+    """Fields that must match when reusing layers from another search."""
+    return {
+        "name": ADAPTIVE_ALGORITHM_NAME,
+        "sparse_path_mode": SPARSE_PATH_MODE,
+        "signal_split": SIGNAL_SPLIT_METHOD,
+        "ld_split": LD_SPLIT_METHOD,
+        "lambda_selection": (
+            "validation_r2_inside_every_alpha_theta_outer_iteration"
+        ),
+        "validation_metric": (
+            "squared_pearson_correlation_total_phenotype_prediction"
+        ),
+        "lambda_path": {
+            "lam_min_ratio": float(args.lam_min_ratio),
+            "n_lambda": int(args.n_lambda),
+            "lasso_cd_max_iter": int(args.lasso_cd_max_iter),
+            "complete_path": True,
+            "early_stopping": False,
+        },
+        "candidate_refinement": {
+            "screen_topk": int(args.screen_topk),
+            "candidate_k": int(args.candidate_k),
+            "kkt_add_topk": int(args.kkt_add_topk),
+            "kkt_max_rounds": int(args.kkt_max_rounds),
+        },
+        "marker_information_estimator": "sample_space_rademacher_hutchinson",
+        "marker_score_probes": int(args.marker_score_probes),
+        "marker_score_seed": int(args.marker_score_seed),
+        "marker_score_policy": (
+            "emit_only_if_layer_is_eligible_for_next_split"
+        ),
+    }
+
+
+def _algorithm_config(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        **_algorithm_identity(args),
+        "max_depth": int(args.max_depth),
+        "k_path": [4**depth for depth in range(int(args.max_depth) + 1)],
+        "early_stop_rule": "first_strict_validation_r2_decrease",
+        "validation_decline_tolerance": VALIDATION_DECLINE_TOLERANCE,
+        "final_refit": (
+            "freeze_selected_k_and_lambda_ratio_then_refit_train_plus_validation"
+        ),
+    }
 
 
 def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
@@ -264,7 +319,16 @@ def _validate_sparse_layer(
     prediction_phenotype: Path,
     marker_score_path: Path | None,
     n_variants: int,
-) -> tuple[dict[str, Any], dict[str, float | int], np.ndarray | None]:
+    expected_selection_method: str,
+    selection_output: Path | None,
+    expected_fixed_lam_ratio: float | None = None,
+) -> tuple[
+    dict[str, Any],
+    dict[str, float | int],
+    np.ndarray | None,
+    dict[str, Any] | None,
+]:
+    """Validate one fixed-K fit and its lambda-selection stage contract."""
     summary_path = Path(str(prefix) + ".summary.json")
     prediction_path = Path(str(prefix) + ".sparse_prediction.tsv")
     summary = _read_json(summary_path)
@@ -274,17 +338,94 @@ def _validate_sparse_layer(
         raise ValueError("Sparse layer did not emit a valid COHERIT branch.")
     if summary.get("sparse_prediction", {}).get("status") != "emitted":
         raise ValueError("Sparse layer did not emit validation/test prediction.")
+    if summary.get("lambda_selection_method") != expected_selection_method:
+        raise ValueError(
+            "Sparse layer used an unexpected lambda-selection method: "
+            f"{summary.get('lambda_selection_method')!r} != "
+            f"{expected_selection_method!r}."
+        )
     theta = np.asarray(summary.get("var_components_lasso_ml"), dtype=np.float64)
     if theta.shape != (int(expected_k) + 1,) or not np.all(np.isfinite(theta)):
         raise ValueError("Sparse layer returned invalid variance components.")
     metrics = prediction_metrics(prediction_path, prediction_phenotype)
+
+    selection_payload = None
+    selected_ratio = float(summary.get("lasso_selected_lam_ratio", float("nan")))
+    if not math.isfinite(selected_ratio) or not 0.0 < selected_ratio <= 1.0:
+        raise ValueError("Sparse layer returned an invalid selected lambda ratio.")
+    if expected_selection_method == "validation_r2":
+        if summary.get("lasso_path_role") != "complete_validation_grid":
+            raise ValueError("Adaptive layer did not evaluate the validation grid.")
+        if selection_output is None or not selection_output.is_file():
+            raise ValueError("Validation-selected layer lacks its path audit JSON.")
+        if not bool(summary.get("validation_selection_inside_outer_loop", False)):
+            raise ValueError(
+                "Adaptive layer did not select lambda inside every alpha/theta round."
+            )
+        selection_payload = _read_json(selection_output)
+        if selection_payload.get("selection_role") != (
+            "inside_every_alpha_theta_outer_iteration"
+        ):
+            raise ValueError("Adaptive layer has the wrong validation-selection role.")
+        if selection_payload.get("test_phenotype_used") is not False:
+            raise ValueError("Adaptive layer does not prove test-phenotype isolation.")
+        selected = selection_payload.get("final_selected")
+        if not isinstance(selected, dict):
+            raise ValueError("Adaptive layer validation audit lacks final_selected.")
+        audit_ratio = float(selected.get("lam_ratio", float("nan")))
+        audit_r2 = float(selected.get("correlation_squared", float("nan")))
+        if not math.isclose(
+            selected_ratio,
+            audit_ratio,
+            rel_tol=1e-10,
+            abs_tol=1e-12,
+        ):
+            raise ValueError("Sparse summary and validation audit select different ratios.")
+        if not math.isclose(
+            float(metrics["correlation_squared"]),
+            audit_r2,
+            rel_tol=0.0,
+            abs_tol=5e-5,
+        ):
+            raise ValueError(
+                "Exported validation prediction does not reproduce the final "
+                "validation-selected path R2."
+            )
+    elif expected_selection_method == "fixed_lam_ratio":
+        if summary.get("lasso_path_role") != "frozen_ratio_target_only":
+            raise ValueError("Final refit did not use the optimized frozen-ratio path.")
+        solved_points = int(summary.get("lasso_path_points_solved", -1))
+        if solved_points not in {1, 2}:
+            raise ValueError("Frozen-ratio refit must solve only one or two path points.")
+        if selection_output is not None:
+            raise ValueError("Frozen-ratio refit must not use validation selection output.")
+        if bool(summary.get("validation_selection_inside_outer_loop", True)):
+            raise ValueError("Frozen-ratio refit unexpectedly used validation selection.")
+        if expected_fixed_lam_ratio is None or not math.isclose(
+            selected_ratio,
+            float(expected_fixed_lam_ratio),
+            rel_tol=1e-10,
+            abs_tol=1e-12,
+        ):
+            raise ValueError("Final refit did not preserve the selected lambda ratio.")
+    else:
+        raise ValueError(
+            f"Unsupported expected lambda-selection method: {expected_selection_method}"
+        )
+
     score = None
     if marker_score_path is not None:
-        score = _load_signal_score(marker_score_path, n_variants)
         marker_metadata = summary.get("adaptive_marker_score")
-        if not isinstance(marker_metadata, dict) or marker_metadata.get("status") != "emitted":
+        if not isinstance(marker_metadata, dict):
             raise ValueError("Sparse summary lacks adaptive marker-score metadata.")
-    return summary, metrics, score
+        marker_status = marker_metadata.get("status")
+        if marker_status == "emitted":
+            score = _load_signal_score(marker_score_path, n_variants)
+        elif marker_status != "skipped_validation_decline":
+            raise ValueError(
+                f"Sparse layer has an invalid marker-score status: {marker_status!r}."
+            )
+    return summary, metrics, score, selection_payload
 
 
 def _component_spec_matches(
@@ -336,21 +477,19 @@ def _load_reusable_layer_records(
     prior_algorithm = config.get("algorithm")
     if not isinstance(prior_algorithm, dict):
         raise ValueError("Reusable run configuration lacks algorithm provenance.")
-    expected_algorithm_values = {
-        "name": "prediction_first_adaptive_coherit_iterative_four_split",
-        "signal_high_fraction": SIGNAL_HIGH_FRACTION,
-        "ld_split": "within_signal_bin_median_stable_rank",
-        "validation_metric": "squared_pearson_correlation",
-        "marker_information_estimator": "sample_space_rademacher_hutchinson",
-        "marker_score_probes": int(args.marker_score_probes),
-        "marker_score_seed": int(args.marker_score_seed),
-    }
+    expected_algorithm_values = _algorithm_identity(args)
     for key, expected in expected_algorithm_values.items():
         if prior_algorithm.get(key) != expected:
             raise ValueError(f"Reusable run algorithm differs for {key}.")
-    prior_sparse_hash = config.get("source_sha256", {}).get("sparse_pipeline")
-    if prior_sparse_hash != _sha256(args.sparse_pipeline):
-        raise ValueError("Reusable run used a different sparse pipeline source.")
+    expected_source_hashes = {
+        "sparse_pipeline": _sha256(args.sparse_pipeline),
+        "lasso_cd": _sha256(Path(_lasso_mod.__file__).resolve()),
+        "sparsity_selection": _sha256(Path(_selection_mod.__file__).resolve()),
+    }
+    prior_source_hashes = config.get("source_sha256", {})
+    for name, expected_hash in expected_source_hashes.items():
+        if prior_source_hashes.get(name) != expected_hash:
+            raise ValueError(f"Reusable run used a different {name} source.")
 
     records: dict[int, dict[str, Any]] = {}
     for raw_record in result.get("valid_layers", []):
@@ -370,8 +509,8 @@ def _reusable_layer_artifacts(
     *,
     components: Sequence[AdaptiveComponent],
     need_marker_score: bool,
-) -> tuple[Path, Path, Path | None] | None:
-    """Resolve a reusable component spec, sparse prefix, and optional score."""
+) -> tuple[Path, Path, Path | None, Path] | None:
+    """Resolve a reusable validation-selected layer and optional marker score."""
     if record is None:
         return None
     marker_metadata = record.get("marker_score")
@@ -386,11 +525,21 @@ def _reusable_layer_artifacts(
         )
     marker_score_path = None
     if need_marker_score:
-        marker_score_path = Path(str(marker_metadata["path"])).expanduser().resolve(
-            strict=True
-        )
+        marker_status = marker_metadata.get("status")
+        if marker_status == "emitted":
+            marker_score_path = Path(
+                str(marker_metadata["path"])
+            ).expanduser().resolve(strict=True)
+        elif marker_status != "skipped_validation_decline":
+            return None
+    validation_path_value = record.get("validation_path_json")
+    if not validation_path_value:
+        return None
+    validation_path = Path(str(validation_path_value)).expanduser().resolve(
+        strict=True
+    )
     prefix = component_spec.parent / "coherit"
-    return component_spec, prefix, marker_score_path
+    return component_spec, prefix, marker_score_path, validation_path
 
 
 def _run_command(command: Sequence[str], log_path: Path) -> None:
@@ -424,10 +573,22 @@ def _sparse_command(
     keep: Path,
     prediction_keep: Path,
     prefix: Path,
+    selection_pheno: Path | None,
+    selection_output: Path | None,
+    fixed_lam_ratio: float | None,
     marker_score_path: Path | None,
     marker_score_seed: int,
+    marker_score_min_validation_r2: float | None,
     theta_init: np.ndarray | None,
 ) -> list[str]:
+    if bool(selection_pheno) != bool(selection_output):
+        raise ValueError("Selection phenotype and output must be supplied together.")
+    if selection_pheno is not None and fixed_lam_ratio is not None:
+        raise ValueError("Validation scan and frozen-ratio refit are distinct stages.")
+    if selection_pheno is None and fixed_lam_ratio is None:
+        raise ValueError("Adaptive sparse command requires an explicit lambda stage.")
+    if marker_score_min_validation_r2 is not None and marker_score_path is None:
+        raise ValueError("Conditional marker scoring requires a marker-score output.")
     command = [
         str(args.python_bin),
         str(args.sparse_pipeline),
@@ -455,7 +616,37 @@ def _sparse_command(
         str(args.gpu_budget_gib),
         "--cpu-threads",
         str(args.cpu_threads),
+        "--screen-topk",
+        str(args.screen_topk),
+        "--candidate-k",
+        str(args.candidate_k),
+        "--kkt-add-topk",
+        str(args.kkt_add_topk),
+        "--kkt-max-rounds",
+        str(args.kkt_max_rounds),
+        "--lasso-lam-min-ratio",
+        str(args.lam_min_ratio),
+        "--lasso-n-lambda",
+        str(args.n_lambda),
+        "--lasso-cd-max-iter",
+        str(args.lasso_cd_max_iter),
     ]
+    if selection_pheno is not None:
+        command.extend(
+            [
+                "--sparsity-validation-pheno-txt",
+                str(selection_pheno),
+                "--sparsity-validation-out",
+                str(selection_output),
+            ]
+        )
+    else:
+        command.extend(
+            [
+                "--lasso-fixed-lam-ratio",
+                format(float(fixed_lam_ratio), ".17g"),
+            ]
+        )
     if marker_score_path is not None:
         command.extend(
             [
@@ -467,6 +658,13 @@ def _sparse_command(
                 str(marker_score_seed),
             ]
         )
+        if marker_score_min_validation_r2 is not None:
+            command.extend(
+                [
+                    "--marker-score-min-validation-r2",
+                    format(float(marker_score_min_validation_r2), ".17g"),
+                ]
+            )
     if theta_init is not None:
         command.extend(
             [
@@ -531,6 +729,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--test-keep", required=True)
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--max-depth", type=int, default=MAX_ADAPTIVE_DEPTH)
+    parser.add_argument("--lam-min-ratio", type=float, default=1e-3)
+    parser.add_argument("--n-lambda", type=int, default=80)
+    parser.add_argument("--lasso-cd-max-iter", type=int, default=10000)
+    parser.add_argument("--screen-topk", type=int, default=2000)
+    parser.add_argument("--candidate-k", type=int, default=256)
+    parser.add_argument("--kkt-add-topk", type=int, default=256)
+    parser.add_argument("--kkt-max-rounds", type=int, default=20)
     parser.add_argument("--marker-score-probes", type=int, default=32)
     parser.add_argument("--marker-score-seed", type=int, default=20260825)
     parser.add_argument("--device", default="gpu")
@@ -557,6 +762,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error(f"--max-depth must be in 0..{MAX_ADAPTIVE_DEPTH}.")
     if int(args.marker_score_probes) < 1:
         parser.error("--marker-score-probes must be >= 1.")
+    if not math.isfinite(args.lam_min_ratio) or not 0.0 < args.lam_min_ratio <= 1.0:
+        parser.error("--lam-min-ratio must lie in (0, 1].")
+    for name in (
+        "n_lambda",
+        "lasso_cd_max_iter",
+        "screen_topk",
+        "candidate_k",
+        "kkt_add_topk",
+        "kkt_max_rounds",
+    ):
+        if int(getattr(args, name)) < 1:
+            parser.error(f"--{name.replace('_', '-')} must be >= 1.")
+    if int(args.screen_topk) < int(args.candidate_k):
+        parser.error("--screen-topk must be >= --candidate-k.")
     if float(args.gpu_budget_gib) < 0.0:
         parser.error("--gpu-budget-gib must be nonnegative.")
     if int(args.cpu_threads) < 0:
@@ -603,13 +822,6 @@ def _resolve_args(args: argparse.Namespace) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _resolve_args(parse_args(argv))
     result_path = args.out_dir / "adaptive_result.json"
-    if result_path.is_file():
-        cached = _read_json(result_path)
-        if cached.get("status") != "complete" or cached.get("case_id") != args.case_id:
-            raise ValueError(f"Existing adaptive result is incompatible: {result_path}")
-        print(f"[cached] {result_path}")
-        return 0
-
     args.out_dir.mkdir(parents=True, exist_ok=True)
     ld_score = load_aligned_ld_score(
         args.ld_score,
@@ -620,21 +832,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     validate_partition(components, n_variants=n_variants)
 
     config = {
-        "schema_version": 1,
+        "schema_version": 2,
         "case_id": args.case_id,
-        "algorithm": {
-            "name": "prediction_first_adaptive_coherit_iterative_four_split",
-            "max_depth": int(args.max_depth),
-            "k_path": [4**depth for depth in range(int(args.max_depth) + 1)],
-            "signal_high_fraction": SIGNAL_HIGH_FRACTION,
-            "ld_split": "within_signal_bin_median_stable_rank",
-            "validation_metric": "squared_pearson_correlation",
-            "early_stop_rule": "first_strict_validation_r2_decrease",
-            "validation_decline_tolerance": VALIDATION_DECLINE_TOLERANCE,
-            "marker_information_estimator": "sample_space_rademacher_hutchinson",
-            "marker_score_probes": int(args.marker_score_probes),
-            "marker_score_seed": int(args.marker_score_seed),
-        },
+        "algorithm": _algorithm_config(args),
         "inputs": {
             name: str(getattr(args, name))
             for name in INPUT_PATH_NAMES
@@ -645,6 +845,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "device": args.device,
             "gpu_budget_gib": float(args.gpu_budget_gib),
             "cpu_threads": int(args.cpu_threads),
+            "sparse_path_mode": SPARSE_PATH_MODE,
             "reuse_run_dir": (
                 str(args.reuse_run_dir) if args.reuse_run_dir is not None else None
             ),
@@ -653,6 +854,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             "adaptive_driver": _sha256(Path(__file__).resolve()),
             "adaptive_partition": _sha256(Path(_partition_mod.__file__).resolve()),
             "sparse_pipeline": _sha256(args.sparse_pipeline),
+            "lasso_cd": _sha256(Path(_lasso_mod.__file__).resolve()),
+            "sparsity_selection": _sha256(
+                Path(_selection_mod.__file__).resolve()
+            ),
         },
         "created_at": _now(),
     }
@@ -669,6 +874,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
     else:
         _atomic_json(config_path, config)
+
+    if result_path.is_file():
+        cached = _read_json(result_path)
+        if cached.get("status") != "complete" or cached.get("case_id") != args.case_id:
+            raise ValueError(f"Existing adaptive result is incompatible: {result_path}")
+        print(f"[cached] {result_path}")
+        return 0
 
     reusable_layers = _load_reusable_layer_records(
         args.reuse_run_dir,
@@ -696,7 +908,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         reused_from = None
         if reused_artifacts is not None:
-            component_spec, prefix, marker_score_path = reused_artifacts
+            (
+                component_spec,
+                prefix,
+                marker_score_path,
+                selection_output,
+            ) = reused_artifacts
             reused_from = str(component_spec.parent)
             print(
                 f"[adaptive] reusing depth={depth} K={expected_k} from {reused_from}",
@@ -709,25 +926,38 @@ def main(argv: Sequence[str] | None = None) -> int:
                     component_spec,
                     components,
                     provenance={
-                        "algorithm": "adaptive_coherit_iterative_four_split",
+                        "algorithm": ADAPTIVE_ALGORITHM_NAME,
                         "case_id": args.case_id,
                         "depth": int(depth),
-                        "signal_high_fraction": SIGNAL_HIGH_FRACTION,
+                        "signal_split": SIGNAL_SPLIT_METHOD,
                     },
                 )
             prefix = layer_dir / "coherit"
             marker_score_path = (
                 layer_dir / "marker_score.npz" if need_marker_score else None
             )
+            selection_output = layer_dir / "validation_path.json"
         summary_path = Path(str(prefix) + ".summary.json")
         try:
             if reused_artifacts is None and not summary_path.is_file():
-                partial_outputs = list(layer_dir.glob("coherit.*"))
+                partial_outputs = list(layer_dir.glob("coherit.*")) + list(
+                    layer_dir.glob("validation_path*")
+                )
                 if partial_outputs:
                     raise RuntimeError(
                         "Incomplete sparse layer outputs already exist; use a new "
                         f"--out-dir or inspect {layer_dir}."
                     )
+                marker_score_min_validation_r2 = (
+                    float(
+                        layer_records[-1][
+                            "selected_lambda_validation_r2"
+                        ]
+                    )
+                    - VALIDATION_DECLINE_TOLERANCE
+                    if need_marker_score and layer_records
+                    else None
+                )
                 command = _sparse_command(
                     args=args,
                     component_spec=component_spec,
@@ -735,18 +965,26 @@ def main(argv: Sequence[str] | None = None) -> int:
                     keep=args.train_keep,
                     prediction_keep=args.validation_keep,
                     prefix=prefix,
+                    selection_pheno=args.validation_pheno_txt,
+                    selection_output=selection_output,
+                    fixed_lam_ratio=None,
                     marker_score_path=marker_score_path,
                     marker_score_seed=int(args.marker_score_seed) + depth,
+                    marker_score_min_validation_r2=(
+                        marker_score_min_validation_r2
+                    ),
                     theta_init=theta_init,
                 )
                 print(f"[adaptive] fitting depth={depth} K={expected_k}", flush=True)
                 _run_command(command, layer_dir / "runner.log")
-            summary, metrics, signal_score = _validate_sparse_layer(
+            summary, metrics, signal_score, selection_payload = _validate_sparse_layer(
                 prefix=prefix,
                 expected_k=expected_k,
                 prediction_phenotype=args.validation_pheno_txt,
                 marker_score_path=marker_score_path,
                 n_variants=n_variants,
+                expected_selection_method="validation_r2",
+                selection_output=selection_output,
             )
         except Exception as error:
             failure = {
@@ -773,11 +1011,32 @@ def main(argv: Sequence[str] | None = None) -> int:
         theta_fit = np.asarray(
             summary["var_components_lasso_ml"], dtype=np.float64
         )
+        if selection_payload is None:
+            raise RuntimeError("Validation-selected layer lacks its selection audit.")
+        selected_lambda = selection_payload["final_selected"]
         record = {
             "depth": int(depth),
             "K": int(expected_k),
             "component_spec": str(component_spec),
             "validation": metrics,
+            "lambda_selection_method": "validation_r2",
+            "selected_lam": float(selected_lambda["lam"]),
+            "selected_lam_ratio": float(selected_lambda["lam_ratio"]),
+            "selected_lambda_validation_r2": float(
+                selected_lambda["correlation_squared"]
+            ),
+            "lasso_path_role": summary.get("lasso_path_role"),
+            "lasso_path_points_solved": int(
+                summary.get("lasso_path_points_solved", 0)
+            ),
+            "lasso_path_points_requested": int(
+                summary.get("lasso_path_points_requested", 0)
+            ),
+            "validation_path_json": str(selection_output),
+            "validation_path_tsv": str(selection_output)[:-5] + ".path.tsv",
+            "n_lambda_path_selections": int(
+                selection_payload["n_path_selections"]
+            ),
             "h2_chive": float(summary["h2_chive_guarded"]),
             "support_size": int(summary["support_size"]),
             "var_components_lasso_ml": theta_fit.tolist(),
@@ -795,7 +1054,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             % (
                 depth,
                 expected_k,
-                float(metrics["correlation_squared"]),
+                float(record["selected_lambda_validation_r2"]),
                 int(summary["support_size"]),
             ),
             flush=True,
@@ -803,9 +1062,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         if len(layer_records) >= 2:
             previous_r2 = float(
-                layer_records[-2]["validation"]["correlation_squared"]
+                layer_records[-2]["selected_lambda_validation_r2"]
             )
-            current_r2 = float(metrics["correlation_squared"])
+            current_r2 = float(record["selected_lambda_validation_r2"])
             if validation_declined(previous_r2, current_r2):
                 search_stop = {
                     "reason": "validation_r2_decreased",
@@ -831,12 +1090,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             }
             break
 
-        assert signal_score is not None
+        if signal_score is None:
+            raise RuntimeError(
+                "An accepted Adaptive-K layer did not emit marker scores for "
+                "the next split."
+            )
         children = four_way_split(
             components,
             signal_score=signal_score,
             ld_score=ld_score,
-            high_fraction=SIGNAL_HIGH_FRACTION,
             child_depth=depth + 1,
         )
         theta_init = covariance_preserving_warm_start(
@@ -847,19 +1109,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         components = children
 
     best_r2 = max(
-        float(record["validation"]["correlation_squared"])
+        float(record["selected_lambda_validation_r2"])
         for record in layer_records
     )
     tied = [
         index
         for index, record in enumerate(layer_records)
-        if best_r2 - float(record["validation"]["correlation_squared"]) <= 1e-12
+        if best_r2 - float(record["selected_lambda_validation_r2"]) <= 1e-12
     ]
     selected_index = min(tied, key=lambda index: int(layer_records[index]["depth"]))
     selected = layer_records[selected_index]
     selected_components = layer_components[selected_index]
     selected_k = int(selected["K"])
     selected_depth = int(selected["depth"])
+    selected_lam_ratio = float(selected["selected_lam_ratio"])
 
     final_dir = args.out_dir / f"final_refit_K{selected_k}"
     final_dir.mkdir(parents=True, exist_ok=True)
@@ -870,6 +1133,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             selected_components,
             provenance={
                 "algorithm": "adaptive_coherit_frozen_training_partition",
+                "signal_split": SIGNAL_SPLIT_METHOD,
                 "case_id": args.case_id,
                 "selected_depth": selected_depth,
                 "selected_K": selected_k,
@@ -891,24 +1155,32 @@ def main(argv: Sequence[str] | None = None) -> int:
             keep=args.fit_keep,
             prediction_keep=args.test_keep,
             prefix=final_prefix,
+            selection_pheno=None,
+            selection_output=None,
+            fixed_lam_ratio=selected_lam_ratio,
             marker_score_path=None,
             marker_score_seed=int(args.marker_score_seed),
+            marker_score_min_validation_r2=None,
             theta_init=np.asarray(
                 selected["var_components_lasso_ml"], dtype=np.float64
             ),
         )
         print(
-            f"[adaptive] final 10k refit with frozen K={selected_k} partition",
+            "[adaptive] final train+validation refit with frozen "
+            f"K={selected_k} and lambda/lambda_max={selected_lam_ratio:.8g}",
             flush=True,
         )
         _run_command(final_command, final_dir / "runner.log")
 
-    final_summary, test_metrics, _ = _validate_sparse_layer(
+    final_summary, test_metrics, _, _ = _validate_sparse_layer(
         prefix=final_prefix,
         expected_k=selected_k,
         prediction_phenotype=args.test_pheno_txt,
         marker_score_path=None,
         n_variants=n_variants,
+        expected_selection_method="fixed_lam_ratio",
+        selection_output=None,
+        expected_fixed_lam_ratio=selected_lam_ratio,
     )
     comparison = _existing_comparison(
         args.existing_prediction_results,
@@ -928,11 +1200,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     result = {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "complete",
         "case_id": args.case_id,
         "completed_at": _now(),
         "algorithm": config["algorithm"],
+        "sparse_path_mode": SPARSE_PATH_MODE,
         "valid_layers": layer_records,
         "layer_failures": layer_failures,
         "search_stop": search_stop,
@@ -941,8 +1214,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             "selected_depth": selected_depth,
             "selected_K": selected_k,
             "selected_validation_r2": float(
-                selected["validation"]["correlation_squared"]
+                selected["selected_lambda_validation_r2"]
             ),
+            "selected_lam": float(selected["selected_lam"]),
+            "selected_lam_ratio": selected_lam_ratio,
+            "lambda_selection_method": "validation_r2",
             "tie_rule": "smaller_K_within_1e-12",
             "search_stop_reason": (
                 search_stop.get("reason") if search_stop is not None else None
@@ -950,7 +1226,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         },
         "final_refit": {
             "training_samples": int(final_summary["n_samples"]),
-            "partition_frozen_before_10k_refit": True,
+            "partition_frozen_before_refit": True,
+            "lambda_ratio_frozen_before_refit": True,
+            "fixed_lam_ratio": selected_lam_ratio,
+            "lambda_selection_method": "fixed_lam_ratio",
+            "lasso_path_role": final_summary.get("lasso_path_role"),
+            "lasso_path_points_solved": int(
+                final_summary.get("lasso_path_points_solved", 0)
+            ),
+            "lasso_path_points_requested": int(
+                final_summary.get("lasso_path_points_requested", 0)
+            ),
             "component_spec": str(final_component_spec),
             "h2_chive": float(final_summary["h2_chive_guarded"]),
             "support_size": int(final_summary["support_size"]),
@@ -968,7 +1254,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "[adaptive] complete selected_K=%s validation_R2=%.8f test_R2=%.8f"
         % (
             selected_k,
-            float(selected["validation"]["correlation_squared"]),
+            float(selected["selected_lambda_validation_r2"]),
             float(test_metrics["correlation_squared"]),
         ),
         flush=True,

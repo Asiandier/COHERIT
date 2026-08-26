@@ -96,33 +96,58 @@ current nuisance score is algebraically equivalent to applying \(P_C\) to
 Within each candidate problem, coordinate descent is accepted solely when the
 active and inactive score-KKT conditions pass at the configured numerical
 tolerance; coefficient change is only an active-set scheduling heuristic.
-Every evaluated lambda on the EBIC path must pass that finite-tolerance
-certificate.  An unsolved path point is reported as a numerical failure rather
-than being skipped in favor of the lambda-max empty model.
-At each covariance update, EBIC reselects lambda and the full-marker KKT scan
-adds any omitted violating variants to the candidate set.  The KKT tolerance
-is matched to the ordinary PCG precision; an independent finite-PCG score on
-candidate coordinates is diagnostic rather than a second rejection gate.
+Every evaluated lambda on the complete path must pass that finite-tolerance
+certificate. An unsolved path point is reported as a numerical failure rather
+than being skipped in favor of the lambda-max empty model. At each covariance
+update, held-out validation squared correlation selects lambda before the
+variance-component update, and the full-marker KKT scan adds any omitted
+violating variants to the candidate set. The KKT tolerance is matched to the
+ordinary PCG precision; an independent finite-PCG score on candidate
+coordinates is diagnostic rather than a second rejection gate.
 The outer loop stops when both the variance components and the complete fitted
-fixed mean stabilize, or after ten updates by default.  It then performs
-exactly one final EBIC-LASSO update at the returned covariance, without another
+fixed mean stabilize, or after the configured maximum number of updates. It
+then performs exactly one final validation-selected LASSO update at the
+returned covariance, without another
 variance update.  Reaching the outer limit is reported as a warning and does
 not invalidate a finite final pair.  If that final update itself is unavailable,
 the most recent complete covariance-aligned pair is returned with a warning.
-The default run stops with this covariance-aligned LASSO pair and reports the
-COHERIT estimator.  The default EBIC penalty uses the full eligible marker
-count.  A secondary four-estimator comparison can be requested with
+The selected lambda/lambda-max ratio is then frozen before the combined
+train+validation refit; the held-out test phenotype is never used for lambda
+selection. Because that ratio is already fixed, each final-refit LASSO block
+solves only the lambda-max warm-start point and the exact target point, rather
+than recomputing the unused validation grid. The run stops with this
+covariance-aligned LASSO pair and reports
+the COHERIT estimator. A secondary four-estimator comparison can be requested with
 `--compare-four-estimators`; only in that mode is the selected span frozen and
 one separate REML--GLS refit performed.  That refit is not fed back into the
 LASSO.
+
+The end-to-end sparse path has two partition modes with the same inner
+validation-lambda contract:
+
+- `fixed_k_validation_lambda`: freeze a supplied component spec (or use K=1),
+  select lambda by validation prediction inside every alpha/theta iteration,
+  then freeze the selected lambda ratio for the train+validation refit. The
+  orchestrator is `gpu-reml-sparse-fixed`.
+- `adaptive_k_validation_lambda`: start at K=1, fully converge the same
+  validation-selected sparse model at each K, split every GRM by exact 1D
+  two-means signal score and within-bin LD median, and stop at the first
+  validation-R2 decline along K=1,4,...,1024. The orchestrator is
+  `gpu-reml-sparse-adaptive`. A layer that already falls below the preceding
+  validation R2 skips the otherwise unused marker-information probes.
+
+The validation set therefore selects lambda in both modes and additionally
+selects K only in Adaptive mode. The test phenotype remains isolated until the
+partition and lambda ratio are frozen.
 
 Sparse-run output semantics are deliberately explicit:
 
 - By default, `estimator_mode` is `coherit` and `computed_estimators` contains
   only `h2_chive`.  No selected-support REML--GLS refit is run.
-- New sparse runs use output schema version 5, which records the estimator
-  mode explicitly.  Historical schema-4 comparison outputs remain valid
-  artifacts but are not produced by the current pipeline.
+- New sparse runs use output schema version 6, which records the estimator
+  mode and the validation/frozen-ratio lambda-selection contract explicitly.
+  Historical outputs remain valid artifacts but are not produced by the
+  current pipeline.
 - `var_components_lasso_ml` exposes the variance components used by COHERIT.
 - `h2` is the primary total estimate. For a valid covariance-aligned LASSO
   pair it combines the calibrated LASSO quadratic with the
@@ -338,35 +363,33 @@ gpu-reml \
   --out-prefix out/smile_multi
 ```
 
-Sparse REML plus LASSO, single GRM:
+Sparse REML plus LASSO with lambda selected inside every outer iteration:
 
 ```bash
 gpu-reml-sparse \
   --bed-prefix /path/to/data \
+  --component-spec single_grm.npz \
   --pheno-txt pheno.txt \
   --covar-txt covar.txt \
+  --prediction-bed-prefix /path/to/data \
+  --prediction-covar-txt covar.txt \
+  --prediction-keep-path validation.keep \
+  --sparsity-validation-pheno-txt validation.pheno \
+  --sparsity-validation-out out/validation_path.json \
   --out-prefix out/sparse_single
 ```
 
-Sparse REML plus LASSO, multiple BED prefixes as multiple GRMs:
-
-```bash
-gpu-reml-sparse \
-  --bed-prefix /path/to/grm1,/path/to/grm2,/path/to/grm3 \
-  --pheno-txt pheno.txt \
-  --covar-txt covar.txt \
-  --out-prefix out/sparse_multi_bed
-```
-
-Sparse REML plus LASSO, one genotype file partitioned into multiple GRMs:
+After selection, refit on the combined training and validation samples with
+the frozen ratio:
 
 ```bash
 gpu-reml-sparse \
   --bed-prefix /path/to/data \
-  --component-spec components.json \
-  --pheno-txt pheno.txt \
+  --component-spec selected_components.npz \
+  --pheno-txt fit.pheno \
   --covar-txt covar.txt \
-  --out-prefix out/sparse_components
+  --lasso-fixed-lam-ratio 0.2940048064 \
+  --out-prefix out/final_refit
 ```
 
 Continuous-trait marginal GWAS:
@@ -501,6 +524,11 @@ fit lifecycle.
   `max(1e-4, 2*pcg_tol)`, so the certificate does not demand more precision
   than its PCG inputs provide.
 - `--outer-max`: maximum number of variance updates; the default is `20`.
+- `--sparsity-validation-pheno-txt` and `--sparsity-validation-out`: required
+  together for model selection. The complete lambda path is evaluated on the
+  validation samples inside every alpha/theta outer iteration.
+- `--lasso-fixed-lam-ratio`: marks the final refit stage and is mutually
+  exclusive with validation selection inputs.
 - `--compare-four-estimators`: opt in to the secondary four-estimator and
   selected-span prediction comparison.  Without it, sparse runs compute only
   COHERIT and, when prediction inputs are supplied, only the matched Lasso

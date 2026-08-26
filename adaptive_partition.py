@@ -66,26 +66,78 @@ def single_component(n_variants: int) -> list[AdaptiveComponent]:
     ]
 
 
-def _stable_signal_split(
+def _exact_signal_two_means_split(
     indices: np.ndarray,
     signal_score: np.ndarray,
-    *,
-    high_fraction: float,
-) -> tuple[np.ndarray, np.ndarray, float]:
+) -> tuple[np.ndarray, np.ndarray, dict[str, float | int]]:
+    """Return the exact deterministic one-dimensional two-means partition.
+
+    For squared Euclidean distance, the globally optimal clusters are
+    contiguous after sorting the scalar scores.  Evaluating every admissible
+    split therefore avoids the initialization and local-minimum ambiguity of
+    iterative Lloyd k-means.  At least two markers are retained in each
+    signal cluster because both clusters are subsequently split by LD rank.
+    """
     count = int(indices.size)
-    high_count = int(np.ceil(float(high_fraction) * count))
-    if high_count < 2 or count - high_count < 2:
+    if count < 4:
         raise ValueError(
-            "A four-way split requires at least two markers in both signal bins; "
-            f"parent size={count}, high_fraction={high_fraction}."
+            "A four-way split requires at least four markers for signal "
+            f"two-means; parent size={count}."
         )
-    values = signal_score[indices]
-    # Primary key: descending score. Secondary key: source marker index.
-    order = np.lexsort((indices, -values))
-    high = np.sort(indices[order[:high_count]])
-    low = np.sort(indices[order[high_count:]])
-    cutoff = float(values[order[high_count - 1]])
-    return high, low, cutoff
+    values = np.asarray(signal_score[indices], dtype=np.float64)
+    # Primary key: ascending score. Secondary key: source marker index.
+    order = np.lexsort((indices, values))
+    sorted_values = values[order]
+
+    prefix_sum = np.concatenate(
+        (np.asarray([0.0]), np.cumsum(sorted_values, dtype=np.float64))
+    )
+    prefix_square = np.concatenate(
+        (
+            np.asarray([0.0]),
+            np.cumsum(sorted_values * sorted_values, dtype=np.float64),
+        )
+    )
+    split_positions = np.arange(2, count - 1, dtype=np.int64)
+    low_count = split_positions.astype(np.float64)
+    high_count = float(count) - low_count
+    low_sum = prefix_sum[split_positions]
+    high_sum = prefix_sum[count] - low_sum
+    low_sse = prefix_square[split_positions] - low_sum * low_sum / low_count
+    high_sse = (
+        prefix_square[count]
+        - prefix_square[split_positions]
+        - high_sum * high_sum / high_count
+    )
+    objective = np.maximum(low_sse, 0.0) + np.maximum(high_sse, 0.0)
+    # Several cut positions can have exactly the same global optimum when
+    # scores contain ties (including the all-equal case).  Prefer the most
+    # balanced optimum, then the smaller cut position.  This keeps every
+    # split deterministic and prevents arbitrary tiny clusters.
+    balance = np.abs(split_positions.astype(np.float64) - 0.5 * float(count))
+    best_index = int(
+        np.lexsort((split_positions, balance, objective))[0]
+    )
+    split = int(split_positions[best_index])
+
+    low_order = order[:split]
+    high_order = order[split:]
+    low = np.sort(indices[low_order])
+    high = np.sort(indices[high_order])
+    low_mean = float(np.mean(values[low_order]))
+    high_mean = float(np.mean(values[high_order]))
+    if high_mean < low_mean:
+        raise RuntimeError("Signal two-means reversed the ordered cluster means.")
+    cutoff = float(0.5 * (low_mean + high_mean))
+    diagnostics: dict[str, float | int] = {
+        "signal_cluster_low_size": int(low.size),
+        "signal_cluster_high_size": int(high.size),
+        "signal_cluster_low_mean": low_mean,
+        "signal_cluster_high_mean": high_mean,
+        "signal_cluster_boundary": cutoff,
+        "signal_cluster_within_sse": float(objective[best_index]),
+    }
+    return high, low, diagnostics
 
 
 def _stable_ld_split(
@@ -111,10 +163,9 @@ def four_way_split(
     *,
     signal_score: np.ndarray,
     ld_score: np.ndarray,
-    high_fraction: float = 0.15,
     child_depth: int,
 ) -> list[AdaptiveComponent]:
-    """Split every parent into signal 15/85 and within-bin LD halves."""
+    """Split every parent by exact signal two-means, then by LD rank."""
     signal = np.asarray(signal_score, dtype=np.float64).reshape(-1)
     ld = np.asarray(ld_score, dtype=np.float64).reshape(-1)
     if signal.shape != ld.shape or signal.size == 0:
@@ -123,18 +174,17 @@ def four_way_split(
         raise ValueError("signal_score must be finite and nonnegative.")
     if not np.all(np.isfinite(ld)):
         raise ValueError("ld_score must be finite.")
-    if not 0.0 < float(high_fraction) < 1.0:
-        raise ValueError("high_fraction must lie strictly between zero and one.")
     validate_partition(parents, n_variants=int(signal.size))
 
     children: list[AdaptiveComponent] = []
     for parent_index, parent in enumerate(parents):
         indices = np.asarray(parent.variant_indices, dtype=np.int64).reshape(-1)
-        signal_high, signal_low, signal_cutoff = _stable_signal_split(
-            indices,
-            signal,
-            high_fraction=float(high_fraction),
-        )
+        (
+            signal_high,
+            signal_low,
+            signal_diagnostics,
+        ) = _exact_signal_two_means_split(indices, signal)
+        realized_high_fraction = float(signal_high.size / indices.size)
         sh_ld_high, sh_ld_low, sh_ld_median = _stable_ld_split(
             signal_high, ld
         )
@@ -160,10 +210,11 @@ def four_way_split(
                         "parent_name": parent.name,
                         "parent_size": int(indices.size),
                         "signal_bin": signal_bin,
-                        "signal_high_fraction": float(high_fraction),
-                        "signal_cutoff": signal_cutoff,
+                        "signal_split_method": "exact_1d_two_means",
+                        "signal_high_fraction_realized": realized_high_fraction,
                         "ld_bin": ld_bin,
                         "ld_median_within_signal_bin": float(ld_median),
+                        **signal_diagnostics,
                     },
                 )
             )

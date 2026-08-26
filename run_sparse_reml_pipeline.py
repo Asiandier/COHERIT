@@ -3,6 +3,13 @@
 Sparse REML + LASSO pipeline.
 
 Performance notes (vs. previous version):
+  • KKT-certified candidates persist across alpha/theta outer iterations and
+    are unioned with the refreshed signal screen instead of being discarded
+    down to the active support.
+  • Small KKT-violation batches receive an adaptive near-threshold buffer,
+    avoiding repeated complete-path solves for one-digit follow-up violations.
+  • Same-basis coefficient paths are reused only when their per-lambda KKT
+    residual improves on the ordinary descending-lambda warm start.
   • Warm-start dictionary: maps SNP index → previous PCG solution column.
     When the candidate set overlaps between iterations (common), the warm
     starts for those columns are reused — dramatically reducing PCG iterations
@@ -15,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import dataclasses
 import importlib
 import json
 import logging
@@ -88,9 +96,6 @@ remove_sparse_prediction_outputs = (
 evaluate_prediction_path = _sparsity_selection_mod.evaluate_prediction_path
 merge_path_diagnostics = _sparsity_selection_mod.merge_path_diagnostics
 read_phenotype_aligned = _sparsity_selection_mod.read_phenotype_aligned
-select_validation_path_index = (
-    _sparsity_selection_mod.select_validation_path_index
-)
 write_selection_outputs = _sparsity_selection_mod.write_selection_outputs
 
 _source_mod = importlib.import_module(f"{pkg_name}.geno_source")
@@ -112,9 +117,6 @@ make_nonbed_input_fam = _common_mod.make_nonbed_input_fam
 compute_sample_mask = _common_mod.compute_sample_mask
 write_keep_file = _common_mod.write_keep_file
 resolve_cpu_threads = _common_mod.resolve_cpu_threads
-
-LASSO_EBIC_ES_PATIENCE_FIXED = 10
-
 
 def _bed_count(path: str, attr: str) -> int:
     bed = open_bed(path)
@@ -483,6 +485,154 @@ def _lookup_pvar_rows(
     return rows
 
 
+@dataclasses.dataclass
+class _PredictionFitContext:
+    """Prediction genotype/covariate state shared by iterative validation."""
+
+    fitter: object
+    grm_index: MultiGRMIndex
+    covar: np.ndarray | None
+    sample_ids: list[str]
+    dropped_ids: list[str]
+    _close_callback: object
+    _closed: bool = False
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        atexit.unregister(self._close_callback)
+        self._close_callback()
+
+
+def _build_prediction_fit_context(
+    *,
+    args,
+    training_fitter,
+    component_variant_indices: list[np.ndarray],
+    prediction_bed_list: list[str],
+    prediction_pgen_prefix: str,
+    covar_transform,
+    call_width: int,
+    cpu_threads: int,
+    gpu_budget_bytes: float,
+    ring_depth: int,
+) -> _PredictionFitContext:
+    """Build prediction state using training-only genotype standardization."""
+    standardization_overrides = []
+    for streamer in training_fitter.streamers:
+        if streamer._means_host is None or streamer._inv_sds_host is None:
+            raise RuntimeError(
+                "Sparse prediction requires retained training SNP "
+                "standardization statistics."
+            )
+        standardization_overrides.append(
+            (streamer._means_host, streamer._inv_sds_host)
+        )
+
+    if prediction_pgen_prefix:
+        prediction_fam_path = make_nonbed_input_fam(
+            pgen_prefix=prediction_pgen_prefix
+        )
+        atexit.register(cleanup_path, prediction_fam_path)
+    else:
+        prediction_fam_path = prediction_bed_list[0] + ".fam"
+
+    requested_prediction_ids = None
+    if args.prediction_keep_path:
+        if not os.path.exists(args.prediction_keep_path):
+            raise SystemExit(
+                "--prediction-keep-path does not exist: "
+                f"{args.prediction_keep_path}"
+            )
+        requested_prediction_ids = read_keep_ids(args.prediction_keep_path)
+    prediction_covar, prediction_ids, prediction_dropped = load_covar_aligned(
+        prediction_fam_path,
+        args.prediction_covar_txt or None,
+        transform=covar_transform,
+        keep_ids=requested_prediction_ids,
+    )
+    logger.info(
+        "[prediction] loaded %s samples; dropped %s",
+        len(prediction_ids),
+        len(prediction_dropped),
+    )
+
+    prediction_sources = None
+    prediction_sample_mask = None
+    if prediction_pgen_prefix:
+        prediction_sample_mask = compute_sample_mask(
+            prediction_fam_path, prediction_ids
+        )
+        prediction_sources = [
+            PgenGenoSource(
+                prediction_pgen_prefix,
+                sample_mask=prediction_sample_mask,
+            )
+        ]
+        prediction_sample_mask = None
+    else:
+        n_prediction_bed = _bed_count(
+            prediction_bed_list[0] + ".bed", "iid_count"
+        )
+        if n_prediction_bed != len(prediction_ids):
+            prediction_sample_mask = compute_sample_mask(
+                prediction_fam_path, prediction_ids
+            )
+
+    prediction_cfg_kwargs = dict(
+        device=args.device,
+        sample_mask=prediction_sample_mask,
+        component_variant_indices=component_variant_indices or None,
+        standardization_overrides=standardization_overrides,
+        call_width=call_width,
+        keep_host_stats=True,
+        cpu_threads=cpu_threads,
+        gpu_budget_bytes=gpu_budget_bytes,
+        ring_depth=ring_depth,
+        n_rand_vec=args.n_rand_vec,
+        minq_iter=args.minq_iter,
+        slq_samples=args.slq_samples,
+        slq_m=args.slq_m,
+        precond_rank=0,
+        max_pcg_iters=args.max_pcg_iters,
+        pcg_ridge=args.pcg_ridge,
+        verbose=args.verbose,
+    )
+    if prediction_sources is not None:
+        prediction_fitter = InfinitesimalREMLFitter(
+            FitConfig(sources=prediction_sources, **prediction_cfg_kwargs)
+        )
+    else:
+        prediction_fitter = InfinitesimalREMLFitter(
+            FitConfig(
+                bed_prefix=prediction_bed_list,
+                **prediction_cfg_kwargs,
+            )
+        )
+    close_callback = prediction_fitter.close
+    atexit.register(close_callback)
+    try:
+        prediction_grm_index = MultiGRMIndex(
+            prediction_fitter.streamers,
+            call_plan=prediction_fitter._multi_call_plan,
+            component_variant_indices=component_variant_indices or None,
+        )
+    except Exception:
+        atexit.unregister(close_callback)
+        close_callback()
+        raise
+
+    return _PredictionFitContext(
+        fitter=prediction_fitter,
+        grm_index=prediction_grm_index,
+        covar=prediction_covar,
+        sample_ids=list(prediction_ids),
+        dropped_ids=list(prediction_dropped),
+        _close_callback=close_callback,
+    )
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run sparse REML + LASSO pipeline on real genotype data.")
     # Genotype input — exactly one of the two groups must be supplied
@@ -522,6 +672,16 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Deterministic Rademacher seed for --marker-score-out.",
+    )
+    p.add_argument(
+        "--marker-score-min-validation-r2",
+        type=float,
+        default=None,
+        help=(
+            "Optional Adaptive-K optimization: emit marker scores only when "
+            "the final validation-selected model reaches this R2. A declining "
+            "K layer can then stop without paying for unused score probes."
+        ),
     )
     p.add_argument("--pheno-txt", default=env("PHENO_TXT", ""))
     p.add_argument("--covar-txt", default=env("COVAR_TXT", ""))
@@ -616,29 +776,17 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--lasso-lam-min-ratio", type=float, default=0.05)
     p.add_argument("--lasso-n-lambda", type=int, default=60)
-    p.add_argument("--lasso-ebic-gamma", type=float, default=0.5)
-    p.add_argument(
-        "--lasso-selection-mode",
-        choices=["ebic", "fixed_ratio"],
-        default="ebic",
-        help=(
-            "Select the Lasso path point by EBIC or by a frozen "
-            "lambda/lambda_max ratio chosen on separate validation data."
-        ),
-    )
     p.add_argument(
         "--lasso-fixed-lam-ratio",
         type=float,
         default=None,
         help=(
-            "Required with --lasso-selection-mode fixed_ratio; must lie in "
-            "(0, 1]."
+            "Frozen lambda/lambda_max ratio for the final train+validation "
+            "refit. When omitted, validation phenotype/output inputs are "
+            "required and validation R2 selects lambda inside every outer "
+            "iteration."
         ),
     )
-    p.add_argument("--lasso-ebic-early-stop", action="store_true")
-    p.add_argument("--no-lasso-ebic-early-stop", dest="lasso_ebic_early_stop", action="store_false")
-    p.set_defaults(lasso_ebic_early_stop=True)
-    p.add_argument("--lasso-ebic-es-min-delta", type=float, default=0.0)
     p.add_argument("--lasso-cd-max-iter", type=int, default=2000)
     p.add_argument("--lasso-cd-tol", type=float, default=1e-6)
     p.add_argument("--lasso-active-set-period", type=int, default=5)
@@ -655,21 +803,11 @@ def parse_args() -> argparse.Namespace:
         "--sparsity-validation-out",
         default="",
         help=(
-            "Optional JSON output for validation-selected lambda-path "
-            "diagnostics at the final fitted covariance."
+            "JSON audit of the lambda selected by validation R2 inside every "
+            "alpha/theta outer iteration."
         ),
     )
     p.add_argument("--proj-ridge", type=float, default=1e-6)
-    p.add_argument(
-        "--ebic-p-mode",
-        choices=["candidate", "full"],
-        default="full",
-        help=(
-            "Model-space size used by the EBIC combinatorial penalty. "
-            "The default 'full' matches genome-wide KKT certification; "
-            "'candidate' is retained only for screened-EBIC sensitivity analyses."
-        ),
-    )
     p.add_argument(
         "--kkt-tol",
         type=float,
@@ -692,7 +830,11 @@ def parse_args() -> argparse.Namespace:
         "--kkt-add-topk",
         type=int,
         default=256,
-        help="Maximum number of outside-candidate KKT violators added per refinement round.",
+        help=(
+            "Maximum outside-marker expansion batch per KKT round. The batch "
+            "contains the strongest strict violators and, when space remains, "
+            "a small adaptive buffer of the strongest near-threshold markers."
+        ),
     )
     p.add_argument(
         "--kkt-max-rounds",
@@ -1042,6 +1184,22 @@ def _finite_float_or_none(value: float) -> float | None:
     return value_f if np.isfinite(value_f) else None
 
 
+def _validation_allows_marker_score(
+    observed_r2: float | None,
+    minimum_r2: float | None,
+) -> bool:
+    """Skip score probes only when Adaptive K will stop at this layer."""
+    if minimum_r2 is None:
+        return True
+    if observed_r2 is None:
+        raise ValueError("Conditional marker scoring requires validation R2.")
+    observed = float(observed_r2)
+    minimum = float(minimum_r2)
+    if not np.isfinite(observed) or not np.isfinite(minimum):
+        raise ValueError("Marker-score validation thresholds must be finite.")
+    return observed >= minimum
+
+
 def _json_safe_value(value):
     """Recursively replace non-finite numeric diagnostics by JSON ``null``."""
     if isinstance(value, dict):
@@ -1056,6 +1214,221 @@ def _json_safe_value(value):
     if isinstance(value, float) and not np.isfinite(value):
         return None
     return value
+
+
+def _select_converged_validation_path_index(
+    path_rows: list[dict],
+    metrics: list[dict],
+) -> int:
+    """Select validation R2 only among converged, candidate-KKT path points."""
+    if len(path_rows) != len(metrics) or not path_rows:
+        raise ValueError("Lasso path and validation metrics must align.")
+    eligible = [
+        index
+        for index, (row, metric) in enumerate(zip(path_rows, metrics))
+        if bool(row.get("converged", False))
+        and bool(row.get("kkt_passed", False))
+        and metric.get("correlation_squared") is not None
+        and np.isfinite(float(metric["correlation_squared"]))
+    ]
+    if not eligible:
+        raise RuntimeError(
+            "No converged candidate-KKT Lasso path point has finite validation R2."
+        )
+    return max(
+        eligible,
+        key=lambda index: (
+            float(metrics[index]["correlation_squared"]),
+            -int(path_rows[index]["k"]),
+            float(path_rows[index]["lam_ratio"]),
+        ),
+    )
+
+
+def _materialize_validation_selected_lasso(
+    lasso_path: dict,
+    metrics: list[dict],
+    *,
+    selected_index: int,
+    path_prediction_pcg_res: float,
+    path_prediction_pcg_iters: int,
+) -> tuple[dict, dict]:
+    """Make one validation-selected path row the alpha used downstream."""
+    path_rows = list(lasso_path["path"])
+    index = int(selected_index)
+    if not 0 <= index < len(path_rows) or len(metrics) != len(path_rows):
+        raise ValueError("Validation-selected path index is out of range.")
+    beta_snp_path = np.asarray(lasso_path["beta_snp_path"], dtype=np.float64)
+    beta_cov_path = np.asarray(lasso_path["beta_cov_path"], dtype=np.float64)
+    if beta_snp_path.shape[0] != len(path_rows) or beta_cov_path.shape[0] != len(
+        path_rows
+    ):
+        raise ValueError("Lasso coefficient paths do not align with diagnostics.")
+
+    selected_row = path_rows[index]
+    if not (
+        bool(selected_row.get("converged", False))
+        and bool(selected_row.get("kkt_passed", False))
+    ):
+        raise RuntimeError(
+            "Validation-selected Lasso path point is not candidate-KKT converged."
+        )
+    beta_snp = beta_snp_path[index].copy()
+    beta_cov = beta_cov_path[index].copy()
+    active_idx = np.flatnonzero(beta_snp != 0.0).astype(np.int64)
+    selected_metric = dict(metrics[index])
+    merged_path = merge_path_diagnostics(path_rows, metrics)
+    selection_record = {
+        "selection_metric": (
+            "squared_pearson_correlation_total_phenotype_prediction"
+        ),
+        "selected": {
+            "path_index": index,
+            "lam": float(selected_row["lam"]),
+            "lam_ratio": float(selected_row["lam_ratio"]),
+            "support_size": int(active_idx.size),
+            **selected_metric,
+        },
+        "path_prediction_pcg_reported_res": float(path_prediction_pcg_res),
+        "path_prediction_pcg_iters": int(path_prediction_pcg_iters),
+        "path": merged_path,
+    }
+
+    selected = dict(lasso_path)
+    selected.update(
+        {
+            "beta_cov": beta_cov,
+            "beta_snp": beta_snp,
+            "active_idx": active_idx,
+            "lam": float(selected_row["lam"]),
+            "selected_index": index,
+            "selection_method": "validation_r2",
+            "selected_lam_ratio": float(selected_row["lam_ratio"]),
+            "validation_selection": selection_record,
+        }
+    )
+    return selected, selection_record
+
+
+def _select_lasso_by_validation_prediction(
+    *,
+    args,
+    fitter,
+    prediction_context: _PredictionFitContext,
+    y_train: np.ndarray,
+    train_covar: np.ndarray | None,
+    train_candidate: np.ndarray,
+    candidate: np.ndarray,
+    lasso_path: dict,
+    theta_standardized: np.ndarray,
+    phenotype_scale: float,
+    validation_outcome: np.ndarray,
+) -> tuple[dict, dict]:
+    """Evaluate the complete path and return the validation-selected alpha."""
+    validation_candidate = (
+        prediction_context.grm_index.extract_standardized_columns(candidate)
+        .astype(np.float32, copy=False)
+    )
+    path_prediction = predict_sparse_path_partitioned(
+        fitter=fitter,
+        test_fitter=prediction_context.fitter,
+        y_train_raw=y_train,
+        train_covar=train_covar,
+        test_covar=prediction_context.covar,
+        train_candidate_geno=train_candidate,
+        test_candidate_geno=validation_candidate,
+        beta_cov_path_raw=lasso_path["beta_cov_path"],
+        beta_candidate_path_raw=lasso_path["beta_snp_path"],
+        theta_standardized=theta_standardized,
+        phenotype_scale=float(phenotype_scale),
+        pcg_tol=float(args.pcg_tol),
+        max_pcg_iters=int(args.max_pcg_iters),
+    )
+    metrics = evaluate_prediction_path(
+        path_prediction.phenotype_prediction_raw,
+        validation_outcome,
+    )
+    selected_index = _select_converged_validation_path_index(
+        list(lasso_path["path"]), metrics
+    )
+    return _materialize_validation_selected_lasso(
+        lasso_path,
+        metrics,
+        selected_index=selected_index,
+        path_prediction_pcg_res=float(path_prediction.pcg_rel_res),
+        path_prediction_pcg_iters=int(path_prediction.pcg_iters),
+    )
+
+
+def _write_iterative_validation_output(
+    *,
+    output_path: str,
+    phenotype_path: str,
+    validation_outcome: np.ndarray,
+    selection_trace: list[dict[str, object]],
+    final_lasso: dict,
+    final_candidate: np.ndarray,
+    grm_index: MultiGRMIndex,
+    theta_standardized: np.ndarray,
+    phenotype_scale: float,
+    outer_converged: bool,
+    outer_stop_reason: str,
+) -> dict[str, object]:
+    """Write the audit proving validation selection occurred in every round."""
+    if not selection_trace:
+        raise RuntimeError("Iterative validation selection trace is empty.")
+    final_selection = final_lasso.get("validation_selection")
+    if not isinstance(final_selection, dict):
+        raise RuntimeError("Final Lasso lacks iterative validation diagnostics.")
+    candidate = np.asarray(final_candidate, dtype=np.int64).reshape(-1)
+    active_local = np.asarray(final_lasso["active_idx"], dtype=np.int64).reshape(-1)
+    support = candidate[active_local]
+    selected = {
+        **dict(final_selection["selected"]),
+        "lam_max": float(final_lasso["lam_max"]),
+        "support_indices": support.tolist(),
+        "support_source_indices": (
+            grm_index.source_variant_indices(support).tolist()
+        ),
+    }
+    payload = {
+        "schema_version": 2,
+        "selection_role": "inside_every_alpha_theta_outer_iteration",
+        "selection_metric": (
+            "squared_pearson_correlation_total_phenotype_prediction"
+        ),
+        "test_phenotype_used": False,
+        "validation_phenotype_path": os.path.abspath(phenotype_path),
+        "n_validation_samples": int(
+            np.asarray(validation_outcome).reshape(-1).size
+        ),
+        "phenotype_scale": float(phenotype_scale),
+        "outer_converged": bool(outer_converged),
+        "outer_stop_reason": str(outer_stop_reason),
+        "theta_standardized_final": np.asarray(
+            theta_standardized, dtype=np.float64
+        ).tolist(),
+        "n_path_selections": int(len(selection_trace)),
+        "outer_selection_trace": selection_trace,
+        "final_selected": selected,
+        "path": list(final_selection["path"]),
+    }
+    output_paths = write_selection_outputs(
+        output_path, _json_safe_value(payload)
+    )
+    return {
+        "requested": True,
+        "status": "emitted",
+        "selection_role": payload["selection_role"],
+        "selection_metric": payload["selection_metric"],
+        "selected_lam_ratio": float(selected["lam_ratio"]),
+        "selected_support_size": int(selected["support_size"]),
+        "validation_correlation_squared": float(
+            selected["correlation_squared"]
+        ),
+        "n_path_selections": int(len(selection_trace)),
+        "outputs": output_paths,
+    }
 
 
 def _expand_selected_basis_coefficients(
@@ -1300,7 +1673,7 @@ def _sparse_output_contract(comparison_enabled: bool) -> dict[str, object]:
     """Return the mode-labelled sparse output contract for one run."""
     if comparison_enabled:
         return {
-            "sparse_output_schema_version": 5,
+            "sparse_output_schema_version": 6,
             "estimator_mode": "four_estimator_comparison",
             "computed_estimators": [
                 "h2_lasso_plugin",
@@ -1324,7 +1697,7 @@ def _sparse_output_contract(comparison_enabled: bool) -> dict[str, object]:
             ],
         }
     return {
-        "sparse_output_schema_version": 5,
+        "sparse_output_schema_version": 6,
         "estimator_mode": "coherit",
         "computed_estimators": ["h2_chive"],
         "selected_snp_columns": [
@@ -1564,12 +1937,16 @@ def _build_lasso_candidate(
     previous_support: np.ndarray,
     screened_indices: np.ndarray,
     candidate_target: int,
+    previous_candidate: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Keep the complete previous support, then fill from the new screen.
+    """Reuse the certified candidate and add the current screened seed.
 
-    ``candidate_target`` is a minimum seed size, not a cap.  In particular,
-    a valid Lasso support is never truncated merely because it is larger than
-    the initial screening target.
+    On the first outer iteration, ``candidate_target`` is the minimum seed
+    size after retaining any supplied support.  Once a complete candidate has
+    passed the outside-marker KKT check, later outer iterations keep that
+    candidate and union it with the first ``candidate_target`` entries from
+    the current score screen.  This avoids rebuilding the same candidate by
+    repeated full-path KKT refinements after every covariance update.
     """
     target = int(candidate_target)
     if target <= 0:
@@ -1577,19 +1954,147 @@ def _build_lasso_candidate(
 
     keep_list: list[int] = []
     seen: set[int] = set()
+    cached = (
+        np.empty((0,), dtype=np.int64)
+        if previous_candidate is None
+        else np.asarray(previous_candidate, dtype=np.int64).reshape(-1)
+    )
+    for value in cached:
+        index = int(value)
+        if index not in seen:
+            keep_list.append(index)
+            seen.add(index)
     for value in np.asarray(previous_support, dtype=np.int64).reshape(-1):
         index = int(value)
         if index not in seen:
             keep_list.append(index)
             seen.add(index)
-    for value in np.asarray(screened_indices, dtype=np.int64).reshape(-1):
-        if len(keep_list) >= target:
+    screened = np.asarray(screened_indices, dtype=np.int64).reshape(-1)
+    screen_limit = min(target, int(screened.size))
+    for value in screened[:screen_limit]:
+        # With no reusable candidate, the target is the desired total seed
+        # size.  With a reusable candidate, it is the size of the fresh score
+        # seed to union with that candidate.
+        if cached.size == 0 and len(keep_list) >= target:
             break
         index = int(value)
         if index not in seen:
             keep_list.append(index)
             seen.add(index)
     return np.asarray(sorted(keep_list), dtype=np.int64)
+
+
+def _remap_lasso_beta_path(
+    *,
+    previous_candidate: np.ndarray,
+    previous_beta_path: np.ndarray | None,
+    candidate: np.ndarray,
+) -> tuple[np.ndarray | None, int]:
+    """Map a prior coefficient path into the current global-SNP basis."""
+    if previous_beta_path is None:
+        return None, 0
+    previous = np.asarray(previous_candidate, dtype=np.int64).reshape(-1)
+    current = np.asarray(candidate, dtype=np.int64).reshape(-1)
+    beta_path = np.asarray(previous_beta_path, dtype=np.float64)
+    if beta_path.ndim != 2 or beta_path.shape[1] != previous.size:
+        raise ValueError(
+            "Previous Lasso coefficient path does not align with its candidate."
+        )
+    if beta_path.shape[0] < 1 or not np.all(np.isfinite(beta_path)):
+        raise ValueError(
+            "Previous Lasso coefficient path must be finite and non-empty."
+        )
+    if previous.size == 0 or current.size == 0:
+        return None, 0
+    common, previous_pos, current_pos = np.intersect1d(
+        previous,
+        current,
+        assume_unique=True,
+        return_indices=True,
+    )
+    if common.size == 0:
+        return None, 0
+    mapped = np.zeros(
+        (int(beta_path.shape[0]), int(current.size)), dtype=np.float64
+    )
+    mapped[:, current_pos] = beta_path[:, previous_pos]
+    return mapped, int(common.size)
+
+
+def _buffered_kkt_expansion_indices(
+    *,
+    score_abs: np.ndarray,
+    candidate: np.ndarray,
+    violators: np.ndarray,
+    max_add: int,
+) -> dict[str, object]:
+    """Choose strict KKT violators plus a small near-threshold look-ahead.
+
+    The configured ``max_add`` remains the hard per-round budget.  When all
+    strict violators fit, the batch is enlarged adaptively to at least the
+    square root of that budget and at most twice the strict-violator count.
+    This catches the common cascade of one-digit follow-up violations without
+    inflating every candidate by a full ``max_add`` block.
+    """
+    scores = np.asarray(score_abs, dtype=np.float64).reshape(-1)
+    current = np.asarray(candidate, dtype=np.int64).reshape(-1)
+    strict = np.unique(
+        np.asarray(violators, dtype=np.int64).reshape(-1)
+    )
+    budget = int(max_add)
+    if budget < 1:
+        raise ValueError("max_add must be >= 1.")
+    if not np.all(np.isfinite(scores)) or np.any(scores < 0.0):
+        raise ValueError("score_abs must contain finite nonnegative values.")
+    for name, indices in (("candidate", current), ("violators", strict)):
+        if np.any(indices < 0) or np.any(indices >= scores.size):
+            raise ValueError(f"{name} contains an out-of-range marker index.")
+    if strict.size == 0:
+        return {
+            "add_indices": np.empty((0,), dtype=np.int64),
+            "n_strict_added": 0,
+            "n_buffered_added": 0,
+        }
+    if np.intersect1d(current, strict, assume_unique=True).size > 0:
+        raise ValueError("KKT violators must lie outside the candidate set.")
+
+    n_strict_added = min(int(strict.size), budget)
+    strict_order = np.argsort(scores[strict], kind="stable")[-n_strict_added:]
+    selected_strict = strict[strict_order]
+
+    target_size = n_strict_added
+    if strict.size <= budget:
+        target_size = min(
+            budget,
+            max(
+                int(strict.size) * 2,
+                int(np.ceil(np.sqrt(float(budget)))),
+            ),
+        )
+    n_buffer = max(int(target_size) - n_strict_added, 0)
+    buffered = np.empty((0,), dtype=np.int64)
+    if n_buffer > 0:
+        eligible = np.ones(scores.size, dtype=bool)
+        eligible[current] = False
+        eligible[strict] = False
+        pool = np.flatnonzero(eligible)
+        n_buffer = min(n_buffer, int(pool.size))
+        if n_buffer > 0:
+            if n_buffer == pool.size:
+                buffered = pool
+            else:
+                local = np.argpartition(scores[pool], -n_buffer)[-n_buffer:]
+                buffered = pool[local]
+
+    add_indices = np.unique(
+        np.concatenate([selected_strict, buffered])
+    ).astype(np.int64)
+    add_indices.sort()
+    return {
+        "add_indices": add_indices,
+        "n_strict_added": int(selected_strict.size),
+        "n_buffered_added": int(buffered.size),
+    }
 
 
 def _parse_variance_components_init(
@@ -1782,388 +2287,6 @@ def _compute_adaptive_marker_scores(
     }
 
 
-def _run_sparsity_validation_selection(
-    *,
-    args,
-    fitter,
-    prediction_fitter,
-    ops,
-    grm_index: MultiGRMIndex,
-    prediction_grm_index: MultiGRMIndex,
-    y_train: np.ndarray,
-    train_covar: np.ndarray | None,
-    validation_covar: np.ndarray | None,
-    validation_ids: list[str],
-    theta_standardized: np.ndarray,
-    phenotype_scale: float,
-    initial_candidate: np.ndarray,
-    path_cfg: LassoPathConfig,
-) -> dict[str, object]:
-    """Select a Lasso path point by validation prediction and certify it."""
-    if (
-        getattr(fitter, "_partitioned_streamer", None) is None
-        or getattr(prediction_fitter, "_partitioned_streamer", None) is None
-    ):
-        raise ValueError(
-            "Validation path selection requires a single-source component "
-            "partition."
-        )
-
-    y = np.asarray(y_train, dtype=np.float64).reshape(-1)
-    theta = np.asarray(theta_standardized, dtype=np.float64).reshape(-1)
-    candidate = np.unique(
-        np.asarray(initial_candidate, dtype=np.int64).reshape(-1)
-    )
-    if candidate.size < 1:
-        raise RuntimeError(
-            "Validation path selection requires a non-empty final candidate."
-        )
-    if np.any(candidate < 0) or np.any(candidate >= grm_index.m_total):
-        raise ValueError("Initial validation candidate is out of range.")
-
-    validation_outcome = read_phenotype_aligned(
-        args.sparsity_validation_pheno_txt,
-        validation_ids,
-    )
-    theta_dev = jnp.asarray(theta, dtype=jnp.float32)
-    fitter._ensure_projected_core_precond_ready(
-        ops, var_components_init=theta_dev
-    )
-    hv = fitter._make_hv(ops, theta_dev[:-1], theta_dev[-1])
-    precond = fitter._make_effect_precond(
-        ops, theta_dev[:-1], theta_dev[-1]
-    )
-
-    base_parts = [y[:, None]]
-    n_covar = 0
-    if train_covar is not None:
-        base_parts.append(np.asarray(train_covar, dtype=np.float64))
-        n_covar = int(train_covar.shape[1])
-    base_rhs = np.concatenate(base_parts, axis=1).astype(
-        np.float32, copy=False
-    )
-    base_rhs_dev = jnp.asarray(base_rhs, dtype=jnp.float32)
-    base_solution, base_reported_res, base_iters = pcg_solve(
-        hv,
-        base_rhs_dev,
-        M=precond,
-        tol=float(args.pcg_tol),
-        maxiter=int(args.max_pcg_iters),
-    )
-    _require_pcg_converged(
-        base_reported_res,
-        tol=float(args.pcg_tol),
-        iters=base_iters,
-        maxiter=int(args.max_pcg_iters),
-        stage="validation path base solve",
-    )
-    base_true_res = _true_pcg_relative_residual(
-        hv, base_rhs_dev, base_solution
-    )
-    if not np.isfinite(base_true_res):
-        raise RuntimeError("Validation path base solve has non-finite residual.")
-    base_solution_np = np.asarray(base_solution, dtype=np.float64)
-    Hinv_y = base_solution_np[:, 0]
-    Hinv_covar = (
-        base_solution_np[:, 1 : 1 + n_covar]
-        if n_covar > 0
-        else None
-    )
-
-    candidate_warm: dict[int, np.ndarray] = {}
-    expansion_trace: list[dict[str, object]] = []
-    accepted: dict[str, object] | None = None
-    final_lasso_path = None
-    final_path_prediction = None
-    final_metrics = None
-    final_selected_index = -1
-
-    for round_index in range(1, int(args.kkt_max_rounds) + 1):
-        train_candidate = grm_index.extract_standardized_columns(
-            candidate
-        ).astype(np.float32, copy=False)
-        candidate_rhs = jnp.asarray(train_candidate, dtype=jnp.float32)
-        candidate_x0 = None
-        if candidate_warm:
-            warm = np.zeros_like(train_candidate, dtype=np.float32)
-            hit = 0
-            for column, marker_index in enumerate(candidate.tolist()):
-                previous = candidate_warm.get(int(marker_index))
-                if previous is not None:
-                    warm[:, column] = previous
-                    hit += 1
-            if hit:
-                candidate_x0 = jnp.asarray(warm, dtype=jnp.float32)
-
-        candidate_solution, candidate_reported_res, candidate_iters = pcg_solve(
-            hv,
-            candidate_rhs,
-            M=precond,
-            tol=float(args.pcg_tol),
-            maxiter=int(args.max_pcg_iters),
-            X0=candidate_x0,
-        )
-        _require_pcg_converged(
-            candidate_reported_res,
-            tol=float(args.pcg_tol),
-            iters=candidate_iters,
-            maxiter=int(args.max_pcg_iters),
-            stage=f"validation path candidate round {round_index}",
-        )
-        candidate_true_res = _true_pcg_relative_residual(
-            hv, candidate_rhs, candidate_solution
-        )
-        if not np.isfinite(candidate_true_res):
-            raise RuntimeError(
-                "Validation path candidate solve has non-finite residual."
-            )
-        candidate_solution_np = np.asarray(
-            candidate_solution, dtype=np.float32
-        )
-        candidate_warm = {
-            int(marker_index): candidate_solution_np[:, column]
-            for column, marker_index in enumerate(candidate.tolist())
-        }
-
-        p_for_ebic = (
-            int(candidate.size)
-            if args.ebic_p_mode == "candidate"
-            else int(grm_index.m_total)
-        )
-        lasso_path = fit_weighted_lasso_with_covariates(
-            y=y,
-            covar=train_covar,
-            geno=train_candidate,
-            Hinv_y=Hinv_y,
-            Hinv_covar=Hinv_covar,
-            Hinv_geno=candidate_solution_np,
-            p_total=p_for_ebic,
-            cfg=path_cfg,
-            ridge=float(args.lasso_ridge),
-        )
-        validation_candidate = (
-            prediction_grm_index.extract_standardized_columns(candidate)
-            .astype(np.float32, copy=False)
-        )
-        path_prediction = predict_sparse_path_partitioned(
-            fitter=fitter,
-            test_fitter=prediction_fitter,
-            y_train_raw=y,
-            train_covar=train_covar,
-            test_covar=validation_covar,
-            train_candidate_geno=train_candidate,
-            test_candidate_geno=validation_candidate,
-            beta_cov_path_raw=lasso_path["beta_cov_path"],
-            beta_candidate_path_raw=lasso_path["beta_snp_path"],
-            theta_standardized=theta,
-            phenotype_scale=float(phenotype_scale),
-            pcg_tol=float(args.pcg_tol),
-            max_pcg_iters=int(args.max_pcg_iters),
-        )
-        metrics = evaluate_prediction_path(
-            path_prediction.phenotype_prediction_raw,
-            validation_outcome,
-        )
-        selected_index = select_validation_path_index(
-            lasso_path["path"], metrics
-        )
-        selected_row = lasso_path["path"][selected_index]
-        selected_beta = np.asarray(
-            lasso_path["beta_snp_path"][selected_index],
-            dtype=np.float64,
-        )
-        if not (
-            bool(selected_row.get("converged", False))
-            and bool(selected_row.get("kkt_passed", False))
-        ):
-            raise RuntimeError(
-                "Validation-selected path point failed candidate KKT "
-                "convergence."
-            )
-
-        selected_dual = jnp.asarray(
-            path_prediction.dual_raw_objective_scale[:, selected_index],
-            dtype=jnp.float32,
-        )
-        score_signed = np.asarray(
-            grm_index.xtv_all(selected_dual, normalize=False),
-            dtype=np.float64,
-        )
-        partitioned = _partitioned_lasso_kkt_from_scores(
-            score=score_signed,
-            candidate=candidate,
-            beta_candidate=selected_beta,
-            lam=float(selected_row["lam"]),
-            abs_tol=float(args.kkt_tol),
-            rel_tol=float(args.kkt_rel_tol),
-        )
-        violators = np.asarray(
-            partitioned["outside_violators"], dtype=np.int64
-        )
-        n_add = min(int(args.kkt_add_topk), int(violators.size))
-        added = np.empty((0,), dtype=np.int64)
-        if n_add:
-            added = violators[
-                np.argsort(np.abs(score_signed[violators]))[-n_add:]
-            ]
-            added = np.sort(added.astype(np.int64, copy=False))
-        selected_metric = metrics[selected_index]
-        round_record = {
-            "round": int(round_index),
-            "candidate_size": int(candidate.size),
-            "selected_path_index": int(selected_index),
-            "selected_lam": float(selected_row["lam"]),
-            "selected_lam_ratio": float(selected_row["lam_ratio"]),
-            "selected_support_size": int(np.count_nonzero(selected_beta)),
-            "validation_correlation_squared": float(
-                selected_metric["correlation_squared"]
-            ),
-            "max_outside_score": float(partitioned["max_outside_score"]),
-            "kkt_threshold": float(partitioned["threshold"]),
-            "n_outside_violators": int(violators.size),
-            "added_indices": added.tolist(),
-            "added_source_indices": (
-                grm_index.source_variant_indices(added).tolist()
-                if added.size
-                else []
-            ),
-            "candidate_pcg_reported_res": float(
-                np.asarray(candidate_reported_res)
-            ),
-            "candidate_pcg_true_res": float(candidate_true_res),
-            "candidate_pcg_iters": int(candidate_iters),
-            "path_prediction_pcg_reported_res": float(
-                path_prediction.pcg_rel_res
-            ),
-            "path_prediction_pcg_iters": int(path_prediction.pcg_iters),
-            "decision": "accept" if not violators.size else "expand_candidate",
-        }
-        expansion_trace.append(round_record)
-        logger.info(
-            "[validation sparsity %s] cand=%s selected_ratio=%.6g "
-            "active=%s val_r2=%.6g violators=%s decision=%s",
-            round_index,
-            candidate.size,
-            float(selected_row["lam_ratio"]),
-            int(np.count_nonzero(selected_beta)),
-            float(selected_metric["correlation_squared"]),
-            violators.size,
-            round_record["decision"],
-        )
-
-        final_lasso_path = lasso_path
-        final_path_prediction = path_prediction
-        final_metrics = metrics
-        final_selected_index = int(selected_index)
-        if not violators.size:
-            accepted = dict(partitioned)
-            break
-
-        candidate = np.unique(np.concatenate([candidate, added])).astype(
-            np.int64
-        )
-        candidate.sort()
-        max_candidate = int(args.kkt_max_candidate)
-        if max_candidate > 0 and candidate.size > max_candidate:
-            raise RuntimeError(
-                "Validation KKT expansion exceeded --kkt-max-candidate "
-                f"({candidate.size} > {max_candidate})."
-            )
-
-    if (
-        accepted is None
-        or final_lasso_path is None
-        or final_path_prediction is None
-        or final_metrics is None
-        or final_selected_index < 0
-    ):
-        raise RuntimeError(
-            "Validation-selected Lasso point was not globally KKT certified "
-            f"within {int(args.kkt_max_rounds)} rounds."
-        )
-
-    selected_row = final_lasso_path["path"][final_selected_index]
-    selected_beta = np.asarray(
-        final_lasso_path["beta_snp_path"][final_selected_index],
-        dtype=np.float64,
-    )
-    support_local = np.flatnonzero(selected_beta != 0.0).astype(np.int64)
-    selected_support = candidate[support_local]
-    merged_path = merge_path_diagnostics(
-        final_lasso_path["path"], final_metrics
-    )
-    selected_metric = final_metrics[final_selected_index]
-    payload = {
-        "schema_version": 1,
-        "selection_role": "validation_only",
-        "selection_metric": "squared_pearson_correlation_total_phenotype_prediction",
-        "test_phenotype_used": False,
-        "validation_phenotype_path": os.path.abspath(
-            args.sparsity_validation_pheno_txt
-        ),
-        "n_validation_samples": int(validation_outcome.size),
-        "theta_standardized_fixed": theta.tolist(),
-        "phenotype_scale": float(phenotype_scale),
-        "path_config": {
-            "lam_min_ratio": float(path_cfg.lam_min_ratio),
-            "n_lambda_requested": int(path_cfg.n_lambda),
-            "n_lambda_evaluated": int(len(merged_path)),
-            "ebic_gamma": float(path_cfg.ebic_gamma),
-            "ebic_early_stop": bool(path_cfg.ebic_early_stop),
-        },
-        "base_pcg": {
-            "reported_relative_residual": float(
-                np.asarray(base_reported_res)
-            ),
-            "true_relative_residual": float(base_true_res),
-            "iterations": int(base_iters),
-        },
-        "candidate_expansion": expansion_trace,
-        "final_candidate_size": int(candidate.size),
-        "final_candidate_indices": candidate.tolist(),
-        "final_candidate_source_indices": (
-            grm_index.source_variant_indices(candidate).tolist()
-        ),
-        "selected": {
-            "path_index": int(final_selected_index),
-            "lam": float(selected_row["lam"]),
-            "lam_max": float(final_lasso_path["lam_max"]),
-            "lam_ratio": float(selected_row["lam_ratio"]),
-            "support_size": int(selected_support.size),
-            "support_indices": selected_support.tolist(),
-            "support_source_indices": (
-                grm_index.source_variant_indices(selected_support).tolist()
-            ),
-            **dict(selected_metric),
-        },
-        "global_kkt": {
-            "passed": True,
-            "candidate_certificate": accepted["candidate_certificate"],
-            "full_certificate": accepted["full_certificate"],
-            "max_outside_score": accepted["max_outside_score"],
-            "threshold": accepted["threshold"],
-        },
-        "path": merged_path,
-    }
-    safe_payload = _json_safe_value(payload)
-    output_paths = write_selection_outputs(
-        args.sparsity_validation_out, safe_payload
-    )
-    return {
-        "requested": True,
-        "status": "emitted",
-        "selection_metric": payload["selection_metric"],
-        "selected_lam_ratio": float(selected_row["lam_ratio"]),
-        "selected_support_size": int(selected_support.size),
-        "validation_correlation_squared": float(
-            selected_metric["correlation_squared"]
-        ),
-        "final_candidate_size": int(candidate.size),
-        "kkt_rounds": int(len(expansion_trace)),
-        "outputs": output_paths,
-    }
-
-
 def main() -> None:
     args = parse_args()
     if int(args.screen_topk) < int(args.candidate_k):
@@ -2196,6 +2319,14 @@ def main() -> None:
         raise SystemExit("pcg-tol must be finite and > 0.")
     if args.marker_score_out and int(args.marker_score_probes) < 1:
         raise SystemExit("marker-score-probes must be >= 1.")
+    if args.marker_score_min_validation_r2 is not None:
+        threshold = float(args.marker_score_min_validation_r2)
+        if not np.isfinite(threshold):
+            raise SystemExit("marker-score-min-validation-r2 must be finite.")
+        if not args.marker_score_out:
+            raise SystemExit(
+                "--marker-score-min-validation-r2 requires --marker-score-out."
+            )
     if (
         not np.isfinite(float(args.lasso_lam_min_ratio))
         or not 0.0 < float(args.lasso_lam_min_ratio) <= 1.0
@@ -2203,15 +2334,22 @@ def main() -> None:
         raise SystemExit("lasso-lam-min-ratio must lie in (0, 1].")
     if int(args.lasso_n_lambda) < 1:
         raise SystemExit("lasso-n-lambda must be >= 1.")
-    if args.lasso_selection_mode == "fixed_ratio":
+    fixed_ratio_refit = args.lasso_fixed_lam_ratio is not None
+    iterative_validation_selection = not fixed_ratio_refit
+    if (
+        args.marker_score_min_validation_r2 is not None
+        and not iterative_validation_selection
+    ):
+        raise SystemExit(
+            "Conditional marker-score emission requires validation-lambda selection."
+        )
+    if fixed_ratio_refit:
         if (
-            args.lasso_fixed_lam_ratio is None
-            or not np.isfinite(float(args.lasso_fixed_lam_ratio))
+            not np.isfinite(float(args.lasso_fixed_lam_ratio))
             or not 0.0 < float(args.lasso_fixed_lam_ratio) <= 1.0
         ):
             raise SystemExit(
-                "fixed_ratio selection requires --lasso-fixed-lam-ratio "
-                "in (0, 1]."
+                "--lasso-fixed-lam-ratio must lie in (0, 1]."
             )
         if float(args.lasso_fixed_lam_ratio) < float(
             args.lasso_lam_min_ratio
@@ -2220,11 +2358,6 @@ def main() -> None:
                 "lasso-fixed-lam-ratio must be at least "
                 "--lasso-lam-min-ratio so it lies on the fitted path."
             )
-    elif args.lasso_fixed_lam_ratio is not None:
-        raise SystemExit(
-            "--lasso-fixed-lam-ratio is only valid with "
-            "--lasso-selection-mode fixed_ratio."
-        )
 
     sparsity_validation_requested = bool(
         args.sparsity_validation_pheno_txt
@@ -2236,13 +2369,20 @@ def main() -> None:
         raise SystemExit(
             "--sparsity-validation-pheno-txt and "
             "--sparsity-validation-out must be supplied together."
+    )
+    if iterative_validation_selection and not sparsity_validation_requested:
+        raise SystemExit(
+            "Sparse fitting requires both --sparsity-validation-pheno-txt "
+            "and --sparsity-validation-out so validation R2 can select "
+            "lambda inside every outer iteration. For a final refit, supply "
+            "--lasso-fixed-lam-ratio instead."
         )
-    if sparsity_validation_requested:
-        if args.lasso_selection_mode != "ebic":
-            raise SystemExit(
-                "Validation path scanning must use --lasso-selection-mode "
-                "ebic; use fixed_ratio only for the final refit."
-            )
+    if fixed_ratio_refit and sparsity_validation_requested:
+        raise SystemExit(
+            "Validation selection inputs and --lasso-fixed-lam-ratio are "
+            "mutually exclusive stages."
+        )
+    if iterative_validation_selection:
         if not os.path.exists(args.sparsity_validation_pheno_txt):
             raise SystemExit(
                 "--sparsity-validation-pheno-txt does not exist: "
@@ -2578,24 +2718,69 @@ def main() -> None:
     )
 
     path_cfg = LassoPathConfig(
-        lam_min_ratio=args.lasso_lam_min_ratio, n_lambda=args.lasso_n_lambda,
-        ebic_gamma=args.lasso_ebic_gamma, max_cd_iter=args.lasso_cd_max_iter,
-        ebic_early_stop=args.lasso_ebic_early_stop,
-        ebic_early_stop_patience=LASSO_EBIC_ES_PATIENCE_FIXED,
-        ebic_early_stop_min_delta=args.lasso_ebic_es_min_delta,
-        cd_tol=args.lasso_cd_tol, active_set_period=args.lasso_active_set_period,
-        kkt_abs_tol=args.kkt_tol, kkt_rel_tol=args.kkt_rel_tol,
-        selection_mode=args.lasso_selection_mode,
+        lam_min_ratio=args.lasso_lam_min_ratio,
+        n_lambda=args.lasso_n_lambda,
+        max_cd_iter=args.lasso_cd_max_iter,
+        cd_tol=args.lasso_cd_tol,
+        active_set_period=args.lasso_active_set_period,
+        kkt_abs_tol=args.kkt_tol,
+        kkt_rel_tol=args.kkt_rel_tol,
         fixed_lam_ratio=args.lasso_fixed_lam_ratio,
         verbose=args.verbose,
     )
 
+    if iterative_validation_selection:
+        logger.info(
+            "[validation alpha] complete Lasso path will be evaluated inside "
+            "every alpha/theta outer iteration."
+        )
+
+    prediction_context: _PredictionFitContext | None = None
+    validation_outcome: np.ndarray | None = None
+    iterative_validation_trace: list[dict[str, object]] = []
+    if iterative_validation_selection:
+        prediction_context = _build_prediction_fit_context(
+            args=args,
+            training_fitter=fitter,
+            component_variant_indices=component_variant_indices,
+            prediction_bed_list=prediction_bed_list,
+            prediction_pgen_prefix=prediction_pgen_prefix,
+            covar_transform=covar_transform,
+            call_width=call_width,
+            cpu_threads=cpu_threads,
+            gpu_budget_bytes=gpu_budget_bytes,
+            ring_depth=plan.ring_depth,
+        )
+        validation_outcome = read_phenotype_aligned(
+            args.sparsity_validation_pheno_txt,
+            prediction_context.sample_ids,
+        )
+        logger.info(
+            "[validation alpha] aligned validation phenotype for %s samples.",
+            int(validation_outcome.size),
+        )
+
     support = np.array([], dtype=np.int64)
+    candidate_cache = np.array([], dtype=np.int64)
     previous_fixed_mean = None
     history: list[dict] = []
 
     warm_screen = None
     warm_z_dict: dict[int, np.ndarray] = {}
+    warm_lasso_candidate = np.array([], dtype=np.int64)
+    warm_lasso_beta_path: np.ndarray | None = None
+    sparse_path_performance = {
+        "candidate_reuse_across_outer": True,
+        "buffered_kkt_expansion": True,
+        "lasso_path_coefficient_warm_start": True,
+        "lasso_path_solves": 0,
+        "lasso_cd_iterations": 0,
+        "lasso_path_warm_start_rows_used": 0,
+        "outer_start_candidate_columns_reused": 0,
+        "outer_start_screen_columns_added": 0,
+        "kkt_strict_violators_added": 0,
+        "kkt_buffered_markers_added": 0,
+    }
 
     final_candidate = np.array([], dtype=np.int64)
     final_lasso = None
@@ -2690,12 +2875,61 @@ def main() -> None:
 
         candidate_seed = top_idx[:candidate_target]
 
-        # ``candidate_target`` controls only the new screen seed.  The entire
-        # previously selected support is retained even when it is larger.
+        # Keep the complete KKT-certified candidate from the preceding outer
+        # update, not merely its active support.  Unioning the current score
+        # seed still admits markers whose ranking changed with the covariance.
         candidate = _build_lasso_candidate(
             previous_support=support,
             screened_indices=candidate_seed,
             candidate_target=candidate_target,
+            previous_candidate=candidate_cache,
+        )
+        max_candidate = int(args.kkt_max_candidate)
+        if max_candidate > 0 and candidate.size > max_candidate:
+            retained = np.unique(
+                np.concatenate([candidate_cache, support])
+            ).astype(np.int64)
+            if retained.size > max_candidate:
+                raise RuntimeError(
+                    "Previously certified candidate exceeds "
+                    f"--kkt-max-candidate ({retained.size} > {max_candidate})."
+                )
+            retained_set = set(retained.tolist())
+            available = max_candidate - int(retained.size)
+            fresh = [
+                int(index)
+                for index in candidate_seed.tolist()
+                if int(index) not in retained_set
+            ][:available]
+            candidate = np.unique(
+                np.concatenate(
+                    [retained, np.asarray(fresh, dtype=np.int64)]
+                )
+            ).astype(np.int64)
+
+        reused_candidate_columns = int(
+            np.intersect1d(
+                candidate, candidate_cache, assume_unique=True
+            ).size
+        )
+        screen_columns_added = int(
+            np.setdiff1d(
+                candidate, candidate_cache, assume_unique=True
+            ).size
+        )
+        sparse_path_performance[
+            "outer_start_candidate_columns_reused"
+        ] += reused_candidate_columns
+        sparse_path_performance[
+            "outer_start_screen_columns_added"
+        ] += screen_columns_added
+        logger.info(
+            "[outer %s%s] candidate seed: reused=%s fresh=%s total=%s",
+            outer,
+            " final" if final_alignment else "",
+            reused_candidate_columns,
+            screen_columns_added,
+            int(candidate.size),
         )
 
         # ---- Step 3/4: candidate LASSO with global KKT refinement ----------
@@ -2791,23 +3025,133 @@ def main() -> None:
                 for j, snp_idx in enumerate(candidate.tolist())
             }
 
-            p_for_ebic = (
-                int(candidate.size)
-                if args.ebic_p_mode == "candidate"
-                else grm_index.m_total
+            beta_snp_path0, warm_lasso_columns = _remap_lasso_beta_path(
+                previous_candidate=warm_lasso_candidate,
+                previous_beta_path=warm_lasso_beta_path,
+                candidate=candidate,
             )
+            # Coefficient-path reuse is deliberately restricted to an
+            # unchanged marker basis.  On an expanded basis the ordinary
+            # descending-lambda warm start is often faster in strong LD; the
+            # reusable candidate set, PCG columns and KKT buffer already avoid
+            # the expensive reconstruction work in that case.
+            if not (
+                warm_lasso_columns == int(candidate.size)
+                and warm_lasso_columns == int(warm_lasso_candidate.size)
+            ):
+                beta_snp_path0 = None
+                warm_lasso_columns = 0
+
             try:
-                lasso = fit_weighted_lasso_with_covariates(
-                    y=y_np,
-                    covar=covar_np,
-                    geno=Z_cand,
-                    Hinv_y=Hinv_y_for_path,
-                    Hinv_covar=Hinv_covar_for_path,
-                    Hinv_geno=sol_z_np,
-                    p_total=p_for_ebic,
-                    cfg=path_cfg,
-                    ridge=args.lasso_ridge,
+                try:
+                    lasso = fit_weighted_lasso_with_covariates(
+                        y=y_np,
+                        covar=covar_np,
+                        geno=Z_cand,
+                        Hinv_y=Hinv_y_for_path,
+                        Hinv_covar=Hinv_covar_for_path,
+                        Hinv_geno=sol_z_np,
+                        cfg=path_cfg,
+                        ridge=args.lasso_ridge,
+                        beta_snp_path0=beta_snp_path0,
+                    )
+                except ValueError as warm_error:
+                    # A zero-score path has one row regardless of the
+                    # requested grid.  If the adjacent fit crosses that
+                    # degenerate case, discard only the optional warm start.
+                    if (
+                        beta_snp_path0 is None
+                        or "beta_path0 shape mismatch" not in str(warm_error)
+                    ):
+                        raise
+                    beta_snp_path0 = None
+                    warm_lasso_columns = 0
+                    lasso = fit_weighted_lasso_with_covariates(
+                        y=y_np,
+                        covar=covar_np,
+                        geno=Z_cand,
+                        Hinv_y=Hinv_y_for_path,
+                        Hinv_covar=Hinv_covar_for_path,
+                        Hinv_geno=sol_z_np,
+                        cfg=path_cfg,
+                        ridge=args.lasso_ridge,
+                    )
+                sparse_path_performance["lasso_path_solves"] += 1
+                sparse_path_performance["lasso_cd_iterations"] += int(
+                    sum(int(row["cd_iter"]) for row in lasso["path"])
                 )
+                sparse_path_performance[
+                    "lasso_path_warm_start_rows_used"
+                ] += int(
+                    lasso["external_beta_path_warm_start_rows_used"]
+                )
+                warm_lasso_candidate = candidate.copy()
+                warm_lasso_beta_path = np.asarray(
+                    lasso["beta_snp_path"], dtype=np.float64
+                ).copy()
+                if iterative_validation_selection:
+                    if prediction_context is None or validation_outcome is None:
+                        raise RuntimeError(
+                            "Iterative validation selection context is unavailable."
+                        )
+                    lasso, validation_record = (
+                        _select_lasso_by_validation_prediction(
+                            args=args,
+                            fitter=fitter,
+                            prediction_context=prediction_context,
+                            y_train=y_np,
+                            train_covar=covar_np,
+                            train_candidate=Z_cand,
+                            candidate=candidate,
+                            lasso_path=lasso,
+                            theta_standardized=theta,
+                            phenotype_scale=phenotype_scale,
+                            validation_outcome=validation_outcome,
+                        )
+                    )
+                    trace_record = {
+                        "outer": int(outer),
+                        "stage": (
+                            "final_covariance_lasso"
+                            if final_alignment
+                            else "outer_update"
+                        ),
+                        "final_alignment": bool(final_alignment),
+                        "kkt_round": int(kkt_round),
+                        "candidate_size": int(candidate.size),
+                        "lasso_path_warm_start_columns": int(
+                            warm_lasso_columns
+                        ),
+                        "lasso_path_warm_start_used": bool(
+                            lasso[
+                                "external_beta_path_warm_start_used"
+                            ]
+                        ),
+                        "lasso_path_warm_start_rows_used": int(
+                            lasso[
+                                "external_beta_path_warm_start_rows_used"
+                            ]
+                        ),
+                        "theta_standardized": np.asarray(
+                            theta, dtype=np.float64
+                        ).tolist(),
+                        **validation_record,
+                    }
+                    iterative_validation_trace.append(trace_record)
+                    logger.info(
+                        "[outer %s kkt %s validation alpha] cand=%s "
+                        "ratio=%.6g active=%s validation_R2=%.8f",
+                        outer,
+                        kkt_round,
+                        int(candidate.size),
+                        float(lasso["selected_lam_ratio"]),
+                        int(np.asarray(lasso["active_idx"]).size),
+                        float(
+                            validation_record["selected"][
+                                "correlation_squared"
+                            ]
+                        ),
+                    )
             except (
                 FloatingPointError,
                 RuntimeError,
@@ -2928,6 +3272,35 @@ def main() -> None:
                 max_outside_score - float(lasso["lam"]), 0.0
             )
             action = "accept" if n_viol == 0 else "expand_candidate"
+            expansion = {
+                "add_indices": np.empty((0,), dtype=np.int64),
+                "n_strict_added": 0,
+                "n_buffered_added": 0,
+            }
+            candidate_limit_error = None
+            if n_viol > 0:
+                expansion_budget = int(args.kkt_add_topk)
+                max_candidate = int(args.kkt_max_candidate)
+                if max_candidate > 0:
+                    available = max_candidate - int(candidate.size)
+                    strict_required = min(expansion_budget, n_viol)
+                    if available < strict_required:
+                        candidate_limit_error = (
+                            "KKT refinement cannot add the required strict "
+                            "violators without exceeding --kkt-max-candidate "
+                            f"({candidate.size} + {strict_required} > "
+                            f"{max_candidate})."
+                        )
+                        action = "candidate_limit_reached"
+                    else:
+                        expansion_budget = min(expansion_budget, available)
+                if candidate_limit_error is None:
+                    expansion = _buffered_kkt_expansion_indices(
+                        score_abs=score_kkt_decision,
+                        candidate=candidate,
+                        violators=violators,
+                        max_add=expansion_budget,
+                    )
             current_record = {
                 "passed": bool(action == "accept"),
                 "tolerance": float(best_path.get("kkt_tolerance", kkt_threshold - float(lasso["lam"]))),
@@ -2957,9 +3330,37 @@ def main() -> None:
                     "candidate_size": int(candidate.size),
                     "support_size": int(support_new.size),
                     "lambda": float(lasso["lam"]),
+                    "lambda_ratio": float(lasso["selected_lam_ratio"]),
+                    "selection_method": str(lasso["selection_method"]),
+                    "validation_correlation_squared": (
+                        float(
+                            lasso["validation_selection"]["selected"][
+                                "correlation_squared"
+                            ]
+                        )
+                        if lasso.get("validation_selection") is not None
+                        else None
+                    ),
                     "threshold": float(kkt_threshold),
                     "max_outside_score": max_outside_score,
                     "n_violators": n_viol,
+                    "n_expansion_strict_added": int(
+                        expansion["n_strict_added"]
+                    ),
+                    "n_expansion_buffered_added": int(
+                        expansion["n_buffered_added"]
+                    ),
+                    "lasso_path_warm_start_columns": int(
+                        warm_lasso_columns
+                    ),
+                    "lasso_path_warm_start_used": bool(
+                        lasso["external_beta_path_warm_start_used"]
+                    ),
+                    "lasso_path_warm_start_rows_used": int(
+                        lasso[
+                            "external_beta_path_warm_start_rows_used"
+                        ]
+                    ),
                     "decision": action,
                     "path_pcg_tol": path_pcg_tol,
                     "candidate_pcg_reported_res": float(np.asarray(res_all)),
@@ -2970,7 +3371,8 @@ def main() -> None:
             )
             logger.info(
                 "[outer %s kkt %s] cand=%s active=%s lam=%.3e "
-                "max_outside=%.3e threshold=%.3e violators=%s decision=%s",
+                "max_outside=%.3e threshold=%.3e violators=%s "
+                "add=%s buffer=%s warm_cols=%s decision=%s",
                 outer,
                 kkt_round,
                 int(candidate.size),
@@ -2979,6 +3381,9 @@ def main() -> None:
                 max_outside_score,
                 kkt_threshold,
                 n_viol,
+                int(expansion["n_strict_added"]),
+                int(expansion["n_buffered_added"]),
+                int(warm_lasso_columns),
                 action,
             )
 
@@ -2986,10 +3391,24 @@ def main() -> None:
                 certified_kkt = True
                 accepted_kkt_record = current_record
                 break
-            n_add = min(int(args.kkt_add_topk), n_viol)
-            add_idx = violators[
-                np.argsort(score_kkt_decision[violators])[-n_add:]
-            ]
+            if candidate_limit_error is not None:
+                penalized_block_failure = candidate_limit_error
+                break
+            add_idx = np.asarray(
+                expansion["add_indices"], dtype=np.int64
+            )
+            if add_idx.size == 0:
+                penalized_block_failure = (
+                    "KKT refinement produced an empty expansion despite "
+                    f"{n_viol} outside-candidate violators."
+                )
+                break
+            sparse_path_performance[
+                "kkt_strict_violators_added"
+            ] += int(expansion["n_strict_added"])
+            sparse_path_performance[
+                "kkt_buffered_markers_added"
+            ] += int(expansion["n_buffered_added"])
             candidate = np.unique(
                 np.concatenate([candidate, add_idx])
             ).astype(np.int64)
@@ -3059,11 +3478,6 @@ def main() -> None:
                         if lasso is not None
                         else None
                     ),
-                    "best_ebic": (
-                        float(lasso["best_ebic"])
-                        if lasso is not None
-                        else None
-                    ),
                     "kkt_certified": False,
                     "kkt_trace": kkt_trace,
                     "final_alignment": final_alignment,
@@ -3081,13 +3495,19 @@ def main() -> None:
         if lasso is None:
             raise RuntimeError("Internal error: LASSO refinement loop did not run.")
 
+        # Only a candidate that passed the full outside-marker KKT check is
+        # carried into the next covariance update.
+        candidate_cache = candidate.copy()
         support_same = bool(np.array_equal(support_new, support))
 
         if args.verbose:
             logger.info(
-                "[outer %s] lasso_select: p_mode=%s "
-                "candidate=%s k_selected=%s kkt_certified=%s",
-                outer, args.ebic_p_mode, int(candidate.size), int(active_local.size),
+                "[outer %s] lasso_select: method=%s candidate=%s "
+                "k_selected=%s kkt_certified=%s",
+                outer,
+                str(lasso["selection_method"]),
+                int(candidate.size),
+                int(active_local.size),
                 bool(certified_kkt),
             )
 
@@ -3119,8 +3539,8 @@ def main() -> None:
                 "kkt": dict(accepted_kkt_record),
             }
 
-        # Exactly one final EBIC-Lasso update aligns alpha with the covariance
-        # returned by the outer loop.  No variance update follows it.
+        # Exactly one final selected-Lasso update aligns alpha with the
+        # covariance returned by the outer loop. No variance update follows it.
         if final_alignment:
             support = support_new
             final_candidate = candidate
@@ -3137,7 +3557,19 @@ def main() -> None:
                     "support_size": int(support_new.size),
                     "support_same": support_same,
                     "lam": float(lasso["lam"]),
-                    "best_ebic": float(lasso["best_ebic"]),
+                    "lam_ratio": float(lasso["selected_lam_ratio"]),
+                    "lambda_selection_method": str(
+                        lasso["selection_method"]
+                    ),
+                    "validation_correlation_squared": (
+                        float(
+                            lasso["validation_selection"]["selected"][
+                                "correlation_squared"
+                            ]
+                        )
+                        if lasso.get("validation_selection") is not None
+                        else None
+                    ),
                     "kkt_certified": True,
                     "kkt_trace": kkt_trace,
                     "final_alignment": True,
@@ -3145,8 +3577,9 @@ def main() -> None:
                 }
             )
             logger.info(
-                "[INFO] final covariance-aligned EBIC-Lasso completed "
+                "[INFO] final covariance-aligned %s-selected Lasso completed "
                 "after %s outer variance updates.",
+                str(lasso["selection_method"]),
                 outer,
             )
             break
@@ -3181,7 +3614,6 @@ def main() -> None:
                     "support_size": int(support_new.size),
                     "support_same": support_same,
                     "lam": float(lasso["lam"]),
-                    "best_ebic": float(lasso["best_ebic"]),
                     "kkt_certified": bool(certified_kkt),
                     "kkt_trace": kkt_trace,
                     "final_alignment": False,
@@ -3236,7 +3668,17 @@ def main() -> None:
             "effect_rel": float(effect_rel),
             "effect_stable": bool(effect_stable),
             "lam": float(lasso["lam"]),
-            "best_ebic": float(lasso["best_ebic"]),
+            "lam_ratio": float(lasso["selected_lam_ratio"]),
+            "lambda_selection_method": str(lasso["selection_method"]),
+            "validation_correlation_squared": (
+                float(
+                    lasso["validation_selection"]["selected"][
+                        "correlation_squared"
+                    ]
+                )
+                if lasso.get("validation_selection") is not None
+                else None
+            ),
             "kkt_certified": bool(certified_kkt),
             "kkt_trace": kkt_trace,
             "final_alignment": False,
@@ -3253,7 +3695,7 @@ def main() -> None:
 
         logger.info(
             "[outer %s] pcg_screen=%s pcg_all=%s cand=%s active=%s "
-            "kkt_rounds=%s lam=%.3e ebic=%.4e vc_ratio=%.3e "
+            "kkt_rounds=%s lam=%.3e validation_R2=%s vc_ratio=%.3e "
             "effect_rel=%.3e support_same=%s iter_time=%.1fs",
             outer,
             int(it_screen),
@@ -3262,7 +3704,16 @@ def main() -> None:
             int(support_new.size),
             len(kkt_trace),
             float(lasso["lam"]),
-            float(lasso["best_ebic"]),
+            (
+                "%.8f"
+                % float(
+                    lasso["validation_selection"]["selected"][
+                        "correlation_squared"
+                    ]
+                )
+                if lasso.get("validation_selection") is not None
+                else "fixed"
+            ),
             vc_change_ratio,
             effect_rel,
             support_same,
@@ -3286,8 +3737,9 @@ def main() -> None:
             final_alignment_pending = True
             logger.info(
                 "[INFO] outer convergence reached at update %s; running one "
-                "final covariance-aligned EBIC-Lasso.",
+                "final covariance-aligned %s-selected Lasso.",
                 outer,
+                str(lasso["selection_method"]),
             )
         elif outer >= int(args.outer_max):
             outer_stop_reason = "outer_max"
@@ -3295,8 +3747,9 @@ def main() -> None:
             logger.warning(
                 "[WARN] outer iteration reached the limit (%s) before the "
                 "change tolerances; returning the finite iterate after one "
-                "final covariance-aligned EBIC-Lasso.",
+                "final covariance-aligned %s-selected Lasso.",
                 int(args.outer_max),
+                str(lasso["selection_method"]),
             )
     # Freeze the primary COHERIT branch.  The final Lasso and theta now come
     # from the same covariance.  A selected-support refit is an explicit,
@@ -3785,33 +4238,67 @@ def main() -> None:
                 "Adaptive marker scores require a valid covariance-aligned "
                 "COHERIT Lasso branch."
             )
-        marker_score_residual = _lasso_residual(
-            y=y_np,
-            covar=covar_np,
-            geno=Z_support,
-            beta_cov=beta_cov_lasso,
-            beta_snp=beta_lasso_active,
-        )
-        adaptive_marker_score_summary = _compute_adaptive_marker_scores(
-            output_path=marker_score_output,
-            residual_raw=marker_score_residual,
-            fitter=fitter,
-            ops=ops,
-            grm_index=grm_index,
-            theta=theta_lasso_ml,
-            n_probes=int(args.marker_score_probes),
-            seed=int(args.marker_score_seed),
-            pcg_tol=float(args.pcg_tol),
-            max_pcg_iters=int(args.max_pcg_iters),
-        )
-        logger.info(
-            "[adaptive] marker scores -> %s (probes=%s clipped=%s)",
-            marker_score_output,
-            int(args.marker_score_probes),
-            adaptive_marker_score_summary[
-                "information_clipped_count"
-            ],
-        )
+        marker_score_threshold = args.marker_score_min_validation_r2
+        observed_validation_r2 = None
+        if marker_score_threshold is not None:
+            validation_selection = (
+                final_lasso.get("validation_selection")
+                if final_lasso is not None
+                else None
+            )
+            if not isinstance(validation_selection, dict):
+                raise RuntimeError(
+                    "Conditional marker scoring requires final validation selection."
+                )
+            observed_validation_r2 = float(
+                validation_selection["selected"]["correlation_squared"]
+            )
+
+        if not _validation_allows_marker_score(
+            observed_validation_r2,
+            marker_score_threshold,
+        ):
+            adaptive_marker_score_summary = {
+                "status": "skipped_validation_decline",
+                "path": os.path.abspath(marker_score_output),
+                "observed_validation_r2": observed_validation_r2,
+                "required_min_validation_r2": float(marker_score_threshold),
+                "reason": "adaptive_k_layer_will_not_be_split",
+            }
+            logger.info(
+                "[adaptive] skipped unused marker scores: validation_R2=%.8f "
+                "< required %.8f",
+                observed_validation_r2,
+                float(marker_score_threshold),
+            )
+        else:
+            marker_score_residual = _lasso_residual(
+                y=y_np,
+                covar=covar_np,
+                geno=Z_support,
+                beta_cov=beta_cov_lasso,
+                beta_snp=beta_lasso_active,
+            )
+            adaptive_marker_score_summary = _compute_adaptive_marker_scores(
+                output_path=marker_score_output,
+                residual_raw=marker_score_residual,
+                fitter=fitter,
+                ops=ops,
+                grm_index=grm_index,
+                theta=theta_lasso_ml,
+                n_probes=int(args.marker_score_probes),
+                seed=int(args.marker_score_seed),
+                pcg_tol=float(args.pcg_tol),
+                max_pcg_iters=int(args.max_pcg_iters),
+            )
+            logger.info(
+                "[adaptive] marker scores -> %s (probes=%s clipped=%s)",
+                marker_score_output,
+                int(args.marker_score_probes),
+                adaptive_marker_score_summary[
+                    "information_clipped_count"
+                ],
+            )
 
     print(f"[RESULT] var_components_lasso_ml={theta_lasso_ml.tolist()}")
     print(f"[RESULT] h2={h2:.6f} (primary={primary_h2_method})")
@@ -3859,12 +4346,31 @@ def main() -> None:
         "requested": bool(prediction_active),
         "status": "not_requested",
     }
-    sparsity_validation_summary = {
-        "requested": bool(sparsity_validation_requested),
-        "status": (
-            "pending" if sparsity_validation_requested else "not_requested"
-        ),
-    }
+    if iterative_validation_selection and lasso_branch_valid:
+        if validation_outcome is None or final_lasso is None:
+            raise RuntimeError(
+                "Iterative validation selection completed without a final model."
+            )
+        sparsity_validation_summary = _write_iterative_validation_output(
+            output_path=args.sparsity_validation_out,
+            phenotype_path=args.sparsity_validation_pheno_txt,
+            validation_outcome=validation_outcome,
+            selection_trace=iterative_validation_trace,
+            final_lasso=final_lasso,
+            final_candidate=final_candidate,
+            grm_index=grm_index,
+            theta_standardized=theta_lasso_ml,
+            phenotype_scale=phenotype_scale,
+            outer_converged=lasso_ml_outer_converged,
+            outer_stop_reason=outer_stop_reason,
+        )
+    else:
+        sparsity_validation_summary = {
+            "requested": bool(sparsity_validation_requested),
+            "status": (
+                "pending" if sparsity_validation_requested else "not_requested"
+            ),
+        }
     if not prediction_active:
         # A reused output prefix must not retain a prediction table from an
         # earlier comparison run when the current run did not request one.
@@ -3984,144 +4490,24 @@ def main() -> None:
                     "branch_outputs_emitted": False,
                 },
             )
-            standardization_overrides = []
-            for streamer in fitter.streamers:
-                if (
-                    streamer._means_host is None
-                    or streamer._inv_sds_host is None
-                ):
-                    raise RuntimeError(
-                        "Sparse prediction requires retained training SNP "
-                        "standardization statistics."
-                    )
-                standardization_overrides.append(
-                    (streamer._means_host, streamer._inv_sds_host)
+            if prediction_context is None:
+                prediction_context = _build_prediction_fit_context(
+                    args=args,
+                    training_fitter=fitter,
+                    component_variant_indices=component_variant_indices,
+                    prediction_bed_list=prediction_bed_list,
+                    prediction_pgen_prefix=prediction_pgen_prefix,
+                    covar_transform=covar_transform,
+                    call_width=call_width,
+                    cpu_threads=cpu_threads,
+                    gpu_budget_bytes=gpu_budget_bytes,
+                    ring_depth=plan.ring_depth,
                 )
-
-            prediction_temp_paths: list[str] = []
-            if prediction_pgen_prefix:
-                prediction_fam_path = make_nonbed_input_fam(
-                    pgen_prefix=prediction_pgen_prefix
-                )
-                prediction_temp_paths.append(prediction_fam_path)
-            else:
-                prediction_fam_path = prediction_bed_list[0] + ".fam"
-            for path in prediction_temp_paths:
-                atexit.register(cleanup_path, path)
-
-            requested_prediction_ids = None
-            if args.prediction_keep_path:
-                if not os.path.exists(args.prediction_keep_path):
-                    raise SystemExit(
-                        "--prediction-keep-path does not exist: "
-                        f"{args.prediction_keep_path}"
-                    )
-                requested_prediction_ids = read_keep_ids(
-                    args.prediction_keep_path
-                )
-            (
-                prediction_covar,
-                prediction_ids,
-                prediction_dropped,
-            ) = load_covar_aligned(
-                prediction_fam_path,
-                args.prediction_covar_txt or None,
-                transform=covar_transform,
-                keep_ids=requested_prediction_ids,
-            )
-            logger.info(
-                "[prediction] loaded %s samples; dropped %s",
-                len(prediction_ids),
-                len(prediction_dropped),
-            )
-
-            prediction_sources = None
-            prediction_sample_mask = None
-            if prediction_pgen_prefix:
-                prediction_sample_mask = compute_sample_mask(
-                    prediction_fam_path, prediction_ids
-                )
-                prediction_sources = [
-                    PgenGenoSource(
-                        prediction_pgen_prefix,
-                        sample_mask=prediction_sample_mask,
-                    )
-                ]
-                prediction_sample_mask = None
-            else:
-                n_prediction_bed = _bed_count(
-                    prediction_bed_list[0] + ".bed", "iid_count"
-                )
-                if n_prediction_bed != len(prediction_ids):
-                    prediction_sample_mask = compute_sample_mask(
-                        prediction_fam_path, prediction_ids
-                    )
-
-            prediction_cfg_kwargs = dict(
-                device=args.device,
-                sample_mask=prediction_sample_mask,
-                component_variant_indices=(
-                    component_variant_indices or None
-                ),
-                standardization_overrides=standardization_overrides,
-                call_width=call_width,
-                # Needed only to extract the selected fixed-SNP columns; the
-                # retained values are supplied training overrides, not moments
-                # estimated from prediction samples.
-                keep_host_stats=True,
-                cpu_threads=cpu_threads,
-                gpu_budget_bytes=gpu_budget_bytes,
-                ring_depth=plan.ring_depth,
-                n_rand_vec=args.n_rand_vec,
-                minq_iter=args.minq_iter,
-                slq_samples=args.slq_samples,
-                slq_m=args.slq_m,
-                precond_rank=0,
-                max_pcg_iters=args.max_pcg_iters,
-                pcg_ridge=args.pcg_ridge,
-                verbose=args.verbose,
-            )
-            if prediction_sources is not None:
-                prediction_fitter = InfinitesimalREMLFitter(
-                    FitConfig(
-                        sources=prediction_sources,
-                        **prediction_cfg_kwargs,
-                    )
-                )
-            else:
-                prediction_fitter = InfinitesimalREMLFitter(
-                    FitConfig(
-                        bed_prefix=prediction_bed_list,
-                        **prediction_cfg_kwargs,
-                    )
-                )
+            prediction_fitter = prediction_context.fitter
+            prediction_grm_index = prediction_context.grm_index
+            prediction_covar = prediction_context.covar
+            prediction_ids = prediction_context.sample_ids
             try:
-                prediction_grm_index = MultiGRMIndex(
-                    prediction_fitter.streamers,
-                    call_plan=prediction_fitter._multi_call_plan,
-                    component_variant_indices=(
-                        component_variant_indices or None
-                    ),
-                )
-                if sparsity_validation_requested:
-                    sparsity_validation_summary = (
-                        _run_sparsity_validation_selection(
-                            args=args,
-                            fitter=fitter,
-                            prediction_fitter=prediction_fitter,
-                            ops=ops,
-                            grm_index=grm_index,
-                            prediction_grm_index=prediction_grm_index,
-                            y_train=y_np,
-                            train_covar=covar_np,
-                            validation_covar=prediction_covar,
-                            validation_ids=prediction_ids,
-                            theta_standardized=theta_lasso_ml,
-                            phenotype_scale=phenotype_scale,
-                            initial_candidate=final_candidate,
-                            path_cfg=path_cfg,
-                        )
-                    )
                 prediction_support = (
                     prediction_grm_index.extract_standardized_columns(
                         support
@@ -4162,7 +4548,7 @@ def main() -> None:
                         max_pcg_iters=args.max_pcg_iters,
                     )
             finally:
-                prediction_fitter.close()
+                prediction_context.close()
 
             branch_metadata = {
                 "lasso": {
@@ -4236,9 +4622,9 @@ def main() -> None:
 
     output_contract = _sparse_output_contract(comparison_enabled)
     summary = {
-        # Schema 5 makes the estimator mode explicit and removes the former
-        # post-GLS diagnostic.  Historical schema-4 files remain readable by
-        # the experiment collectors but are never emitted by new runs.
+        # Schema 6 fixes validation R2 as the training-stage lambda selector,
+        # reserves fixed-lambda-ratio selection for the final refit, and
+        # removes the former information-criterion fields.
         "sparse_output_schema_version": output_contract[
             "sparse_output_schema_version"
         ],
@@ -4252,18 +4638,44 @@ def main() -> None:
         "n_grms": grm_index.n_grm,
         "m_per_grm": grm_index.m_per_grm.tolist(),
         "genetic_trace_atoms": genetic_trace_atoms.tolist(),
-        "ebic_p_mode": args.ebic_p_mode,
-        "lasso_selection_mode": args.lasso_selection_mode,
+        "lambda_selection_method": (
+            str(final_lasso["selection_method"])
+            if final_lasso is not None
+            else None
+        ),
+        "lasso_path_complete": True,
+        "lasso_path_role": (
+            str(final_lasso["path_role"])
+            if final_lasso is not None
+            else None
+        ),
+        "lasso_path_points_solved": (
+            int(len(final_lasso["path"]))
+            if final_lasso is not None
+            else 0
+        ),
+        "lasso_path_points_requested": int(args.lasso_n_lambda),
+        "sparse_path_performance_optimizations": dict(
+            sparse_path_performance
+        ),
+        "validation_selection_inside_outer_loop": bool(
+            iterative_validation_selection
+        ),
         "lasso_fixed_lam_ratio_requested": args.lasso_fixed_lam_ratio,
         "lasso_selected_lam_ratio": (
             float(final_lasso["selected_lam_ratio"])
             if final_lasso is not None
             else None
         ),
-        "ebic_model_space_size": (
-            grm_index.m_total
-            if args.ebic_p_mode == "full"
-            else int(final_candidate.size)
+        "lasso_selected_validation_r2": (
+            float(
+                final_lasso["validation_selection"]["selected"][
+                    "correlation_squared"
+                ]
+            )
+            if final_lasso is not None
+            and final_lasso.get("validation_selection") is not None
+            else None
         ),
         "component_spec": component_spec_source or None,
         "component_partition_mode": (
@@ -4342,13 +4754,13 @@ def main() -> None:
         "support_size": int(support.size),
         "support_indices": support.tolist(),
         "support_source_indices": grm_index.source_variant_indices(support).tolist(),
-        # Candidate expansion certifies the EBIC-selected lambda in each outer
-        # round.  It does not certify every unselected point on the lambda path.
+        # Candidate expansion certifies the selected lambda in each outer
+        # round. It does not certify every unselected point on the path.
         "kkt_certification_scope": "selected_lambda_only",
         "kkt_certificate_definition": (
             "candidate_gram_plus_outside_marker_score"
         ),
-        "ebic_path_globally_kkt_certified": False,
+        "lasso_path_globally_kkt_certified": False,
         "kkt_certified": bool(
             history and bool(history[-1].get("kkt_certified", False))
         ),

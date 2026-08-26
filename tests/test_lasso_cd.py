@@ -5,7 +5,7 @@ These tests avoid GPU, streamer, and bed-file dependencies. They cover:
 - coordinate-descent correctness
 - lambda=0 -> OLS / GLS behavior
 - KKT conditions for LASSO solutions
-- EBIC basic monotonic behavior in simple controlled settings
+- complete lambda-path construction and frozen-ratio selection
 """
 
 import importlib
@@ -24,11 +24,10 @@ _LASSO = importlib.import_module(f"{_PKG}.lasso_cd")
 
 LassoPathConfig = _LASSO.LassoPathConfig
 compute_projected_hinv_vector = _LASSO.compute_projected_hinv_vector
-ebic_from_rss = _LASSO.ebic_from_rss
 fit_weighted_lasso_with_covariates = _LASSO.fit_weighted_lasso_with_covariates
 make_lambda_sequence = _LASSO.make_lambda_sequence
 solve_lasso_cd_gram = _LASSO.solve_lasso_cd_gram
-solve_lasso_path_and_select_ebic = _LASSO.solve_lasso_path_and_select_ebic
+solve_lasso_path = _LASSO.solve_lasso_path
 
 
 def _random_spd(k: int, seed: int = 0) -> np.ndarray:
@@ -140,7 +139,7 @@ class TestSolveLassoCdGram:
         assert inactive_excess <= tolerance
 
 
-class TestLambdaPathAndEbic:
+class TestLambdaPath:
     def test_make_lambda_sequence_descending(self):
         seq = make_lambda_sequence(10.0, 0.1, 5)
         assert seq.shape == (5,)
@@ -148,59 +147,90 @@ class TestLambdaPathAndEbic:
         np.testing.assert_allclose(seq[0], 10.0)
         np.testing.assert_allclose(seq[-1], 1.0)
 
-    def test_ebic_increases_with_k_when_rss_fixed(self):
-        e1 = ebic_from_rss(n=1000, p=10000, k=1, rss=500.0, gamma=0.5, eps=1e-12)
-        e2 = ebic_from_rss(n=1000, p=10000, k=10, rss=500.0, gamma=0.5, eps=1e-12)
-        assert e1 < e2
-
-    def test_path_result_matches_min_ebic_in_path(self):
+    def test_complete_path_defers_selection_to_validation(self):
         Q = _random_spd(5, seed=5)
         q = np.array([1.0, -0.8, 0.6, 0.0, 0.2], dtype=np.float64)
-        out = solve_lasso_path_and_select_ebic(
+        out = solve_lasso_path(
             Q=Q,
             q=q,
             yHy=10.0,
-            n_samples=200,
-            p_total=1000,
             cfg=LassoPathConfig(n_lambda=12, lam_min_ratio=0.2, max_cd_iter=5000, cd_tol=1e-10),
         )
         path = out["path"]
-        best = min(path, key=lambda d: (d["ebic"], d["k"]))
-        assert abs(best["lam"] - out["lam"]) < 1e-12
-        assert abs(best["ebic"] - out["best_ebic"]) < 1e-12
+        assert len(path) == 12
         assert all("kkt_passed" in row for row in path)
         assert all(
             row["converged"] <= row["kkt_passed"]
             for row in path
         )
-        assert out["selection_mode"] == "ebic"
+        assert out["selection_method"] is None
+        assert out["selected_index"] is None
+        assert out["selected_lam_ratio"] is None
         assert out["beta_path"].shape == (len(path), q.size)
-        np.testing.assert_allclose(
-            out["beta"], out["beta_path"][out["selected_index"]]
+
+    def test_external_path_warm_start_preserves_solution_and_reduces_cd_work(self):
+        k = 24
+        correlation = 0.85
+        Q = (
+            (1.0 - correlation) * np.eye(k)
+            + correlation * np.ones((k, k))
+        )
+        q = np.linspace(-2.0, 2.5, k)
+        cfg = LassoPathConfig(
+            n_lambda=18,
+            lam_min_ratio=0.05,
+            max_cd_iter=10000,
+            cd_tol=1e-10,
+            kkt_abs_tol=1e-8,
+            kkt_rel_tol=1e-8,
+        )
+        cold = solve_lasso_path(Q=Q, q=q, yHy=50.0, cfg=cfg)
+        warm = solve_lasso_path(
+            Q=Q,
+            q=q,
+            yHy=50.0,
+            cfg=cfg,
+            beta_path0=cold["beta_path"],
         )
 
-    def test_fixed_ratio_selection_uses_requested_path_location(self):
+        np.testing.assert_allclose(
+            warm["beta_path"], cold["beta_path"], rtol=1e-6, atol=1e-7
+        )
+        assert warm["external_beta_path_warm_start_used"] is True
+        assert sum(row["cd_iter"] for row in warm["path"]) < sum(
+            row["cd_iter"] for row in cold["path"]
+        )
+
+    def test_external_path_warm_start_validates_shape(self):
+        with pytest.raises(ValueError, match="beta_path0 shape mismatch"):
+            solve_lasso_path(
+                Q=np.eye(3),
+                q=np.asarray([1.0, 0.5, -0.25]),
+                yHy=4.0,
+                cfg=LassoPathConfig(n_lambda=5),
+                beta_path0=np.zeros((4, 3)),
+            )
+
+    def test_fixed_ratio_selection_solves_only_max_and_exact_target(self):
         Q = _random_spd(5, seed=12)
         q = np.array([1.2, -0.9, 0.55, 0.25, -0.1], dtype=np.float64)
-        out = solve_lasso_path_and_select_ebic(
+        out = solve_lasso_path(
             Q=Q,
             q=q,
             yHy=15.0,
-            n_samples=250,
-            p_total=5000,
             cfg=LassoPathConfig(
                 n_lambda=9,
                 lam_min_ratio=0.01,
-                selection_mode="fixed_ratio",
                 fixed_lam_ratio=0.1,
-                ebic_early_stop=True,
                 max_cd_iter=5000,
                 cd_tol=1e-10,
             ),
         )
 
-        assert len(out["path"]) == 9
-        assert out["selection_mode"] == "fixed_ratio"
+        assert len(out["path"]) == 2
+        assert out["path_role"] == "frozen_ratio_target_only"
+        assert out["requested_n_lambda"] == 9
+        assert out["selection_method"] == "fixed_lam_ratio"
         assert out["selected_lam_ratio"] == pytest.approx(0.1)
         assert out["path"][out["selected_index"]]["lam_ratio"] == pytest.approx(
             0.1
@@ -208,17 +238,52 @@ class TestLambdaPathAndEbic:
         np.testing.assert_allclose(
             out["beta"], out["beta_path"][out["selected_index"]]
         )
+        full = solve_lasso_path(
+            Q=Q,
+            q=q,
+            yHy=15.0,
+            cfg=LassoPathConfig(
+                n_lambda=9,
+                lam_min_ratio=0.01,
+                max_cd_iter=5000,
+                cd_tol=1e-10,
+            ),
+        )
+        full_index = min(
+            range(len(full["path"])),
+            key=lambda index: abs(full["path"][index]["lam_ratio"] - 0.1),
+        )
+        np.testing.assert_allclose(
+            out["beta"],
+            full["beta_path"][full_index],
+            rtol=1e-5,
+            atol=1e-6,
+        )
+
+    def test_fixed_ratio_one_solves_only_lambda_max(self):
+        out = solve_lasso_path(
+            Q=np.eye(3),
+            q=np.asarray([1.0, -0.5, 0.25]),
+            yHy=4.0,
+            cfg=LassoPathConfig(
+                n_lambda=80,
+                lam_min_ratio=1e-3,
+                fixed_lam_ratio=1.0,
+            ),
+        )
+
+        assert len(out["path"]) == 1
+        assert out["selected_index"] == 0
+        assert out["selected_lam_ratio"] == pytest.approx(1.0)
+        np.testing.assert_allclose(out["beta"], 0.0)
 
     def test_fixed_ratio_selection_validates_ratio(self):
         with pytest.raises(ValueError, match="fixed_lam_ratio"):
-            solve_lasso_path_and_select_ebic(
+            solve_lasso_path(
                 Q=np.eye(2),
                 q=np.ones(2),
                 yHy=5.0,
-                n_samples=20,
-                p_total=100,
                 cfg=LassoPathConfig(
-                    selection_mode="fixed_ratio",
                     fixed_lam_ratio=0.0,
                 ),
             )
@@ -231,17 +296,14 @@ class TestLambdaPathAndEbic:
             return beta, Qb, 1, True
 
         monkeypatch.setattr(_LASSO, "solve_lasso_cd_gram", _fake_solve_lasso_cd_gram)
-        out = solve_lasso_path_and_select_ebic(
+        out = solve_lasso_path(
             Q=np.array([[1.0]], dtype=np.float64),
             q=np.array([1.0], dtype=np.float64),
             yHy=-1e-12,
-            n_samples=20,
-            p_total=1,
-            cfg=LassoPathConfig(n_lambda=1, lam_min_ratio=1.0, ebic_early_stop=False),
+            cfg=LassoPathConfig(n_lambda=1, lam_min_ratio=1.0),
         )
 
         assert out["path"][0]["rss"] == 0.0
-        assert np.isfinite(out["best_ebic"])
 
 
 class TestProjectedHinvVector:
@@ -276,13 +338,12 @@ class TestFitWeightedLassoWithCovariates:
             Hinv_y=y,
             Hinv_covar=C,
             Hinv_geno=Z,
-            p_total=1000,
             cfg=LassoPathConfig(
                 n_lambda=1,
                 lam_min_ratio=1.0,
+                fixed_lam_ratio=1.0,
                 max_cd_iter=5000,
                 cd_tol=1e-10,
-                ebic_early_stop=False,
             ),
             ridge=1e-8,
         )
@@ -309,13 +370,12 @@ class TestFitWeightedLassoWithCovariates:
             Hinv_y=y,
             Hinv_covar=None,
             Hinv_geno=Z,
-            p_total=p_z,
             cfg=LassoPathConfig(
                 n_lambda=1,
                 lam_min_ratio=1.0,
+                fixed_lam_ratio=1.0,
                 max_cd_iter=5000,
                 cd_tol=1e-10,
-                ebic_early_stop=False,
             ),
             ridge=1e-8,
         )
@@ -344,13 +404,12 @@ class TestFitWeightedLassoWithCovariates:
             Hinv_y=Hy,
             Hinv_covar=HC,
             Hinv_geno=HZ,
-            p_total=500,
             cfg=LassoPathConfig(
                 n_lambda=1,
                 lam_min_ratio=1.0,
+                fixed_lam_ratio=1.0,
                 max_cd_iter=5000,
                 cd_tol=1e-10,
-                ebic_early_stop=False,
             ),
             ridge=1e-8,
         )
@@ -401,13 +460,12 @@ class TestFitWeightedLassoWithCovariates:
             Hinv_y=Hy,
             Hinv_covar=HC,
             Hinv_geno=HZ,
-            p_total=100,
             cfg=LassoPathConfig(
                 n_lambda=1,
                 lam_min_ratio=1.0,
+                fixed_lam_ratio=1.0,
                 max_cd_iter=100,
                 cd_tol=1e-8,
-                ebic_early_stop=False,
             ),
             ridge=1e-8,
         )

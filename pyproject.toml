@@ -25,7 +25,9 @@ dev = []
 [project.scripts]
 gpu-reml = "GPU_REML.run_reml_pipeline:main"
 gpu-reml-sparse = "GPU_REML.run_sparse_reml_pipeline:main"
+gpu-reml-sparse-fixed = "GPU_REML.run_validation_sparsity_pipeline:main"
 gpu-reml-sparse-adaptive = "GPU_REML.run_adaptive_sparse_reml_pipeline:main"
+# Backward-compatible alias for the original fixed-K validation driver name.
 gpu-reml-sparse-adaptive-sparsity = "GPU_REML.run_validation_sparsity_pipeline:main"
 gpu-reml-gwas = "GPU_REML.run_gwas_pipeline:main"
 

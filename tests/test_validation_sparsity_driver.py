@@ -40,6 +40,32 @@ def test_driver_defaults_to_expanded_untruncated_path(tmp_path):
     assert args.lam_min_ratio == pytest.approx(1e-3)
     assert args.n_lambda == 80
     assert args.lasso_cd_max_iter == 10000
+    assert args.component_spec == ""
+
+
+def test_fixed_k_mode_accepts_and_validates_user_partition(tmp_path):
+    component_spec = tmp_path / "fixed_k2.npz"
+    np.savez(
+        component_spec,
+        arr_0=np.asarray([0, 2, 4], dtype=np.int64),
+        arr_1=np.asarray([1, 3, 5], dtype=np.int64),
+    )
+
+    args = DRIVER.parse_args(
+        [
+            *_required_args(tmp_path),
+            "--component-spec",
+            str(component_spec),
+        ]
+    )
+    components = DRIVER._load_fixed_components(
+        component_spec,
+        n_variants=6,
+    )
+
+    assert args.component_spec == str(component_spec)
+    assert len(components) == 2
+    assert DRIVER._same_component_membership(component_spec, components)
 
 
 def test_sparse_commands_isolate_validation_and_final_test_stages(tmp_path):
@@ -76,13 +102,30 @@ def test_sparse_commands_isolate_validation_and_final_test_stages(tmp_path):
     )
 
     assert "--sparsity-validation-pheno-txt" in selection
+    assert "--lasso-selection-mode" not in selection
     assert selection[selection.index("--lasso-cd-max-iter") + 1] == "10000"
     assert str(tmp_path / "validation.pheno") in selection
     assert str(tmp_path / "test.keep") not in selection
-    assert "--lasso-selection-mode" in final
-    assert final[final.index("--lasso-selection-mode") + 1] == "fixed_ratio"
+    assert "--lasso-selection-mode" not in final
+    assert float(
+        final[final.index("--lasso-fixed-lam-ratio") + 1]
+    ) == pytest.approx(0.025)
     assert "--sparsity-validation-pheno-txt" not in final
     assert str(tmp_path / "validation.pheno") not in final
+
+    with pytest.raises(ValueError, match="explicit lambda stage"):
+        DRIVER._sparse_command(
+            args=args,
+            component_spec=component,
+            phenotype=tmp_path / "fit.pheno",
+            keep=tmp_path / "fit.keep",
+            prediction_keep=tmp_path / "test.keep",
+            prefix=tmp_path / "invalid",
+            selection_pheno=None,
+            selection_output=None,
+            fixed_lam_ratio=None,
+            theta_init=None,
+        )
 
 
 def test_prediction_metrics_aligns_by_iid(tmp_path):

@@ -8,6 +8,7 @@ import sys
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -19,6 +20,93 @@ PKG = os.path.basename(REPO_ROOT)
 SPARSE = importlib.import_module(f"{PKG}.run_sparse_reml_pipeline")
 REML = importlib.import_module(f"{PKG}.reml")
 LASSO = importlib.import_module(f"{PKG}.lasso_cd")
+
+
+def test_validation_selected_path_materializes_alpha_used_downstream():
+    lasso_path = {
+        "beta_snp": np.asarray([0.0, 0.0]),
+        "beta_cov": np.asarray([1.0]),
+        "active_idx": np.empty((0,), dtype=np.int64),
+        "lam": 10.0,
+        "selected_index": 0,
+        "selection_method": None,
+        "selected_lam_ratio": 1.0,
+        "lam_max": 10.0,
+        "beta_snp_path": np.asarray([[0.0, 0.0], [2.0, -1.0]]),
+        "beta_cov_path": np.asarray([[1.0], [3.0]]),
+        "path": [
+            {
+                "lam": 10.0,
+                "lam_ratio": 1.0,
+                "k": 0,
+                "converged": True,
+                "kkt_passed": True,
+            },
+            {
+                "lam": 2.0,
+                "lam_ratio": 0.2,
+                "k": 2,
+                "converged": True,
+                "kkt_passed": True,
+            },
+        ],
+    }
+    metrics = [
+        {"path_index": 0, "correlation_squared": 0.01},
+        {"path_index": 1, "correlation_squared": 0.25},
+    ]
+
+    selected_index = SPARSE._select_converged_validation_path_index(
+        lasso_path["path"], metrics
+    )
+    selected, record = SPARSE._materialize_validation_selected_lasso(
+        lasso_path,
+        metrics,
+        selected_index=selected_index,
+        path_prediction_pcg_res=1e-4,
+        path_prediction_pcg_iters=7,
+    )
+
+    assert selected_index == 1
+    assert selected["selection_method"] == "validation_r2"
+    assert selected["selected_lam_ratio"] == 0.2
+    assert np.array_equal(selected["beta_snp"], [2.0, -1.0])
+    assert np.array_equal(selected["beta_cov"], [3.0])
+    assert np.array_equal(selected["active_idx"], [0, 1])
+    assert record["selected"]["correlation_squared"] == 0.25
+
+    residual = SPARSE._lasso_residual(
+        y=np.asarray([10.0, 20.0]),
+        covar=np.ones((2, 1)),
+        geno=np.asarray([[1.0, 0.0], [0.0, 1.0]]),
+        beta_cov=selected["beta_cov"],
+        beta_snp=selected["beta_snp"],
+    )
+    # This is the exact residual passed to the variance-component update.
+    assert np.array_equal(residual, [5.0, 18.0])
+
+
+def test_validation_selection_excludes_unconverged_path_points():
+    path = [
+        {
+            "k": 5,
+            "lam_ratio": 0.1,
+            "converged": False,
+            "kkt_passed": False,
+        },
+        {
+            "k": 1,
+            "lam_ratio": 0.5,
+            "converged": True,
+            "kkt_passed": True,
+        },
+    ]
+    metrics = [
+        {"correlation_squared": 0.9},
+        {"correlation_squared": 0.2},
+    ]
+
+    assert SPARSE._select_converged_validation_path_index(path, metrics) == 1
 
 
 def test_sparse_dense_h2_is_invariant_to_phenotype_rescaling():
@@ -198,13 +286,13 @@ def test_sparse_output_contract_hides_comparison_fields_by_default():
     default = SPARSE._sparse_output_contract(False)
     comparison = SPARSE._sparse_output_contract(True)
 
-    assert default["sparse_output_schema_version"] == 5
+    assert default["sparse_output_schema_version"] == 6
     assert default["estimator_mode"] == "coherit"
     assert default["computed_estimators"] == ["h2_chive"]
     assert default["selected_snp_columns"][-1] == "beta_lasso"
     assert "beta_gls_reml" not in default["selected_snp_columns"]
 
-    assert comparison["sparse_output_schema_version"] == 5
+    assert comparison["sparse_output_schema_version"] == 6
     assert comparison["estimator_mode"] == "four_estimator_comparison"
     assert comparison["computed_estimators"] == [
         "h2_lasso_plugin",
@@ -243,23 +331,17 @@ def test_fitted_mean_convergence_allows_equivalent_support_swaps():
     assert changed_ratio > 1e-2
 
 
-def test_sparse_pipeline_ebic_defaults_to_full_model_space(monkeypatch):
+def test_sparse_pipeline_defaults_to_iterative_validation_contract(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["gpu-reml-sparse"])
     args = SPARSE.parse_args()
-    assert args.ebic_p_mode == "full"
+    assert args.lasso_fixed_lam_ratio is None
     assert args.minq_iter == 50
     assert not hasattr(args, "kkt_check")
+    assert not hasattr(args, "lasso_selection_mode")
 
     monkeypatch.setattr(sys, "argv", ["gpu-reml-sparse", "--kkt-check"])
     with np.testing.assert_raises(SystemExit):
         SPARSE.parse_args()
-
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["gpu-reml-sparse", "--ebic-p-mode", "candidate"],
-    )
-    assert SPARSE.parse_args().ebic_p_mode == "candidate"
 
     monkeypatch.setattr(
         sys, "argv", ["gpu-reml-sparse", "--no-kkt-check"]
@@ -296,6 +378,66 @@ def test_lasso_candidate_keeps_complete_previous_support_above_seed_target():
         candidate_target=5,
     )
     np.testing.assert_array_equal(filled, np.asarray([1, 2, 3, 7, 9]))
+
+
+def test_lasso_candidate_reuses_certified_set_and_unions_fresh_screen():
+    candidate = SPARSE._build_lasso_candidate(
+        previous_support=np.asarray([4, 7]),
+        previous_candidate=np.asarray([1, 4, 9]),
+        screened_indices=np.asarray([2, 4, 6]),
+        candidate_target=2,
+    )
+    np.testing.assert_array_equal(candidate, np.asarray([1, 2, 4, 7, 9]))
+
+
+def test_lasso_path_warm_start_remaps_global_marker_basis():
+    previous_candidate = np.asarray([2, 7, 9])
+    previous_path = np.asarray(
+        [[0.0, 0.0, 0.0], [0.2, -0.7, 0.9]], dtype=np.float64
+    )
+    mapped, n_common = SPARSE._remap_lasso_beta_path(
+        previous_candidate=previous_candidate,
+        previous_beta_path=previous_path,
+        candidate=np.asarray([1, 2, 7, 10]),
+    )
+
+    assert n_common == 2
+    np.testing.assert_array_equal(
+        mapped,
+        np.asarray(
+            [[0.0, 0.0, 0.0, 0.0], [0.0, 0.2, -0.7, 0.0]]
+        ),
+    )
+
+
+def test_buffered_kkt_expansion_adds_strict_and_near_threshold_markers():
+    expansion = SPARSE._buffered_kkt_expansion_indices(
+        score_abs=np.arange(20, dtype=np.float64),
+        candidate=np.asarray([18, 19]),
+        violators=np.asarray([16, 17]),
+        max_add=16,
+    )
+
+    np.testing.assert_array_equal(
+        expansion["add_indices"], np.asarray([14, 15, 16, 17])
+    )
+    assert expansion["n_strict_added"] == 2
+    assert expansion["n_buffered_added"] == 2
+
+
+def test_buffered_kkt_expansion_prioritizes_strict_violators_at_budget():
+    expansion = SPARSE._buffered_kkt_expansion_indices(
+        score_abs=np.asarray([0.0, 0.0, 0.0, 3.0, 0.0, 5.0, 0.0, 7.0]),
+        candidate=np.asarray([0, 1]),
+        violators=np.asarray([3, 5, 7]),
+        max_add=2,
+    )
+
+    np.testing.assert_array_equal(
+        expansion["add_indices"], np.asarray([5, 7])
+    )
+    assert expansion["n_strict_added"] == 2
+    assert expansion["n_buffered_added"] == 0
 
 
 def test_partitioned_signed_kkt_distinguishes_candidate_and_outside_failures():
@@ -642,7 +784,7 @@ def test_gram_cd_kkt_certificate_on_scaled_high_ld_gram():
     assert inactive_excess <= tolerance
 
 
-def test_ebic_path_failure_does_not_fall_back_to_valid_null(monkeypatch):
+def test_complete_path_failure_does_not_fall_back_to_valid_null(monkeypatch):
     def fake_lambda_sequence(_lam_max, _lam_min_ratio, _n_lambda):
         return np.asarray([1.0, 0.1])
 
@@ -659,19 +801,25 @@ def test_ebic_path_failure_does_not_fall_back_to_valid_null(monkeypatch):
         RuntimeError,
         "Lasso path failed score-KKT convergence",
     ):
-        LASSO.solve_lasso_path_and_select_ebic(
+        LASSO.solve_lasso_path(
             Q=np.asarray([[1.0]]),
             q=np.asarray([1.0]),
             yHy=1.0,
-            n_samples=100,
-            p_total=10,
             cfg=LASSO.LassoPathConfig(
                 n_lambda=2,
-                ebic_early_stop=False,
                 kkt_abs_tol=1e-8,
                 kkt_rel_tol=0.0,
             ),
         )
+
+
+def test_marker_score_probes_are_skipped_only_for_a_declining_adaptive_layer():
+    assert SPARSE._validation_allows_marker_score(None, None)
+    assert SPARSE._validation_allows_marker_score(0.2, 0.2)
+    assert SPARSE._validation_allows_marker_score(0.21, 0.2)
+    assert not SPARSE._validation_allows_marker_score(0.19, 0.2)
+    with np.testing.assert_raises_regex(ValueError, "requires validation R2"):
+        SPARSE._validation_allows_marker_score(None, 0.2)
 
 
 def test_covariate_contrast_reml_passes_full_design_and_maps_scale():
