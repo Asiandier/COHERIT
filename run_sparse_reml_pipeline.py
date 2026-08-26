@@ -22,8 +22,10 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import csv
 import dataclasses
 import importlib
+import itertools
 import json
 import logging
 import os
@@ -61,6 +63,13 @@ _precond_mod = importlib.import_module(f"{pkg_name}.precond")
 _common_mod = importlib.import_module(f"{pkg_name}.pipeline_common")
 _io_utils_mod = importlib.import_module(f"{pkg_name}.io_utils")
 _component_spec_mod = importlib.import_module(f"{pkg_name}.component_spec")
+_adaptive_partition_mod = importlib.import_module(
+    f"{pkg_name}.adaptive_partition"
+)
+_covtree_mod = importlib.import_module(f"{pkg_name}.covtree")
+_covariance_score_mod = importlib.import_module(
+    f"{pkg_name}.covariance_score"
+)
 _sparse_prediction_mod = importlib.import_module(
     f"{pkg_name}.sparse_prediction"
 )
@@ -80,6 +89,16 @@ compute_projected_hinv_vector = _lasso_mod.compute_projected_hinv_vector
 fit_weighted_lasso_with_covariates = _lasso_mod.fit_weighted_lasso_with_covariates
 pcg_solve = _pcg_mod.pcg_solve
 load_component_specs = _component_spec_mod.load_component_specs
+AdaptiveComponent = _adaptive_partition_mod.AdaptiveComponent
+write_component_spec = _adaptive_partition_mod.write_component_spec
+generate_covtree_candidates = _covtree_mod.generate_covtree_candidates
+replace_covtree_parent = _covtree_mod.replace_parent
+selective_covariance_warm_start = (
+    _covtree_mod.selective_covariance_warm_start
+)
+evaluate_covtree_candidates = (
+    _covariance_score_mod.evaluate_covtree_candidates
+)
 predict_sparse_branch = _sparse_prediction_mod.predict_sparse_branch
 predict_sparse_path_partitioned = (
     _sparse_prediction_mod.predict_sparse_path_partitioned
@@ -133,6 +152,181 @@ def _load_component_variant_indices(path: str) -> list[np.ndarray]:
         np.asarray(spec.variant_indices, dtype=np.int64).reshape(-1)
         for spec in load_component_specs(path)
     ]
+
+
+def _load_ld_score_in_bim_order(path: str, bim_path: str) -> np.ndarray:
+    """Load individual-marker LD scores after proving exact BIM-ID alignment."""
+    values: list[float] = []
+    with open(path, encoding="utf-8", newline="") as score_handle:
+        reader = csv.DictReader(score_handle, delimiter="\t")
+        if not reader.fieldnames or not {"ID", "ld_score"}.issubset(
+            reader.fieldnames
+        ):
+            raise ValueError("CovTree LD-score table must contain ID and ld_score.")
+        with open(bim_path, encoding="utf-8") as bim_handle:
+            sentinel = object()
+            for row_index, pair in enumerate(
+                itertools.zip_longest(reader, bim_handle, fillvalue=sentinel),
+                start=1,
+            ):
+                score_row, bim_line = pair
+                if score_row is sentinel or bim_line is sentinel:
+                    raise ValueError("CovTree LD-score and BIM row counts differ.")
+                fields = str(bim_line).split()
+                if len(fields) < 2 or str(score_row["ID"]) != fields[1]:
+                    raise ValueError(
+                        "CovTree LD-score/BIM order mismatch at row "
+                        f"{row_index}."
+                    )
+                value = float(score_row["ld_score"])
+                if not np.isfinite(value) or value < 0.0:
+                    raise ValueError(
+                        f"Invalid CovTree LD score at row {row_index}."
+                    )
+                values.append(value)
+    result = np.asarray(values, dtype=np.float64)
+    if result.size == 0:
+        raise ValueError("CovTree LD-score table is empty.")
+    return result
+
+
+def _covtree_components_from_spec(path: str) -> list[AdaptiveComponent]:
+    specs = load_component_specs(path)
+    return [
+        AdaptiveComponent(
+            name=str(spec.name),
+            variant_indices=np.asarray(spec.variant_indices, dtype=np.int64),
+            annotation=dict(spec.annotation or {}),
+        )
+        for spec in specs
+    ]
+
+
+def _load_sparse_numerical_state(
+    path: str,
+    *,
+    grm_index: "MultiGRMIndex",
+    n_samples: int,
+    n_lambda: int,
+) -> dict[str, object]:
+    """Load a parent sparse state and remap source SNPs to current cache order."""
+    with np.load(path, allow_pickle=False) as payload:
+        required = {
+            "source_candidate_indices",
+            "source_support_indices",
+            "beta_snp_path",
+            "screen_solution",
+            "z_solution",
+            "fixed_mean",
+        }
+        if not required.issubset(payload.files):
+            raise ValueError("Sparse state artifact is incomplete.")
+        source_candidate = np.asarray(
+            payload["source_candidate_indices"], dtype=np.int64
+        ).reshape(-1)
+        source_support = np.asarray(
+            payload["source_support_indices"], dtype=np.int64
+        ).reshape(-1)
+        beta_path = np.asarray(payload["beta_snp_path"], dtype=np.float64)
+        screen_solution = np.asarray(payload["screen_solution"], dtype=np.float32)
+        z_solution = np.asarray(payload["z_solution"], dtype=np.float32)
+        fixed_mean = np.asarray(payload["fixed_mean"], dtype=np.float64).reshape(-1)
+    if (
+        np.unique(source_candidate).size != source_candidate.size
+        or np.unique(source_support).size != source_support.size
+        or np.setdiff1d(source_support, source_candidate).size > 0
+    ):
+        raise ValueError("Sparse state candidate/support source indices are invalid.")
+    if beta_path.shape != (int(n_lambda), int(source_candidate.size)):
+        raise ValueError(
+            "Sparse state beta path shape mismatch: "
+            f"{beta_path.shape} != {(int(n_lambda), int(source_candidate.size))}."
+        )
+    if z_solution.shape != (int(n_samples), int(source_candidate.size)):
+        raise ValueError("Sparse state Hinv[Z] matrix has the wrong shape.")
+    if screen_solution.ndim != 2 or screen_solution.shape[0] != int(n_samples):
+        raise ValueError("Sparse state screening solution has the wrong shape.")
+    if fixed_mean.shape != (int(n_samples),):
+        raise ValueError("Sparse state fixed mean has the wrong shape.")
+    arrays_to_check = (beta_path, screen_solution, z_solution, fixed_mean)
+    if not all(np.all(np.isfinite(value)) for value in arrays_to_check):
+        raise ValueError("Sparse numerical state contains non-finite values.")
+
+    cache = np.arange(grm_index.m_total, dtype=np.int64)
+    cache_to_source = grm_index.source_variant_indices(cache)
+    source_to_cache = np.empty(grm_index.m_total, dtype=np.int64)
+    source_to_cache[cache_to_source] = cache
+    if np.any(
+        (source_candidate < 0) | (source_candidate >= grm_index.m_total)
+    ):
+        raise ValueError("Sparse state contains an out-of-range source marker.")
+    candidate = source_to_cache[source_candidate]
+    support = source_to_cache[source_support]
+    return {
+        "candidate": candidate,
+        "support": np.sort(support),
+        "beta_snp_path": beta_path,
+        "screen_solution": jnp.asarray(screen_solution, dtype=jnp.float32),
+        "z_solution": z_solution,
+        "fixed_mean": fixed_mean,
+    }
+
+
+def _write_sparse_numerical_state(
+    path: str,
+    *,
+    grm_index: "MultiGRMIndex",
+    candidate: np.ndarray,
+    support: np.ndarray,
+    beta_snp_path: np.ndarray,
+    screen_solution,
+    warm_z_dict: dict[int, np.ndarray],
+    fixed_mean: np.ndarray,
+) -> dict[str, object]:
+    """Persist the exact state reusable under a covariance-preserving split."""
+    candidate_indices = np.asarray(candidate, dtype=np.int64).reshape(-1)
+    support_indices = np.asarray(support, dtype=np.int64).reshape(-1)
+    beta_path = np.asarray(beta_snp_path, dtype=np.float32)
+    screen = np.asarray(jax.device_get(screen_solution), dtype=np.float32)
+    mean = np.asarray(fixed_mean, dtype=np.float32).reshape(-1)
+    if beta_path.ndim != 2 or beta_path.shape[1] != candidate_indices.size:
+        raise ValueError("Cannot emit sparse state: beta path/candidate mismatch.")
+    missing_z = [
+        int(index) for index in candidate_indices if int(index) not in warm_z_dict
+    ]
+    if missing_z:
+        raise ValueError(
+            "Cannot emit sparse state: Hinv[Z] columns are incomplete."
+        )
+    z_solution = np.column_stack(
+        [warm_z_dict[int(index)] for index in candidate_indices]
+    ).astype(np.float32, copy=False)
+    source_candidate = grm_index.source_variant_indices(candidate_indices)
+    source_support = grm_index.source_variant_indices(support_indices)
+    ensure_parent_dir(path)
+    temporary = f"{path}.tmp.{os.getpid()}"
+    with open(temporary, "wb") as handle:
+        np.savez(
+            handle,
+            source_candidate_indices=source_candidate,
+            source_support_indices=source_support,
+            beta_snp_path=beta_path,
+            screen_solution=screen,
+            z_solution=z_solution,
+            fixed_mean=mean,
+        )
+    os.replace(temporary, path)
+    return {
+        "status": "emitted",
+        "path": os.path.abspath(path),
+        "candidate_size": int(candidate_indices.size),
+        "support_size": int(support_indices.size),
+        "lambda_rows": int(beta_path.shape[0]),
+        "screen_rhs_columns": int(screen.shape[1]),
+        "z_solution_shape": list(z_solution.shape),
+        "coordinate_system": "source_marker_index",
+        "reuse_contract": "covariance_preserving_split_only",
+    }
 
 
 def _normalized_design_is_well_conditioned(
@@ -654,6 +848,19 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--sparse-state-in",
+        default="",
+        help=(
+            "Optional NPZ sparse numerical state from a covariance-preserving "
+            "parent layer. Source-marker coordinates are remapped to this partition."
+        ),
+    )
+    p.add_argument(
+        "--sparse-state-out",
+        default="",
+        help="Optional NPZ output used to warm-start the next CovTree layer.",
+    )
+    p.add_argument(
         "--marker-score-out",
         default="",
         help=(
@@ -683,6 +890,35 @@ def parse_args() -> argparse.Namespace:
             "K layer can then stop without paying for unused score probes."
         ),
     )
+    p.add_argument(
+        "--covtree-diagnostic-out",
+        default="",
+        help=(
+            "Optional JSON output for nuisance-adjusted REML covariance split "
+            "tests under the converged fixed-K model."
+        ),
+    )
+    p.add_argument(
+        "--covtree-split-spec-out",
+        default="",
+        help=(
+            "Optional NPZ component spec for the single split accepted by "
+            "--covtree-diagnostic-out. No file is written when the layer stops."
+        ),
+    )
+    p.add_argument(
+        "--covtree-ld-score",
+        default="",
+        help="BIM-aligned TSV containing ID and individual-marker ld_score.",
+    )
+    p.add_argument("--covtree-bootstrap-draws", type=int, default=199)
+    p.add_argument("--covtree-bootstrap-seed", type=int, default=0)
+    p.add_argument("--covtree-alpha", type=float, default=0.05)
+    p.add_argument("--covtree-rank-rtol", type=float, default=1e-7)
+    p.add_argument("--covtree-min-child-markers", type=int, default=16)
+    p.add_argument("--covtree-max-univariate-depth", type=int, default=2)
+    p.add_argument("--covtree-parent-theta-abs-min", type=float, default=1e-6)
+    p.add_argument("--covtree-parent-theta-rel-min", type=float, default=1e-4)
     p.add_argument("--pheno-txt", default=env("PHENO_TXT", ""))
     p.add_argument("--covar-txt", default=env("COVAR_TXT", ""))
     p.add_argument(
@@ -831,9 +1067,9 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=256,
         help=(
-            "Maximum outside-marker expansion batch per KKT round. The batch "
-            "contains the strongest strict violators and, when space remains, "
-            "a small adaptive buffer of the strongest near-threshold markers."
+            "Nominal outside-marker expansion batch per KKT round. A strict-"
+            "violator overflow of at most one tenth is absorbed in the same round; "
+            "otherwise the strongest strict violators are added in batches."
         ),
     )
     p.add_argument(
@@ -2021,6 +2257,25 @@ def _remap_lasso_beta_path(
     return mapped, int(common.size)
 
 
+def _allow_expanded_lasso_path_warm_start(
+    *,
+    previous_size: int,
+    current_size: int,
+    common_size: int,
+) -> bool:
+    """Reuse a mapped path only for an unchanged or very slightly grown basis."""
+    previous = int(previous_size)
+    current = int(current_size)
+    common = int(common_size)
+    if previous < 1 or current < previous or common != previous:
+        return False
+    growth = current - previous
+    if growth == 0:
+        return True
+    small_growth_limit = max(16, int(np.ceil(0.02 * float(previous))))
+    return growth <= small_growth_limit
+
+
 def _buffered_kkt_expansion_indices(
     *,
     score_abs: np.ndarray,
@@ -2097,6 +2352,18 @@ def _buffered_kkt_expansion_indices(
     }
 
 
+def _kkt_expansion_budget(n_violators: int, nominal_budget: int) -> int:
+    """Absorb a small strict-violator overflow to avoid a nearly empty round."""
+    count = int(n_violators)
+    nominal = int(nominal_budget)
+    if count < 0 or nominal < 1:
+        raise ValueError("KKT violator count/budget is invalid.")
+    spillover = nominal // 10
+    if nominal < count <= nominal + spillover:
+        return count
+    return nominal
+
+
 def _parse_variance_components_init(
     value: str,
     *,
@@ -2131,6 +2398,8 @@ def _compute_adaptive_marker_scores(
     *,
     output_path: str,
     residual_raw: np.ndarray,
+    covar: np.ndarray | None,
+    phenotype_scale: float,
     fitter,
     ops,
     grm_index: MultiGRMIndex,
@@ -2140,11 +2409,13 @@ def _compute_adaptive_marker_scores(
     pcg_tol: float,
     max_pcg_iters: int,
 ) -> dict[str, object]:
-    """Write |x'V^-1 r| / sqrt(x'V^-1 x) for every source marker.
+    """Write legacy association and signed REML covariance marker scores.
 
-    The marker-information diagonal is estimated without materializing X or V.
+    Both information diagonals are estimated without materializing X or V.
     For a sample-space Rademacher probe q,
     E[(X' q) * (X' V^-1 q)] = diag(X' V^-1 X).
+    Replacing ``V^-1 q`` by ``P q`` gives the fixed-effect-adjusted quantity
+    needed by ``u_j = 0.5 * ((x_j' P e)^2 - x_j' P x_j)``.
     """
     if int(n_probes) < 1:
         raise ValueError("marker-score-probes must be >= 1.")
@@ -2154,6 +2425,15 @@ def _compute_adaptive_marker_scores(
     n_samples = int(fitter.streamers[0].n)
     if residual.shape != (n_samples,) or not np.all(np.isfinite(residual)):
         raise ValueError("Adaptive marker-score residual is malformed.")
+    scale = float(phenotype_scale)
+    if not np.isfinite(scale) or scale <= 0.0:
+        raise ValueError("phenotype_scale must be finite and positive.")
+    if covar is None:
+        fixed_design = np.empty((n_samples, 0), dtype=np.float32)
+    else:
+        fixed_design = np.asarray(covar, dtype=np.float32)
+        if fixed_design.ndim != 2 or fixed_design.shape[0] != n_samples:
+            raise ValueError("Adaptive marker-score covariates are malformed.")
 
     theta_values = np.asarray(theta, dtype=np.float64).reshape(-1)
     if theta_values.shape != (grm_index.n_grm + 1,):
@@ -2172,7 +2452,9 @@ def _compute_adaptive_marker_scores(
     ).astype(np.float32)
     probes *= 2.0
     probes -= 1.0
-    rhs = np.concatenate([residual[:, None], probes], axis=1).astype(
+    rhs = np.concatenate(
+        [residual[:, None], probes, fixed_design], axis=1
+    ).astype(
         np.float32,
         copy=False,
     )
@@ -2195,8 +2477,40 @@ def _compute_adaptive_marker_scores(
     if not np.isfinite(true_residual):
         raise RuntimeError("Adaptive marker-score PCG true residual is non-finite.")
 
+    solution_np = np.asarray(jax.device_get(solution), dtype=np.float32)
+    core_solution = solution_np[:, : int(n_probes) + 1]
+    if fixed_design.shape[1] > 0:
+        vinv_c = solution_np[:, int(n_probes) + 1 :]
+        covar_gram = (
+            fixed_design.astype(np.float64).T @ vinv_c.astype(np.float64)
+        )
+        covar_gram_inverse = np.linalg.pinv(
+            0.5 * (covar_gram + covar_gram.T),
+            rcond=1e-10,
+            hermitian=True,
+        )
+        projection_coefficients = covar_gram_inverse @ (
+            fixed_design.astype(np.float64).T
+            @ core_solution.astype(np.float64)
+        )
+        projected_solution = core_solution - vinv_c @ projection_coefficients.astype(
+            np.float32
+        )
+    else:
+        projected_solution = core_solution
+
+    projected_solution[:, 0] /= np.float32(scale)
     xt_solution = np.asarray(
-        grm_index.xtv_all(solution, normalize=False),
+        grm_index.xtv_all(
+            jnp.asarray(core_solution, dtype=jnp.float32), normalize=False
+        ),
+        dtype=np.float64,
+    )
+    xt_projected_solution = np.asarray(
+        grm_index.xtv_all(
+            jnp.asarray(projected_solution, dtype=jnp.float32),
+            normalize=False,
+        ),
         dtype=np.float64,
     )
     xt_probe = np.asarray(
@@ -2214,6 +2528,11 @@ def _compute_adaptive_marker_scores(
         )
     if xt_probe.shape != (grm_index.m_total, int(n_probes)):
         raise RuntimeError("Adaptive marker-score X'probe has the wrong shape.")
+    if xt_projected_solution.shape != expected_shape:
+        raise RuntimeError(
+            "Adaptive marker-score X'P RHS has the wrong shape: "
+            f"{xt_projected_solution.shape} != {expected_shape}."
+        )
 
     numerator = xt_solution[:, 0]
     information = np.mean(
@@ -2235,6 +2554,38 @@ def _compute_adaptive_marker_scores(
     signal_score = np.abs(numerator) / np.sqrt(information_safe)
     if not np.all(np.isfinite(signal_score)):
         raise RuntimeError("Adaptive marker score contains non-finite values.")
+
+    projected_numerator = xt_projected_solution[:, 0]
+    projected_information = np.mean(
+        xt_probe * xt_projected_solution[:, 1:],
+        axis=1,
+        dtype=np.float64,
+    )
+    projected_positive = projected_information[
+        np.isfinite(projected_information) & (projected_information > 0.0)
+    ]
+    if projected_positive.size == 0:
+        raise RuntimeError(
+            "Hutchinson projected marker-information estimate has no positive entries."
+        )
+    projected_information_floor = max(
+        float(np.median(projected_positive)) * 1e-6,
+        float(np.finfo(np.float32).tiny),
+    )
+    projected_clipped = (
+        ~np.isfinite(projected_information)
+        | (projected_information <= projected_information_floor)
+    )
+    projected_information_safe = np.where(
+        projected_clipped,
+        projected_information_floor,
+        projected_information,
+    )
+    covariance_score = 0.5 * (
+        np.square(projected_numerator) - projected_information_safe
+    )
+    if not np.all(np.isfinite(covariance_score)):
+        raise RuntimeError("Signed covariance marker score contains non-finite values.")
 
     global_indices = np.arange(grm_index.m_total, dtype=np.int64)
     source_indices = grm_index.source_variant_indices(global_indices)
@@ -2265,6 +2616,13 @@ def _compute_adaptive_marker_scores(
             information_diagonal=information_safe[source_order].astype(
                 np.float32
             ),
+            covariance_score=covariance_score[source_order].astype(np.float32),
+            projected_score_numerator=projected_numerator[source_order].astype(
+                np.float32
+            ),
+            projected_information_diagonal=projected_information_safe[
+                source_order
+            ].astype(np.float32),
         )
     os.replace(temporary, output_path)
     return {
@@ -2272,6 +2630,11 @@ def _compute_adaptive_marker_scores(
         "status": "emitted",
         "path": os.path.abspath(output_path),
         "definition": "abs(x_t_Vinv_residual)/sqrt(x_t_Vinv_x)",
+        "covariance_score_definition": (
+            "0.5*((x_t_P_residual_standardized)^2-x_t_P_x)"
+        ),
+        "fixed_effect_projection": "P_includes_all_unpenalized_covariates",
+        "residual_scale_for_covariance_score": "standardized_phenotype",
         "information_diagonal_estimator": (
             "sample_space_rademacher_hutchinson"
         ),
@@ -2281,9 +2644,363 @@ def _compute_adaptive_marker_scores(
         "information_floor": float(information_floor),
         "information_clipped_count": int(np.count_nonzero(clipped)),
         "information_clipped_fraction": float(np.mean(clipped)),
+        "projected_information_floor": float(projected_information_floor),
+        "projected_information_clipped_count": int(
+            np.count_nonzero(projected_clipped)
+        ),
+        "projected_information_clipped_fraction": float(
+            np.mean(projected_clipped)
+        ),
         "pcg_reported_relative_residual": float(reported),
         "pcg_true_relative_residual": float(true_residual),
         "pcg_iterations": int(iterations),
+    }
+
+
+def _write_covtree_bootstrap_marker_scores(
+    *,
+    output_path: str,
+    grm_index: MultiGRMIndex,
+    marker_scores: dict[str, np.ndarray],
+    bootstrap_draws: int,
+    seed: int,
+) -> tuple[dict[str, object], np.ndarray]:
+    """Write CovTree's already-computed marker diagnostics in source order."""
+    required = {
+        "covariance_score",
+        "projected_score_numerator",
+        "projected_information_diagonal",
+    }
+    if not required.issubset(marker_scores):
+        raise ValueError("CovTree bootstrap marker-score payload is incomplete.")
+    cache_arrays = {
+        name: np.asarray(marker_scores[name], dtype=np.float32).reshape(-1)
+        for name in required
+    }
+    if any(value.shape != (grm_index.m_total,) for value in cache_arrays.values()):
+        raise ValueError("CovTree bootstrap marker-score length mismatch.")
+    if not all(np.all(np.isfinite(value)) for value in cache_arrays.values()):
+        raise ValueError("CovTree bootstrap marker scores contain non-finite values.")
+
+    cache_indices = np.arange(grm_index.m_total, dtype=np.int64)
+    cache_to_source = grm_index.source_variant_indices(cache_indices)
+    source_order = np.argsort(cache_to_source, kind="stable")
+    if not np.array_equal(
+        cache_to_source[source_order],
+        np.arange(grm_index.m_total, dtype=np.int64),
+    ):
+        raise RuntimeError("CovTree marker scores require a one-to-one source order.")
+    component_cache = np.empty(grm_index.m_total, dtype=np.int32)
+    for component_index in range(grm_index.n_grm):
+        component_cache[
+            int(grm_index.offsets[component_index]) :
+            int(grm_index.offsets[component_index + 1])
+        ] = int(component_index)
+
+    ensure_parent_dir(output_path)
+    temporary = f"{output_path}.tmp.{os.getpid()}"
+    with open(temporary, "wb") as handle:
+        np.savez_compressed(
+            handle,
+            source_variant_index=cache_to_source[source_order],
+            parent_component_index=component_cache[source_order],
+            covariance_score=cache_arrays["covariance_score"][source_order],
+            projected_score_numerator=cache_arrays[
+                "projected_score_numerator"
+            ][source_order],
+            projected_information_diagonal=cache_arrays[
+                "projected_information_diagonal"
+            ][source_order],
+        )
+    os.replace(temporary, output_path)
+    covariance_source = cache_arrays["covariance_score"][source_order]
+    return (
+        {
+            "requested": True,
+            "status": "emitted",
+            "path": os.path.abspath(output_path),
+            "definition": "0.5*((x_t_P_e)^2-x_t_P_x)",
+            "fixed_effect_projection": "P_includes_all_unpenalized_covariates",
+            "residual_scale": "standardized_phenotype",
+            "information_diagonal_estimator": (
+                "fitted_null_parametric_bootstrap_mean_square"
+            ),
+            "quadratic_backend": "reused_covtree_Xt_Pe_bootstrap_pass",
+            "n_markers": int(grm_index.m_total),
+            "bootstrap_draws": int(bootstrap_draws),
+            "seed": int(seed),
+        },
+        covariance_source,
+    )
+
+
+def _run_covtree_diagnostic(
+    *,
+    args: argparse.Namespace,
+    fitter,
+    ops,
+    grm_index: MultiGRMIndex,
+    component_spec_path: str,
+    bed_prefix: str,
+    marker_score_path: str,
+    residual_raw: np.ndarray,
+    covar: np.ndarray | None,
+    phenotype_scale: float,
+    theta: np.ndarray,
+) -> dict[str, object]:
+    """Test all genotype-only splits and optionally emit one accepted spec."""
+    components = _covtree_components_from_spec(component_spec_path)
+    ld_score = _load_ld_score_in_bim_order(
+        args.covtree_ld_score,
+        bed_prefix + ".bim",
+    )
+    if ld_score.shape != (grm_index.m_total,):
+        raise RuntimeError("CovTree LD-score length does not match the genotype panel.")
+    streamer = fitter.streamers[0]
+    means_cache = np.asarray(streamer._means_host, dtype=np.float64)
+    cache_indices = np.arange(grm_index.m_total, dtype=np.int64)
+    cache_to_source = grm_index.source_variant_indices(cache_indices)
+    means_source = np.empty(grm_index.m_total, dtype=np.float64)
+    means_source[cache_to_source] = means_cache
+    allele_frequency = np.clip(0.5 * means_source, 0.0, 1.0)
+    heterozygosity = 2.0 * allele_frequency * (1.0 - allele_frequency)
+    positive_heterozygosity = heterozygosity[heterozygosity > 0.0]
+    if positive_heterozygosity.size == 0:
+        raise RuntimeError("CovTree could not estimate any positive heterozygosity.")
+    heterozygosity_floor = max(
+        float(np.min(positive_heterozygosity)) * 0.5,
+        float(np.finfo(np.float32).tiny),
+    )
+    heterozygosity_floored = heterozygosity <= 0.0
+    heterozygosity = np.where(
+        heterozygosity_floored, heterozygosity_floor, heterozygosity
+    )
+
+    candidates, candidate_rejections = generate_covtree_candidates(
+        components,
+        ld_score=ld_score,
+        heterozygosity=heterozygosity,
+        min_child_markers=int(args.covtree_min_child_markers),
+        max_univariate_depth=int(
+            getattr(args, "covtree_max_univariate_depth", 2)
+        ),
+    )
+    theta_values = np.asarray(theta, dtype=np.float64).reshape(-1)
+    parent_threshold = max(
+        float(args.covtree_parent_theta_abs_min),
+        float(args.covtree_parent_theta_rel_min)
+        * max(float(np.sum(theta_values[:-1])), np.finfo(float).tiny),
+    )
+    eligible_candidates = []
+    bootstrap_rank_capacity = max(
+        int(args.covtree_bootstrap_draws) - 1 - (len(components) + 1),
+        0,
+    )
+    for candidate in candidates:
+        parent_theta = float(theta_values[candidate.parent_index])
+        if candidate.degrees_of_freedom > bootstrap_rank_capacity:
+            candidate_rejections.append(
+                {
+                    "parent_index": int(candidate.parent_index),
+                    "parent_name": candidate.parent_name,
+                    "split_kind": candidate.split_kind,
+                    "reason": "insufficient_bootstrap_information_rank_capacity",
+                    "candidate_degrees_of_freedom": int(
+                        candidate.degrees_of_freedom
+                    ),
+                    "bootstrap_rank_capacity": bootstrap_rank_capacity,
+                }
+            )
+        elif parent_theta <= parent_threshold:
+            candidate_rejections.append(
+                {
+                    "parent_index": int(candidate.parent_index),
+                    "parent_name": candidate.parent_name,
+                    "split_kind": candidate.split_kind,
+                    "reason": "parent_variance_at_boundary",
+                    "parent_theta": parent_theta,
+                    "threshold": parent_threshold,
+                }
+            )
+        else:
+            eligible_candidates.append(candidate)
+
+    residual_standardized = np.asarray(residual_raw, dtype=np.float32) / np.float32(
+        phenotype_scale
+    )
+    selected_candidate = None
+    marker_score_summary: dict[str, object] = {
+        "requested": True,
+        "status": "not_emitted_no_eligible_candidate",
+        "path": None,
+    }
+    if eligible_candidates:
+        inference, selected_candidate, bootstrap_marker_scores = (
+            evaluate_covtree_candidates(
+                fitter=fitter,
+                ops=ops,
+                grm_index=grm_index,
+                candidates=eligible_candidates,
+                theta=theta_values,
+                covar=covar,
+                residual_standardized=residual_standardized,
+                bootstrap_draws=int(args.covtree_bootstrap_draws),
+                seed=int(args.covtree_bootstrap_seed),
+                alpha=float(args.covtree_alpha),
+                rank_rtol=float(args.covtree_rank_rtol),
+                pcg_tol=float(args.pcg_tol),
+                max_pcg_iters=int(args.max_pcg_iters),
+            )
+        )
+        marker_score_summary, signed_marker = _write_covtree_bootstrap_marker_scores(
+            output_path=marker_score_path,
+            grm_index=grm_index,
+            marker_scores=bootstrap_marker_scores,
+            bootstrap_draws=int(args.covtree_bootstrap_draws),
+            seed=int(args.covtree_bootstrap_seed),
+        )
+        for candidate, metadata in zip(
+            eligible_candidates, inference["candidates"], strict=True
+        ):
+            signed_child_means = np.asarray(
+                [float(np.mean(signed_marker[child])) for child in candidate.children]
+            )
+            contrasts = np.asarray(
+                metadata["contrast_coefficients"], dtype=np.float64
+            )
+            raw_signed_contrasts = signed_child_means @ contrasts
+            metadata.update(
+                {
+                    "signed_marker_child_means": signed_child_means.tolist(),
+                    "raw_signed_marker_contrast_scores": raw_signed_contrasts.tolist(),
+                    "raw_signed_marker_contrast_norm": float(
+                        np.linalg.norm(raw_signed_contrasts)
+                    ),
+                }
+            )
+    else:
+        inference = {
+            "method": "nuisance_adjusted_reml_score_parametric_max_bootstrap",
+            "accepted": False,
+            "best_candidate_index": None,
+            "selected_candidate_index": None,
+            "best_candidate_name": None,
+            "max_score_adjusted_p": None,
+            "max_score_adjusted_p_mc_se": None,
+            "bootstrap_draws": 0,
+            "candidate_count": 0,
+            "candidate_contrast_count": 0,
+            "candidates": [],
+            "pcg": [],
+        }
+
+    split_spec_path = None
+    warm_start = None
+    warm_start_weighting = None
+    if selected_candidate is not None:
+        selected_metadata = inference["candidates"][
+            int(inference["selected_candidate_index"])
+        ]
+        warm_start = selective_covariance_warm_start(
+            theta_values,
+            components,
+            selected_candidate,
+            child_effective_markers=selected_metadata[
+                "child_effective_markers"
+            ],
+        )
+        warm_start_weighting = "effective_marker_count"
+        if args.covtree_split_spec_out:
+            updated_components = replace_covtree_parent(
+                components, selected_candidate
+            )
+            split_spec_path = str(
+                write_component_spec(
+                    args.covtree_split_spec_out,
+                    updated_components,
+                    provenance={
+                        "algorithm": "coherit_covtree_v1",
+                        "source_component_spec": os.path.abspath(
+                            component_spec_path
+                        ),
+                        "selected_candidate": selected_candidate.name,
+                        "max_score_adjusted_p": inference[
+                            "max_score_adjusted_p"
+                        ],
+                    },
+                )
+            )
+
+    diagnostic = {
+        **inference,
+        "status": "complete",
+        "current_k": len(components),
+        "next_k": (
+            len(components) - 1 + len(selected_candidate.children)
+            if selected_candidate is not None
+            else len(components)
+        ),
+        "candidate_generation": (
+            "within_parent_recursive_exact_2means_ld_maf_and_ld_by_maf"
+        ),
+        "candidate_features": {
+            "ld": "log1p_individual_ld_score",
+            "maf": "log_2p1mp_from_training_genotype_mean",
+            "phenotype_independent": True,
+        },
+        "candidate_rejections": candidate_rejections,
+        "parent_theta_boundary_threshold": parent_threshold,
+        "bootstrap_rank_capacity": bootstrap_rank_capacity,
+        "heterozygosity_floor": heterozygosity_floor,
+        "heterozygosity_floored_count": int(
+            np.count_nonzero(heterozygosity_floored)
+        ),
+        "signed_marker_score_path": marker_score_summary["path"],
+        "marker_score": marker_score_summary,
+        "selected_split_spec": split_spec_path,
+        "covariance_preserving_warm_start": (
+            warm_start.tolist() if warm_start is not None else None
+        ),
+        "covariance_preserving_warm_start_weighting": warm_start_weighting,
+        "stopping_reason": (
+            None
+            if selected_candidate is not None
+            else (
+                "no_eligible_candidate"
+                if not eligible_candidates
+                else "max_score_not_significant"
+            )
+        ),
+    }
+    output_path = args.covtree_diagnostic_out
+    ensure_parent_dir(output_path)
+    temporary = f"{output_path}.tmp.{os.getpid()}"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        json.dump(
+            _json_safe_value(diagnostic),
+            handle,
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+        )
+        handle.write("\n")
+    os.replace(temporary, output_path)
+    return {
+        "status": "complete",
+        "path": os.path.abspath(output_path),
+        "accepted": bool(selected_candidate is not None),
+        "selected_candidate": (
+            selected_candidate.name if selected_candidate is not None else None
+        ),
+        "max_score_adjusted_p": inference["max_score_adjusted_p"],
+        "current_k": len(components),
+        "next_k": diagnostic["next_k"],
+        "selected_split_spec": split_spec_path,
+        "covariance_preserving_warm_start": diagnostic[
+            "covariance_preserving_warm_start"
+        ],
+        "stopping_reason": diagnostic["stopping_reason"],
+        "marker_score": marker_score_summary,
     }
 
 
@@ -2319,6 +3036,16 @@ def main() -> None:
         raise SystemExit("pcg-tol must be finite and > 0.")
     if args.marker_score_out and int(args.marker_score_probes) < 1:
         raise SystemExit("marker-score-probes must be >= 1.")
+    for state_flag, state_path in (
+        ("--sparse-state-in", args.sparse_state_in),
+        ("--sparse-state-out", args.sparse_state_out),
+    ):
+        if state_path and not state_path.lower().endswith(".npz"):
+            raise SystemExit(f"{state_flag} must end in .npz.")
+    if args.sparse_state_in and not os.path.isfile(args.sparse_state_in):
+        raise SystemExit(
+            f"--sparse-state-in does not exist: {args.sparse_state_in}"
+        )
     if args.marker_score_min_validation_r2 is not None:
         threshold = float(args.marker_score_min_validation_r2)
         if not np.isfinite(threshold):
@@ -2327,6 +3054,49 @@ def main() -> None:
             raise SystemExit(
                 "--marker-score-min-validation-r2 requires --marker-score-out."
             )
+    covtree_requested = bool(args.covtree_diagnostic_out)
+    if args.covtree_split_spec_out and not covtree_requested:
+        raise SystemExit(
+            "--covtree-split-spec-out requires --covtree-diagnostic-out."
+        )
+    if covtree_requested:
+        if not args.marker_score_out:
+            raise SystemExit(
+                "--covtree-diagnostic-out requires --marker-score-out so the "
+                "signed marker diagnostic is auditable."
+            )
+        if not args.covtree_ld_score:
+            raise SystemExit(
+                "--covtree-diagnostic-out requires --covtree-ld-score."
+            )
+        if args.marker_score_min_validation_r2 is not None:
+            raise SystemExit(
+                "CovTree covariance testing cannot be skipped by a prediction-R2 "
+                "threshold; remove --marker-score-min-validation-r2."
+            )
+        if int(args.covtree_bootstrap_draws) < 19:
+            raise SystemExit("covtree-bootstrap-draws must be >= 19.")
+        if int(args.covtree_min_child_markers) < 1:
+            raise SystemExit("covtree-min-child-markers must be >= 1.")
+        if not 1 <= int(args.covtree_max_univariate_depth) <= 10:
+            raise SystemExit("covtree-max-univariate-depth must lie in 1..10.")
+        for name in (
+            "covtree_rank_rtol",
+            "covtree_parent_theta_abs_min",
+            "covtree_parent_theta_rel_min",
+        ):
+            value = float(getattr(args, name))
+            if not np.isfinite(value) or value < 0.0:
+                raise SystemExit(
+                    f"{name.replace('_', '-')} must be finite and nonnegative."
+                )
+        if float(args.covtree_rank_rtol) <= 0.0:
+            raise SystemExit("covtree-rank-rtol must be > 0.")
+        if (
+            not np.isfinite(float(args.covtree_alpha))
+            or not 0.0 < float(args.covtree_alpha) < 1.0
+        ):
+            raise SystemExit("covtree-alpha must lie in (0, 1).")
     if (
         not np.isfinite(float(args.lasso_lam_min_ratio))
         or not 0.0 < float(args.lasso_lam_min_ratio) <= 1.0
@@ -2452,6 +3222,19 @@ def main() -> None:
             raise SystemExit("single-source component partitioning cannot be combined with multiple BED prefixes.")
         if not (len(bed_list) == 1 or pgen_prefix):
             raise SystemExit("single-source component partitioning requires exactly one genotype input.")
+    if covtree_requested:
+        if not component_variant_indices:
+            raise SystemExit(
+                "CovTree diagnostics require --component-spec, including at K=1."
+            )
+        if len(bed_list) != 1 or pgen_prefix:
+            raise SystemExit(
+                "CovTree diagnostics currently require one PLINK1 BED source."
+            )
+        if not os.path.isfile(args.covtree_ld_score):
+            raise SystemExit(
+                f"CovTree LD-score file does not exist: {args.covtree_ld_score}"
+            )
     if not args.pheno_txt:
         raise SystemExit("--pheno-txt is required.")
 
@@ -2772,7 +3555,9 @@ def main() -> None:
     sparse_path_performance = {
         "candidate_reuse_across_outer": True,
         "buffered_kkt_expansion": True,
+        "kkt_small_overflow_absorption": True,
         "lasso_path_coefficient_warm_start": True,
+        "lasso_path_tiny_basis_growth_warm_start": True,
         "lasso_path_solves": 0,
         "lasso_cd_iterations": 0,
         "lasso_path_warm_start_rows_used": 0,
@@ -2805,6 +3590,93 @@ def main() -> None:
     B_screen_np = np.concatenate(screen_parts, axis=1).astype(np.float32, copy=False)
     B_screen_dev = jnp.asarray(B_screen_np, dtype=jnp.float32)
     n_screen = B_screen_np.shape[1]
+    sparse_state_in_summary = None
+    if args.sparse_state_in:
+        sparse_state = _load_sparse_numerical_state(
+            args.sparse_state_in,
+            grm_index=grm_index,
+            n_samples=n_samples,
+            n_lambda=int(args.lasso_n_lambda),
+        )
+        state_screen = sparse_state["screen_solution"]
+        if state_screen.shape != (n_samples, n_screen):
+            raise ValueError(
+                "Sparse state screening RHS count differs from the current design."
+            )
+        state_candidate = np.asarray(
+            sparse_state["candidate"], dtype=np.int64
+        )
+        support = np.asarray(sparse_state["support"], dtype=np.int64)
+        candidate_cache = state_candidate.copy()
+        warm_lasso_candidate = state_candidate.copy()
+        warm_lasso_beta_path = np.asarray(
+            sparse_state["beta_snp_path"], dtype=np.float64
+        )
+        warm_screen = state_screen
+        state_z = np.asarray(sparse_state["z_solution"], dtype=np.float32)
+        warm_z_dict = {
+            int(marker): state_z[:, column]
+            for column, marker in enumerate(state_candidate.tolist())
+        }
+        previous_fixed_mean = np.asarray(
+            sparse_state["fixed_mean"], dtype=np.float64
+        )
+        sparse_state_in_summary = {
+            "status": "loaded",
+            "path": os.path.abspath(args.sparse_state_in),
+            "candidate_size": int(state_candidate.size),
+            "support_size": int(support.size),
+            "lambda_rows": int(warm_lasso_beta_path.shape[0]),
+            "screen_rhs_columns": int(n_screen),
+            "coordinate_remap": "source_to_current_component_cache",
+        }
+        sparse_path_performance["covtree_parent_state_loaded"] = True
+        sparse_path_performance["covtree_parent_candidate_columns"] = int(
+            state_candidate.size
+        )
+        logger.info(
+            "[covtree warm] loaded parent sparse state: candidate=%s support=%s",
+            int(state_candidate.size),
+            int(support.size),
+        )
+    else:
+        sparse_path_performance["covtree_parent_state_loaded"] = False
+
+    covariance_settling_summary = None
+    if sparse_state_in_summary is not None:
+        settling_residual = (
+            np.asarray(y_np, dtype=np.float64) - previous_fixed_mean
+        ) / float(phenotype_scale)
+        settling_result = _fit_covariate_contrast_residual_reml(
+            fitter,
+            settling_residual,
+            theta,
+            covar=covar_np,
+            h2_init=_trace_weighted_h2(theta),
+        )
+        settled_theta, settling_stop_reason = _accepted_reml_theta(
+            settling_result,
+            expected_components=n_grm + 1,
+            stage="CovTree covariance-only settling",
+        )
+        covariance_settling_summary = {
+            "alpha_frozen": True,
+            "theta_input": np.asarray(theta, dtype=np.float64).tolist(),
+            "theta_output": np.asarray(settled_theta, dtype=np.float64).tolist(),
+            "relative_change": float(
+                _max_rel_change(settled_theta, theta)
+            ),
+            "stop_reason": settling_stop_reason,
+        }
+        theta = np.asarray(settled_theta, dtype=np.float64)
+        sparse_path_performance["covtree_covariance_only_settling"] = True
+        logger.info(
+            "[covtree warm] covariance-only settling stop=%s theta=%s",
+            settling_stop_reason,
+            theta.tolist(),
+        )
+    else:
+        sparse_path_performance["covtree_covariance_only_settling"] = False
 
     # Kept for output-schema compatibility.  It now records the single KKT
     # check from the final covariance-aligned Lasso update; it is not a second
@@ -3030,14 +3902,15 @@ def main() -> None:
                 previous_beta_path=warm_lasso_beta_path,
                 candidate=candidate,
             )
-            # Coefficient-path reuse is deliberately restricted to an
-            # unchanged marker basis.  On an expanded basis the ordinary
-            # descending-lambda warm start is often faster in strong LD; the
-            # reusable candidate set, PCG columns and KKT buffer already avoid
-            # the expensive reconstruction work in that case.
-            if not (
-                warm_lasso_columns == int(candidate.size)
-                and warm_lasso_columns == int(warm_lasso_candidate.size)
+            # Meaningful basis expansions retain the ordinary descending-
+            # lambda warm start, which was empirically faster in strong LD.
+            # Tiny tail expansions are different: remapping the complete old
+            # path avoids resolving ~2,000 unchanged coordinates for a handful
+            # of late KKT markers.
+            if not _allow_expanded_lasso_path_warm_start(
+                previous_size=int(warm_lasso_candidate.size),
+                current_size=int(candidate.size),
+                common_size=warm_lasso_columns,
             ):
                 beta_snp_path0 = None
                 warm_lasso_columns = 0
@@ -3279,7 +4152,11 @@ def main() -> None:
             }
             candidate_limit_error = None
             if n_viol > 0:
-                expansion_budget = int(args.kkt_add_topk)
+                nominal_expansion_budget = int(args.kkt_add_topk)
+                expansion_budget = _kkt_expansion_budget(
+                    n_viol,
+                    nominal_expansion_budget,
+                )
                 max_candidate = int(args.kkt_max_candidate)
                 if max_candidate > 0:
                     available = max_candidate - int(candidate.size)
@@ -4231,8 +5108,9 @@ def main() -> None:
     )
 
     adaptive_marker_score_summary = None
+    covtree_diagnostic_summary = None
     marker_score_output = args.marker_score_out.strip()
-    if marker_score_output:
+    if marker_score_output and not covtree_requested:
         if not lasso_branch_valid:
             raise RuntimeError(
                 "Adaptive marker scores require a valid covariance-aligned "
@@ -4282,6 +5160,8 @@ def main() -> None:
             adaptive_marker_score_summary = _compute_adaptive_marker_scores(
                 output_path=marker_score_output,
                 residual_raw=marker_score_residual,
+                covar=covar_np,
+                phenotype_scale=phenotype_scale,
                 fitter=fitter,
                 ops=ops,
                 grm_index=grm_index,
@@ -4298,6 +5178,72 @@ def main() -> None:
                 adaptive_marker_score_summary[
                     "information_clipped_count"
                 ],
+            )
+
+    if covtree_requested:
+        marker_score_residual = _lasso_residual(
+            y=y_np,
+            covar=covar_np,
+            geno=Z_support,
+            beta_cov=beta_cov_lasso,
+            beta_snp=beta_lasso_active,
+        )
+        covtree_diagnostic_summary = _run_covtree_diagnostic(
+            args=args,
+            fitter=fitter,
+            ops=ops,
+            grm_index=grm_index,
+            component_spec_path=component_spec_source,
+            bed_prefix=bed_list[0],
+            marker_score_path=marker_score_output,
+            residual_raw=marker_score_residual,
+            covar=covar_np,
+            phenotype_scale=phenotype_scale,
+            theta=theta_lasso_ml,
+        )
+        adaptive_marker_score_summary = covtree_diagnostic_summary["marker_score"]
+        logger.info(
+            "[covtree] accepted=%s candidate=%s adjusted_p=%s next_K=%s",
+            covtree_diagnostic_summary["accepted"],
+            covtree_diagnostic_summary["selected_candidate"],
+            covtree_diagnostic_summary["max_score_adjusted_p"],
+            covtree_diagnostic_summary["next_k"],
+        )
+
+    sparse_state_out_summary = None
+    if args.sparse_state_out:
+        next_split_needed = not covtree_requested or bool(
+            covtree_diagnostic_summary["accepted"]
+        )
+        if not next_split_needed:
+            sparse_state_out_summary = {
+                "status": "not_emitted_covtree_stopped",
+                "path": None,
+            }
+        else:
+            if (
+                not alpha_theta_pair_usable
+                or final_candidate.size == 0
+                or warm_lasso_beta_path is None
+                or warm_screen is None
+            ):
+                raise RuntimeError(
+                    "Sparse numerical state output requires a valid final "
+                    "covariance-aligned Lasso pair."
+                )
+            sparse_state_out_summary = _write_sparse_numerical_state(
+                args.sparse_state_out,
+                grm_index=grm_index,
+                candidate=final_candidate,
+                support=support,
+                beta_snp_path=warm_lasso_beta_path,
+                screen_solution=warm_screen,
+                warm_z_dict=warm_z_dict,
+                fixed_mean=fixed_mean_current,
+            )
+            logger.info(
+                "[covtree warm] sparse numerical state -> %s",
+                args.sparse_state_out,
             )
 
     print(f"[RESULT] var_components_lasso_ml={theta_lasso_ml.tolist()}")
@@ -4777,6 +5723,16 @@ def main() -> None:
         summary["variance_components_init_source"] = theta_init_source
     if adaptive_marker_score_summary is not None:
         summary["adaptive_marker_score"] = adaptive_marker_score_summary
+    if covtree_diagnostic_summary is not None:
+        summary["covtree_diagnostic"] = covtree_diagnostic_summary
+    if sparse_state_in_summary is not None:
+        summary["sparse_state_in"] = sparse_state_in_summary
+    if covariance_settling_summary is not None:
+        summary["covtree_covariance_only_settling"] = (
+            covariance_settling_summary
+        )
+    if sparse_state_out_summary is not None:
+        summary["sparse_state_out"] = sparse_state_out_summary
 
     if comparison_enabled:
         summary.update({

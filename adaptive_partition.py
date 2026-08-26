@@ -66,27 +66,41 @@ def single_component(n_variants: int) -> list[AdaptiveComponent]:
     ]
 
 
-def _exact_signal_two_means_split(
+def exact_two_means_split(
     indices: np.ndarray,
-    signal_score: np.ndarray,
+    feature: np.ndarray,
+    *,
+    min_cluster_size: int = 1,
+    feature_name: str = "feature",
 ) -> tuple[np.ndarray, np.ndarray, dict[str, float | int]]:
-    """Return the exact deterministic one-dimensional two-means partition.
+    """Return an exact deterministic one-dimensional two-means partition.
 
     For squared Euclidean distance, the globally optimal clusters are
     contiguous after sorting the scalar scores.  Evaluating every admissible
     split therefore avoids the initialization and local-minimum ambiguity of
-    iterative Lloyd k-means.  At least two markers are retained in each
-    signal cluster because both clusters are subsequently split by LD rank.
+    iterative Lloyd k-means.  Ties are resolved by marker index and then by
+    preferring the most balanced optimal split.
     """
-    count = int(indices.size)
-    if count < 4:
+    marker_indices = np.asarray(indices, dtype=np.int64).reshape(-1)
+    values_all = np.asarray(feature, dtype=np.float64).reshape(-1)
+    minimum = int(min_cluster_size)
+    if minimum < 1:
+        raise ValueError("min_cluster_size must be >= 1.")
+    if marker_indices.size == 0:
+        raise ValueError("indices must be nonempty.")
+    if np.any((marker_indices < 0) | (marker_indices >= values_all.size)):
+        raise IndexError("indices contain an out-of-range marker.")
+    count = int(marker_indices.size)
+    if count < 2 * minimum:
         raise ValueError(
-            "A four-way split requires at least four markers for signal "
-            f"two-means; parent size={count}."
+            "An exact two-means split requires at least twice the minimum "
+            f"cluster size; parent size={count}, minimum={minimum}."
         )
-    values = np.asarray(signal_score[indices], dtype=np.float64)
+    values = values_all[marker_indices]
+    if not np.all(np.isfinite(values)):
+        raise ValueError(f"{feature_name} must be finite within the parent.")
     # Primary key: ascending score. Secondary key: source marker index.
-    order = np.lexsort((indices, values))
+    order = np.lexsort((marker_indices, values))
     sorted_values = values[order]
 
     prefix_sum = np.concatenate(
@@ -98,7 +112,7 @@ def _exact_signal_two_means_split(
             np.cumsum(sorted_values * sorted_values, dtype=np.float64),
         )
     )
-    split_positions = np.arange(2, count - 1, dtype=np.int64)
+    split_positions = np.arange(minimum, count - minimum + 1, dtype=np.int64)
     low_count = split_positions.astype(np.float64)
     high_count = float(count) - low_count
     low_sum = prefix_sum[split_positions]
@@ -122,22 +136,40 @@ def _exact_signal_two_means_split(
 
     low_order = order[:split]
     high_order = order[split:]
-    low = np.sort(indices[low_order])
-    high = np.sort(indices[high_order])
+    low = np.sort(marker_indices[low_order])
+    high = np.sort(marker_indices[high_order])
     low_mean = float(np.mean(values[low_order]))
     high_mean = float(np.mean(values[high_order]))
     if high_mean < low_mean:
         raise RuntimeError("Signal two-means reversed the ordered cluster means.")
     cutoff = float(0.5 * (low_mean + high_mean))
     diagnostics: dict[str, float | int] = {
-        "signal_cluster_low_size": int(low.size),
-        "signal_cluster_high_size": int(high.size),
-        "signal_cluster_low_mean": low_mean,
-        "signal_cluster_high_mean": high_mean,
-        "signal_cluster_boundary": cutoff,
-        "signal_cluster_within_sse": float(objective[best_index]),
+        f"{feature_name}_cluster_low_size": int(low.size),
+        f"{feature_name}_cluster_high_size": int(high.size),
+        f"{feature_name}_cluster_low_mean": low_mean,
+        f"{feature_name}_cluster_high_mean": high_mean,
+        f"{feature_name}_cluster_boundary": cutoff,
+        f"{feature_name}_cluster_within_sse": float(objective[best_index]),
     }
     return high, low, diagnostics
+
+
+def _exact_signal_two_means_split(
+    indices: np.ndarray,
+    signal_score: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, dict[str, float | int]]:
+    """Prediction-first compatibility wrapper with two markers per child."""
+    if np.asarray(indices).size < 4:
+        raise ValueError(
+            "A four-way split requires at least four markers for signal "
+            f"two-means; parent size={np.asarray(indices).size}."
+        )
+    return exact_two_means_split(
+        indices,
+        signal_score,
+        min_cluster_size=2,
+        feature_name="signal",
+    )
 
 
 def _stable_ld_split(
@@ -288,6 +320,7 @@ def write_component_spec(
 __all__ = [
     "AdaptiveComponent",
     "covariance_preserving_warm_start",
+    "exact_two_means_split",
     "four_way_split",
     "single_component",
     "validate_partition",

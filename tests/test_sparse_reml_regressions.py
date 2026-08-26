@@ -22,6 +22,86 @@ REML = importlib.import_module(f"{PKG}.reml")
 LASSO = importlib.import_module(f"{PKG}.lasso_cd")
 
 
+class _StateIndex:
+    def __init__(self, cache_to_source, offsets=None):
+        self.cache_to_source = np.asarray(cache_to_source, dtype=np.int64)
+        self.m_total = int(self.cache_to_source.size)
+        self.offsets = np.asarray(
+            [0, self.m_total] if offsets is None else offsets,
+            dtype=np.int64,
+        )
+        self.n_grm = int(self.offsets.size - 1)
+
+    def source_variant_indices(self, cache_indices):
+        return self.cache_to_source[np.asarray(cache_indices, dtype=np.int64)]
+
+
+def test_covtree_sparse_state_round_trip_remaps_source_coordinates(tmp_path):
+    parent_index = _StateIndex([0, 1, 2, 3])
+    state_path = tmp_path / "state.npz"
+    candidate = np.asarray([0, 2, 3], dtype=np.int64)
+    support = np.asarray([2, 3], dtype=np.int64)
+    beta_path = np.arange(9, dtype=np.float64).reshape(3, 3)
+    screen = SPARSE.jnp.asarray(np.arange(10, dtype=np.float32).reshape(5, 2))
+    z_values = {
+        0: np.full(5, 1.0, dtype=np.float32),
+        2: np.full(5, 2.0, dtype=np.float32),
+        3: np.full(5, 3.0, dtype=np.float32),
+    }
+
+    SPARSE._write_sparse_numerical_state(
+        str(state_path),
+        grm_index=parent_index,
+        candidate=candidate,
+        support=support,
+        beta_snp_path=beta_path,
+        screen_solution=screen,
+        warm_z_dict=z_values,
+        fixed_mean=np.arange(5, dtype=np.float64),
+    )
+    child_index = _StateIndex([2, 0, 3, 1])
+    loaded = SPARSE._load_sparse_numerical_state(
+        str(state_path),
+        grm_index=child_index,
+        n_samples=5,
+        n_lambda=3,
+    )
+
+    np.testing.assert_array_equal(loaded["candidate"], [1, 0, 2])
+    np.testing.assert_array_equal(loaded["support"], [0, 2])
+    np.testing.assert_array_equal(loaded["beta_snp_path"], beta_path)
+    np.testing.assert_array_equal(
+        loaded["z_solution"], np.column_stack([z_values[0], z_values[2], z_values[3]])
+    )
+
+
+def test_covtree_bootstrap_marker_scores_are_written_in_source_order(tmp_path):
+    index = _StateIndex([2, 0, 3, 1], offsets=[0, 2, 4])
+    output = tmp_path / "marker_score.npz"
+    marker_scores = {
+        "covariance_score": np.asarray([20.0, 0.0, 30.0, 10.0]),
+        "projected_score_numerator": np.asarray([2.0, 0.0, 3.0, 1.0]),
+        "projected_information_diagonal": np.asarray([4.0, 1.0, 9.0, 2.0]),
+    }
+
+    summary, covariance_source = SPARSE._write_covtree_bootstrap_marker_scores(
+        output_path=str(output),
+        grm_index=index,
+        marker_scores=marker_scores,
+        bootstrap_draws=199,
+        seed=7,
+    )
+
+    assert summary["quadratic_backend"] == "reused_covtree_Xt_Pe_bootstrap_pass"
+    np.testing.assert_array_equal(covariance_source, [0.0, 10.0, 20.0, 30.0])
+    with np.load(output, allow_pickle=False) as payload:
+        np.testing.assert_array_equal(payload["source_variant_index"], [0, 1, 2, 3])
+        np.testing.assert_array_equal(payload["parent_component_index"], [0, 1, 0, 1])
+        np.testing.assert_array_equal(
+            payload["projected_score_numerator"], [0.0, 1.0, 2.0, 3.0]
+        )
+
+
 def test_validation_selected_path_materializes_alpha_used_downstream():
     lasso_path = {
         "beta_snp": np.asarray([0.0, 0.0]),
@@ -438,6 +518,31 @@ def test_buffered_kkt_expansion_prioritizes_strict_violators_at_budget():
     )
     assert expansion["n_strict_added"] == 2
     assert expansion["n_buffered_added"] == 0
+
+
+def test_kkt_expansion_budget_absorbs_only_small_overflow():
+    assert SPARSE._kkt_expansion_budget(267, 256) == 267
+    assert SPARSE._kkt_expansion_budget(281, 256) == 281
+    assert SPARSE._kkt_expansion_budget(282, 256) == 256
+    assert SPARSE._kkt_expansion_budget(3, 2) == 2
+
+
+def test_lasso_path_warm_start_is_reused_only_for_tiny_basis_growth():
+    assert SPARSE._allow_expanded_lasso_path_warm_start(
+        previous_size=2015,
+        current_size=2031,
+        common_size=2015,
+    )
+    assert not SPARSE._allow_expanded_lasso_path_warm_start(
+        previous_size=1759,
+        current_size=2015,
+        common_size=1759,
+    )
+    assert not SPARSE._allow_expanded_lasso_path_warm_start(
+        previous_size=2015,
+        current_size=2031,
+        common_size=2000,
+    )
 
 
 def test_partitioned_signed_kkt_distinguishes_candidate_and_outside_failures():
