@@ -104,8 +104,10 @@ variance-component update, and the full-marker KKT scan adds any omitted
 violating variants to the candidate set. The KKT tolerance is matched to the
 ordinary PCG precision; an independent finite-PCG score on candidate
 coordinates is diagnostic rather than a second rejection gate.
-The outer loop stops when both the variance components and the complete fitted
-fixed mean stabilize, or after the configured maximum number of updates. It
+The sparse pipeline standardizes the phenotype once at entry and uses that
+single analysis scale throughout every LASSO, REML, CHIVE, and prediction step.
+The outer loop stops when both the complete fitted mean and primary COHERIT
+heritability stabilize, or after the configured maximum number of updates. It
 then performs exactly one final validation-selected LASSO update at the
 returned covariance, without another
 variance update.  Reaching the outer limit is reported as a warning and does
@@ -144,18 +146,16 @@ Sparse-run output semantics are deliberately explicit:
 
 - By default, `estimator_mode` is `coherit` and `computed_estimators` contains
   only `h2_chive`.  No selected-support REML--GLS refit is run.
-- New sparse runs use output schema version 6, which records the estimator
-  mode and the validation/frozen-ratio lambda-selection contract explicitly.
-  Historical outputs remain valid artifacts but are not produced by the
-  current pipeline.
+- New sparse runs use output schema version 7. Raw/standardized duplicate
+  estimator fields and downstream phenotype-scale conversions no longer exist.
 - `var_components_lasso_ml` exposes the variance components used by COHERIT.
 - `h2` is the primary total estimate. For a valid covariance-aligned LASSO
   pair it combines the calibrated LASSO quadratic with the
   `var_components_lasso_ml` background and residual components.
 - `h2_chive_guarded` is the validated counterpart of `h2_chive`
   and equals the top-level `h2` field whenever the COHERIT branch is valid.
-- `q_chive_components` and `q_chive_components_standardized` retain the Lasso
-  plug-in and residual-correction terms that together form the COHERIT sparse
+- `q_chive_components` retains the Lasso plug-in and residual-correction terms
+  that together form the COHERIT sparse
   variance contribution; the plug-in term is not exposed as a standalone
   heritability estimator in the default mode.
 - Sparse prediction emits only the `lasso_*` branch by default: the Lasso
@@ -181,9 +181,9 @@ Sparse-run output semantics are deliberately explicit:
   `selected_snps.tsv` use exactly the same full-rank selected-marker basis.
   Numerically dependent selected columns receive coefficient zero and the
   `selected_span_basis` column identifies retained basis markers.
-- Raw-scale sparse quadratic terms and standardized-phenotype REML components
-  are never added directly.  The summary records both quadratic scales and the
-  phenotype scale used for conversion.
+- Every sparse quadratic and variance component is already on the one analysis
+  scale established by input phenotype standardization. The summary retains
+  only the input normalization metadata needed to transform external outcomes.
 - `lasso_branch_valid` validates the default COHERIT output and, in comparison
   mode, estimators 1 and 2;
   `selected_support_refit_branch_valid` validates estimators 3 and 4.  A

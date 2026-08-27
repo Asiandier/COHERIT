@@ -289,7 +289,7 @@ def evaluate_covtree_candidates(
     candidates: Sequence[CovTreeCandidate],
     theta: np.ndarray,
     covar: np.ndarray | None,
-    residual_standardized: np.ndarray,
+    residual: np.ndarray,
     bootstrap_draws: int,
     seed: int,
     alpha: float,
@@ -301,9 +301,9 @@ def evaluate_covtree_candidates(
     if len(fitter.streamers) != 1:
         raise ValueError("CovTree currently requires one dense genotype source.")
     streamer = fitter.streamers[0]
-    residual = np.asarray(residual_standardized, dtype=np.float32).reshape(-1)
+    residual = np.asarray(residual, dtype=np.float32).reshape(-1)
     if residual.shape != (int(streamer.n),) or not np.all(np.isfinite(residual)):
-        raise ValueError("residual_standardized is malformed.")
+        raise ValueError("residual is malformed.")
     significance = float(alpha)
     if not np.isfinite(significance) or not 0.0 < significance < 1.0:
         raise ValueError("alpha must lie in (0, 1).")

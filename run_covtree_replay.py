@@ -267,6 +267,8 @@ def _build_fitter(original: argparse.Namespace):
         strict_max_linesearch_trials=original.reml_max_linesearch_trials,
         max_pcg_iters=original.max_pcg_iters,
         pcg_ridge=original.pcg_ridge,
+        response_is_standardized=True,
+        unit_variance_components=True,
         verbose=original.verbose,
     )
     fitter = InfinitesimalREMLFitter(config)
@@ -298,6 +300,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     fitter, ops, grm_index, y, covar, bed_prefix = _build_fitter(original)
     try:
+        standardization = completed["input_phenotype_standardization"]
+        y = (
+            y - float(standardization["mean"])
+        ) / float(standardization["standard_deviation"])
         theta = np.asarray(completed["var_components_lasso_ml"], dtype=np.float64)
         support, beta = _selected_effects(selected_path)
         expected_support = np.asarray(completed["support_indices"], dtype=np.int64)
@@ -340,9 +346,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             component_spec_path=original.component_spec,
             bed_prefix=bed_prefix,
             marker_score_path=marker_path,
-            residual_raw=residual,
+            residual=residual,
             covar=covar,
-            phenotype_scale=float(completed["phenotype_scale"]),
             theta=theta,
         )
         print(

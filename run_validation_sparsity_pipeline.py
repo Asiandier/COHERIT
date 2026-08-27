@@ -248,6 +248,8 @@ def _sparse_command(
                 str(selection_pheno),
                 "--sparsity-validation-out",
                 str(selection_output),
+                "--validation-early-stopping-lag",
+                str(args.validation_early_stopping_lag),
             ]
         )
     elif fixed_lam_ratio is not None:
@@ -275,7 +277,7 @@ def _sparse_command(
 def _read_prediction(path: Path) -> tuple[list[str], np.ndarray]:
     with path.open(encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle, delimiter="\t")
-        column = "lasso_phenotype_prediction_raw"
+        column = "lasso_phenotype_prediction"
         if not reader.fieldnames or not {"sample_index", "iid", column}.issubset(
             reader.fieldnames
         ):
@@ -296,9 +298,22 @@ def _read_prediction(path: Path) -> tuple[list[str], np.ndarray]:
 def prediction_metrics(
     prediction_path: Path,
     phenotype_path: Path,
+    *,
+    phenotype_standardization: dict[str, Any],
 ) -> dict[str, float | int | None]:
     ids, prediction = _read_prediction(prediction_path)
     outcome = read_phenotype_aligned(str(phenotype_path), ids)
+    mean = float(phenotype_standardization["mean"])
+    standard_deviation = float(
+        phenotype_standardization["standard_deviation"]
+    )
+    if (
+        not np.isfinite(mean)
+        or not np.isfinite(standard_deviation)
+        or standard_deviation <= 0.0
+    ):
+        raise ValueError("Phenotype input-standardization metadata is invalid.")
+    outcome = (outcome - mean) / standard_deviation
     metrics = evaluate_prediction_path(prediction[:, None], outcome)[0]
     metrics.pop("path_index")
     return {"n": int(outcome.size), **metrics}
@@ -312,6 +327,11 @@ def _validate_sparse_summary(
 ) -> dict[str, Any]:
     summary_path = Path(str(prefix) + ".summary.json")
     summary = _read_json(summary_path)
+    if int(summary.get("sparse_output_schema_version", -1)) != 7:
+        raise ValueError("Sparse summary must use output schema 7.")
+    standardization = summary.get("input_phenotype_standardization")
+    if not isinstance(standardization, dict):
+        raise ValueError("Sparse summary lacks input-standardization metadata.")
     if int(expected_k) < 1:
         raise ValueError("expected_k must be positive.")
     if int(summary.get("n_grms", -1)) != int(expected_k):
@@ -326,8 +346,34 @@ def _validate_sparse_summary(
     if summary.get("lambda_selection_method") != expected_method:
         raise ValueError("Sparse layer used an unexpected lambda-selection method.")
     if expected_method == "validation_r2":
-        if summary.get("lasso_path_role") != "complete_validation_grid":
-            raise ValueError("Fixed-K selection did not evaluate the validation grid.")
+        role = summary.get("lasso_path_role")
+        solved = int(summary.get("lasso_path_points_solved", -1))
+        requested = int(summary.get("lasso_path_points_requested", -1))
+        if role == "complete_validation_grid_weighted_basil":
+            if solved != requested or not bool(
+                summary.get("lasso_path_complete", False)
+            ):
+                raise ValueError(
+                    "Fixed-K complete validation path has inconsistent counts."
+                )
+        elif role == (
+            "early_stopped_kkt_certified_validation_prefix_weighted_basil"
+        ):
+            stopping = summary.get("lasso_validation_early_stopping")
+            if not (
+                isinstance(stopping, dict)
+                and bool(stopping.get("stopped", False))
+                and 1 <= solved < requested
+                and int(stopping.get("n_evaluated", -1)) == solved
+            ):
+                raise ValueError(
+                    "Fixed-K early-stopped validation prefix lacks a valid "
+                    "stopping certificate."
+                )
+        else:
+            raise ValueError(
+                "Fixed-K selection did not return a certified validation path."
+            )
     elif expected_method == "fixed_lam_ratio":
         if summary.get("lasso_path_role") != "frozen_ratio_target_only":
             raise ValueError("Fixed-K refit did not use the optimized target path.")
@@ -399,6 +445,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--lam-min-ratio", type=float, default=1e-3)
     parser.add_argument("--n-lambda", type=int, default=80)
     parser.add_argument("--lasso-cd-max-iter", type=int, default=10000)
+    parser.add_argument(
+        "--validation-early-stopping-lag", type=int, default=5
+    )
     parser.add_argument("--screen-topk", type=int, default=2000)
     parser.add_argument("--candidate-k", type=int, default=256)
     parser.add_argument("--kkt-add-topk", type=int, default=256)
@@ -419,6 +468,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     for name in (
         "n_lambda",
         "lasso_cd_max_iter",
+        "validation_early_stopping_lag",
         "screen_topk",
         "candidate_k",
         "kkt_add_topk",
@@ -509,8 +559,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             "lam_min_ratio": float(args.lam_min_ratio),
             "n_lambda": int(args.n_lambda),
             "lasso_cd_max_iter": int(args.lasso_cd_max_iter),
-            "complete_lambda_path": True,
-            "global_kkt_candidate_expansion": True,
+            "lambda_path": "full_marker_kkt_certified_prefix",
+            "validation_early_stopping": {
+                "enabled": True,
+                "stopping_lag": int(
+                    args.validation_early_stopping_lag
+                ),
+                "rule": "earlier_max_exceeds_latest_window_max",
+            },
+            "global_kkt_solver": "weighted_basil",
             "selection_timing": "before_every_variance_component_update",
             "outer_update": "validation_selected_alpha_then_variance_components",
             "selection_samples": "training_to_validation",
@@ -630,7 +687,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         str(selection_prefix) + ".sparse_prediction.tsv"
     )
     selection_prediction_metrics = prediction_metrics(
-        selection_prediction_path, args.validation_pheno_txt
+        selection_prediction_path,
+        args.validation_pheno_txt,
+        phenotype_standardization=selection_summary[
+            "input_phenotype_standardization"
+        ],
     )
     if not math.isclose(
         float(selection_prediction_metrics["correlation_squared"]),
@@ -682,7 +743,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not math.isclose(final_selected_ratio, selected_ratio, rel_tol=1e-10, abs_tol=1e-12):
         raise ValueError("Final refit did not use the frozen validation lambda ratio.")
     test_prediction_path = Path(str(final_prefix) + ".sparse_prediction.tsv")
-    test_metrics = prediction_metrics(test_prediction_path, args.test_pheno_txt)
+    test_metrics = prediction_metrics(
+        test_prediction_path,
+        args.test_pheno_txt,
+        phenotype_standardization=final_summary[
+            "input_phenotype_standardization"
+        ],
+    )
     comparison = _existing_comparison(
         args.existing_prediction_results,
         case_id=args.case_id,

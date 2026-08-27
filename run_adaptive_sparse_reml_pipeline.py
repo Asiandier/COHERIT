@@ -248,7 +248,7 @@ def _read_prediction(path: Path) -> tuple[list[str], np.ndarray]:
         expected = {
             "sample_index",
             "iid",
-            "lasso_phenotype_prediction_raw",
+            "lasso_phenotype_prediction",
         }
         if not reader.fieldnames or not expected.issubset(reader.fieldnames):
             raise ValueError(f"Sparse prediction schema is incompatible: {path}")
@@ -258,7 +258,7 @@ def _read_prediction(path: Path) -> tuple[list[str], np.ndarray]:
             if int(row["sample_index"]) != expected_index:
                 raise ValueError(f"Prediction sample_index is not contiguous: {path}")
             iids.append(row["iid"])
-            values.append(float(row["lasso_phenotype_prediction_raw"]))
+            values.append(float(row["lasso_phenotype_prediction"]))
     prediction = np.asarray(values, dtype=np.float64)
     if len(iids) != len(set(iids)) or not np.all(np.isfinite(prediction)):
         raise ValueError(f"Prediction IIDs/values are invalid: {path}")
@@ -268,6 +268,8 @@ def _read_prediction(path: Path) -> tuple[list[str], np.ndarray]:
 def prediction_metrics(
     prediction_path: Path,
     phenotype_path: Path,
+    *,
+    phenotype_standardization: dict[str, Any],
 ) -> dict[str, float | int]:
     iids, prediction = _read_prediction(prediction_path)
     phenotype = _read_phenotype(phenotype_path)
@@ -277,6 +279,17 @@ def prediction_metrics(
             f"{phenotype_path}"
         )
     outcome = np.asarray([phenotype[iid] for iid in iids], dtype=np.float64)
+    mean = float(phenotype_standardization["mean"])
+    standard_deviation = float(
+        phenotype_standardization["standard_deviation"]
+    )
+    if (
+        not math.isfinite(mean)
+        or not math.isfinite(standard_deviation)
+        or standard_deviation <= 0.0
+    ):
+        raise ValueError("Phenotype input-standardization metadata is invalid.")
+    outcome = (outcome - mean) / standard_deviation
     centered_prediction = prediction - float(prediction.mean())
     centered_outcome = outcome - float(outcome.mean())
     prediction_ss = float(centered_prediction @ centered_prediction)
@@ -332,6 +345,11 @@ def _validate_sparse_layer(
     summary_path = Path(str(prefix) + ".summary.json")
     prediction_path = Path(str(prefix) + ".sparse_prediction.tsv")
     summary = _read_json(summary_path)
+    if int(summary.get("sparse_output_schema_version", -1)) != 7:
+        raise ValueError("Sparse layer must use output schema 7.")
+    standardization = summary.get("input_phenotype_standardization")
+    if not isinstance(standardization, dict):
+        raise ValueError("Sparse layer lacks input-standardization metadata.")
     if int(summary.get("n_grms", -1)) != int(expected_k):
         raise ValueError(f"Sparse layer used K={summary.get('n_grms')}, expected {expected_k}.")
     if not bool(summary.get("lasso_branch_valid", False)):
@@ -347,15 +365,45 @@ def _validate_sparse_layer(
     theta = np.asarray(summary.get("var_components_lasso_ml"), dtype=np.float64)
     if theta.shape != (int(expected_k) + 1,) or not np.all(np.isfinite(theta)):
         raise ValueError("Sparse layer returned invalid variance components.")
-    metrics = prediction_metrics(prediction_path, prediction_phenotype)
+    metrics = prediction_metrics(
+        prediction_path,
+        prediction_phenotype,
+        phenotype_standardization=standardization,
+    )
 
     selection_payload = None
     selected_ratio = float(summary.get("lasso_selected_lam_ratio", float("nan")))
     if not math.isfinite(selected_ratio) or not 0.0 < selected_ratio <= 1.0:
         raise ValueError("Sparse layer returned an invalid selected lambda ratio.")
     if expected_selection_method == "validation_r2":
-        if summary.get("lasso_path_role") != "complete_validation_grid":
-            raise ValueError("Adaptive layer did not evaluate the validation grid.")
+        role = summary.get("lasso_path_role")
+        solved = int(summary.get("lasso_path_points_solved", -1))
+        requested = int(summary.get("lasso_path_points_requested", -1))
+        if role == "complete_validation_grid_weighted_basil":
+            if solved != requested or not bool(
+                summary.get("lasso_path_complete", False)
+            ):
+                raise ValueError(
+                    "Adaptive layer complete validation path has inconsistent counts."
+                )
+        elif role == (
+            "early_stopped_kkt_certified_validation_prefix_weighted_basil"
+        ):
+            stopping = summary.get("lasso_validation_early_stopping")
+            if not (
+                isinstance(stopping, dict)
+                and bool(stopping.get("stopped", False))
+                and 1 <= solved < requested
+                and int(stopping.get("n_evaluated", -1)) == solved
+            ):
+                raise ValueError(
+                    "Adaptive layer early-stopped validation prefix lacks a "
+                    "valid stopping certificate."
+                )
+        else:
+            raise ValueError(
+                "Adaptive layer did not return a certified validation path."
+            )
         if selection_output is None or not selection_output.is_file():
             raise ValueError("Validation-selected layer lacks its path audit JSON.")
         if not bool(summary.get("validation_selection_inside_outer_loop", False)):

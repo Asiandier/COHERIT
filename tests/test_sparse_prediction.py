@@ -442,7 +442,6 @@ def test_partitioned_sparse_prediction_uses_matching_source_coordinates():
         c_test = np.ones((x_test.shape[0], 1), dtype=np.float64)
         beta_cov = np.asarray([0.4], dtype=np.float64)
         beta_active = np.asarray([0.35, -0.2], dtype=np.float64)
-        phenotype_scale = 1.3
         theta = np.asarray([0.24, 0.31, 0.45], dtype=np.float64)
         y = (
             c_train @ beta_cov
@@ -453,22 +452,19 @@ def test_partitioned_sparse_prediction_uses_matching_source_coordinates():
             name="lasso",
             fitter=train,
             test_fitter=test,
-            y_train_raw=y,
+            y_train=y,
             train_covar=c_train,
             test_covar=c_test,
             train_active_geno=z_active_train,
             test_active_geno=z_active_test,
-            beta_cov_raw=beta_cov,
-            beta_active_raw=beta_active,
-            theta_standardized=theta,
-            phenotype_scale=phenotype_scale,
+            beta_cov=beta_cov,
+            beta_active=beta_active,
+            theta=theta,
             pcg_tol=1e-7,
             max_pcg_iters=1000,
         )
 
-        residual = (
-            y - c_train @ beta_cov - z_active_train @ beta_active
-        ) / phenotype_scale
+        residual = y - c_train @ beta_cov - z_active_train @ beta_active
         canonical_groups = (
             np.asarray([0, 2, 4], dtype=np.int64),
             np.asarray([1, 3, 5], dtype=np.int64),
@@ -485,8 +481,7 @@ def test_partitioned_sparse_prediction_uses_matching_source_coordinates():
         expected_components = []
         for component_idx, source_group in enumerate(canonical_groups):
             expected_components.append(
-                phenotype_scale
-                * theta[component_idx]
+                theta[component_idx]
                 * z_test_source[:, source_group]
                 @ (z_train_source[:, source_group].T @ dual)
                 / float(source_group.size)
@@ -494,19 +489,19 @@ def test_partitioned_sparse_prediction_uses_matching_source_coordinates():
         expected_background = np.sum(expected_components, axis=0)
 
         np.testing.assert_allclose(
-            prediction.fixed_snp_score_raw,
+            prediction.fixed_snp_score,
             z_test_source[:, [0, 3]] @ beta_active,
             rtol=2e-5,
             atol=2e-5,
         )
         np.testing.assert_allclose(
-            prediction.background_blup_raw,
+            prediction.background_blup,
             expected_background,
             rtol=5e-4,
             atol=5e-4,
         )
         for observed, expected in zip(
-            prediction.background_components_raw, expected_components
+            prediction.background_components, expected_components
         ):
             np.testing.assert_allclose(
                 observed,
@@ -522,15 +517,14 @@ def test_partitioned_sparse_prediction_uses_matching_source_coordinates():
         path_prediction = predict_sparse_path_partitioned(
             fitter=train,
             test_fitter=test,
-            y_train_raw=y,
+            y_train=y,
             train_covar=c_train,
             test_covar=c_test,
             train_candidate_geno=z_active_train,
             test_candidate_geno=z_active_test,
-            beta_cov_path_raw=beta_cov_path,
-            beta_candidate_path_raw=beta_active_path,
-            theta_standardized=theta,
-            phenotype_scale=phenotype_scale,
+            beta_cov_path=beta_cov_path,
+            beta_candidate_path=beta_active_path,
+            theta=theta,
             pcg_tol=1e-7,
             max_pcg_iters=1000,
         )
@@ -539,39 +533,38 @@ def test_partitioned_sparse_prediction_uses_matching_source_coordinates():
                 name=f"path_{path_index}",
                 fitter=train,
                 test_fitter=test,
-                y_train_raw=y,
+                y_train=y,
                 train_covar=c_train,
                 test_covar=c_test,
                 train_active_geno=z_active_train,
                 test_active_geno=z_active_test,
-                beta_cov_raw=beta_cov_path[path_index],
-                beta_active_raw=beta_active_path[path_index],
-                theta_standardized=theta,
-                phenotype_scale=phenotype_scale,
+                beta_cov=beta_cov_path[path_index],
+                beta_active=beta_active_path[path_index],
+                theta=theta,
                 pcg_tol=1e-7,
                 max_pcg_iters=1000,
             )
             np.testing.assert_allclose(
-                path_prediction.residual_standardized[:, path_index],
-                branch.residual_standardized,
+                path_prediction.residual[:, path_index],
+                branch.residual,
                 rtol=5e-5,
                 atol=5e-5,
             )
             np.testing.assert_allclose(
-                path_prediction.fixed_snp_score_raw[:, path_index],
-                branch.fixed_snp_score_raw,
+                path_prediction.fixed_snp_score[:, path_index],
+                branch.fixed_snp_score,
                 rtol=5e-5,
                 atol=5e-5,
             )
             np.testing.assert_allclose(
-                path_prediction.background_blup_raw[:, path_index],
-                branch.background_blup_raw,
+                path_prediction.background_blup[:, path_index],
+                branch.background_blup,
                 rtol=5e-4,
                 atol=5e-4,
             )
             np.testing.assert_allclose(
-                path_prediction.phenotype_prediction_raw[:, path_index],
-                branch.phenotype_prediction_raw,
+                path_prediction.phenotype_prediction[:, path_index],
+                branch.phenotype_prediction,
                 rtol=5e-4,
                 atol=5e-4,
             )
@@ -580,25 +573,22 @@ def test_partitioned_sparse_prediction_uses_matching_source_coordinates():
         test.close()
 
 
-def _manual_background(
-    z_train, z_test, residual_standardized, theta, phenotype_scale
-):
+def _manual_background(z_train, z_test, residual, theta):
     m = float(z_train.shape[1])
     covariance = (
         float(theta[0]) * (z_train @ z_train.T) / m
         + float(theta[1]) * np.eye(z_train.shape[0])
     )
-    dual = np.linalg.solve(covariance, residual_standardized)
+    dual = np.linalg.solve(covariance, residual)
     return (
-        float(phenotype_scale)
-        * float(theta[0])
+        float(theta[0])
         * z_test
         @ (z_train.T @ dual)
         / m
     )
 
 
-def test_sparse_predictors_use_branch_matched_mean_theta_and_raw_scale():
+def test_sparse_predictors_use_branch_matched_mean_and_theta():
     x_train = np.asarray(
         [
             [0, 0, 1, 2, 0, 1],
@@ -689,7 +679,6 @@ def test_sparse_predictors_use_branch_matched_mean_theta_and_raw_scale():
             - 0.25 * z_train[:, 4]
             + np.linspace(-0.25, 0.35, x_train.shape[0])
         )
-        phenotype_scale = 1.7
         branch_specs = {
             "lasso": (
                 np.asarray([0.4, -0.2]),
@@ -708,52 +697,49 @@ def test_sparse_predictors_use_branch_matched_mean_theta_and_raw_scale():
                 name=name,
                 fitter=train,
                 test_fitter=test,
-                y_train_raw=y,
+                y_train=y,
                 train_covar=c_train,
                 test_covar=c_test,
                 train_active_geno=z_train[:, support],
                 test_active_geno=z_test[:, support],
-                beta_cov_raw=beta_cov,
-                beta_active_raw=beta_active,
-                theta_standardized=theta,
-                phenotype_scale=phenotype_scale,
+                beta_cov=beta_cov,
+                beta_active=beta_active,
+                theta=theta,
                 pcg_tol=1e-7,
                 max_pcg_iters=1000,
             )
             residual = (
-                y
-                - c_train @ beta_cov
-                - z_train[:, support] @ beta_active
-            ) / phenotype_scale
+                y - c_train @ beta_cov - z_train[:, support] @ beta_active
+            )
             expected_background = _manual_background(
-                z_train, z_test, residual, theta, phenotype_scale
+                z_train, z_test, residual, theta
             )
             np.testing.assert_allclose(
-                predictions[name].residual_standardized,
+                predictions[name].residual,
                 residual,
                 rtol=1e-7,
                 atol=1e-7,
             )
             np.testing.assert_allclose(
-                predictions[name].nuisance_fixed_score_raw,
+                predictions[name].nuisance_fixed_score,
                 c_test @ beta_cov,
                 rtol=2e-5,
                 atol=2e-5,
             )
             np.testing.assert_allclose(
-                predictions[name].fixed_snp_score_raw,
+                predictions[name].fixed_snp_score,
                 z_test[:, support] @ beta_active,
                 rtol=2e-5,
                 atol=2e-5,
             )
             np.testing.assert_allclose(
-                predictions[name].background_blup_raw,
+                predictions[name].background_blup,
                 expected_background,
                 rtol=3e-4,
                 atol=3e-4,
             )
             np.testing.assert_allclose(
-                predictions[name].phenotype_prediction_raw,
+                predictions[name].phenotype_prediction,
                 c_test @ beta_cov
                 + z_test[:, support] @ beta_active
                 + expected_background,
@@ -764,19 +750,16 @@ def test_sparse_predictors_use_branch_matched_mean_theta_and_raw_scale():
         lasso_beta_cov, lasso_beta_active, _ = branch_specs["lasso"]
         selected_theta = branch_specs["selected_span"][2]
         lasso_residual = (
-            y
-            - c_train @ lasso_beta_cov
-            - z_train[:, support] @ lasso_beta_active
-        ) / phenotype_scale
+            y - c_train @ lasso_beta_cov - z_train[:, support] @ lasso_beta_active
+        )
         incorrectly_mixed = _manual_background(
             z_train,
             z_test,
             lasso_residual,
             selected_theta,
-            phenotype_scale,
         )
         assert not np.allclose(
-            predictions["lasso"].background_blup_raw,
+            predictions["lasso"].background_blup,
             incorrectly_mixed,
             rtol=1e-3,
             atol=1e-3,
@@ -790,14 +773,14 @@ def _toy_branch(name: str, offset: float) -> SparseBranchPrediction:
     values = np.asarray([offset, offset + 1.0])
     return SparseBranchPrediction(
         name=name,
-        theta_standardized=np.asarray([0.3, 0.7]),
-        residual_standardized=np.asarray([0.0]),
-        nuisance_fixed_score_raw=values + 1.0,
-        fixed_snp_score_raw=values + 2.0,
-        background_blup_raw=values + 3.0,
-        background_components_raw=(values + 3.0,),
-        genetic_score_raw=2.0 * values + 5.0,
-        phenotype_prediction_raw=3.0 * values + 6.0,
+        theta=np.asarray([0.3, 0.7]),
+        residual=np.asarray([0.0]),
+        nuisance_fixed_score=values + 1.0,
+        fixed_snp_score=values + 2.0,
+        background_blup=values + 3.0,
+        background_components=(values + 3.0,),
+        genetic_score=2.0 * values + 5.0,
+        phenotype_prediction=3.0 * values + 6.0,
         pcg_rel_res=1e-8,
         pcg_iters=4,
     )
@@ -814,8 +797,8 @@ def test_sparse_prediction_writer_supports_independent_branches(tmp_path):
     )
     with open(paths["prediction"], encoding="utf-8") as handle:
         header = handle.readline().strip().split("\t")
-    assert "lasso_genetic_score_raw" in header
-    assert "selected_span_genetic_score_raw" in header
+    assert "lasso_genetic_score" in header
+    assert "selected_span_genetic_score" in header
     with open(paths["metadata"], encoding="utf-8") as handle:
         metadata = json.load(handle)
     assert metadata["status"] == "emitted"
@@ -833,7 +816,7 @@ def test_sparse_prediction_writer_supports_independent_branches(tmp_path):
     )
     with open(lasso_only["prediction"], encoding="utf-8") as handle:
         lasso_header = handle.readline().strip().split("\t")
-    assert "lasso_genetic_score_raw" in lasso_header
+    assert "lasso_genetic_score" in lasso_header
     assert not any(column.startswith("selected_span_") for column in lasso_header)
     with open(lasso_only["metadata"], encoding="utf-8") as handle:
         lasso_metadata = json.load(handle)

@@ -1146,6 +1146,8 @@ def fit_reml(
     rel_dll_tol: float = 1e-3,
     taylor_threshold: float = 0.01,
     pcg_tol: float = 1e-3,
+    response_is_standardized: bool = False,
+    unit_variance_components: bool = False,
     verbose: bool = True,
     log_detail: str = "full",
     return_diagnostics: bool = False,
@@ -1154,10 +1156,16 @@ def fit_reml(
 
     Notes
     -----
-    The phenotype is always standardized internally before optimization as
-    ``y_std = (y - mean(y)) / std(y)``. ``covar`` is used exactly as supplied;
-    low-level callers must include an intercept when it is part of the intended
-    fixed-effect model.
+    By default the phenotype is standardized once before optimization as
+    ``y_std = (y - mean(y)) / std(y)``. Callers that already performed this
+    input-boundary transformation may set ``response_is_standardized=True``;
+    no later response scaling is then applied. ``covar`` is used exactly as
+    supplied; low-level callers must include an intercept when it is part of
+    the intended fixed-effect model.
+
+    ``unit_variance_components=True`` is the sparse-COHERIT contract for
+    standardized GRMs: every covariance component contributes its fitted
+    coefficient directly, so trace atoms are neither computed nor returned.
 
     ``slq_precond_conf`` is factorized once at the initial parameter vector and
     remains the residual-SLQ reference for the full fit. ``precond_conf`` is the
@@ -1185,7 +1193,11 @@ def fit_reml(
         raise ValueError("fit_reml requires slq_m > 0.")
     if not 0.0 <= h2_init <= 1.0:
         raise ValueError("h2_init must lie in [0, 1].")
-    genetic_trace_atoms = _mean_diag_atoms(diag_list, n_samples=n)
+    genetic_trace_atoms = (
+        jnp.ones((G,), dtype=jnp.float32)
+        if unit_variance_components
+        else _mean_diag_atoms(diag_list, n_samples=n)
+    )
     if residual_diag_list is None:
         residual_diag_stack = None
         residual_diag_atoms = jnp.ones((1,), dtype=jnp.float32)
@@ -1210,8 +1222,12 @@ def fit_reml(
             raise ValueError(
                 "residual_diag_list must provide positive residual support for every sample."
             )
-        residual_diag_atoms = jnp.mean(residual_diag_stack, axis=1)
         E = int(residual_diag_stack.shape[0])
+        residual_diag_atoms = (
+            jnp.ones((E,), dtype=jnp.float32)
+            if unit_variance_components
+            else jnp.mean(residual_diag_stack, axis=1)
+        )
     if slq_samples <= 0:
         raise ValueError("fit_reml requires slq_samples > 0.")
     if slq_mode not in {"raw", "projected_core_residual"}:
@@ -1252,7 +1268,13 @@ def fit_reml(
         .astype(jnp.float32)
     )
 
-    y, y_mean, y_scale = standardize_response(y)
+    if response_is_standardized:
+        if not bool(jnp.all(jnp.isfinite(y))):
+            raise ValueError("Phenotype contains non-finite values.")
+        y_mean = jnp.asarray(0.0, dtype=y.dtype)
+        y_scale = jnp.asarray(1.0, dtype=y.dtype)
+    else:
+        y, y_mean, y_scale = standardize_response(y)
     y_mean_host, y_scale_host = jax.device_get((y_mean, y_scale))
 
     xmat = None if covar is None else jnp.asarray(covar, dtype=jnp.float32)
@@ -1886,9 +1908,14 @@ def fit_reml(
             "stop_reason": stop_reason,
             "y_mean": y_mean,
             "y_scale": y_scale,
-            "genetic_trace_atoms": genetic_trace_atoms,
-            "residual_trace_atoms": residual_diag_atoms,
         }
+        if not unit_variance_components:
+            diagnostics.update(
+                {
+                    "genetic_trace_atoms": genetic_trace_atoms,
+                    "residual_trace_atoms": residual_diag_atoms,
+                }
+            )
         return param, history, diagnostics
     return param, history
 

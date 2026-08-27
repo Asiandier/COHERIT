@@ -484,6 +484,8 @@ def solve_lasso_path(
     yHy: float,
     cfg: LassoPathConfig,
     beta_path0: np.ndarray | None = None,
+    lambda_sequence: np.ndarray | None = None,
+    lambda_max_reference: float | None = None,
 ) -> dict:
     """
     Solve the complete requested lambda path.
@@ -502,6 +504,14 @@ def solve_lasso_path(
             row-for-row with the requested lambda-ratio grid.  Every supplied
             row is only a warm start; the usual score-KKT certificate still
             determines convergence and acceptance.
+        lambda_sequence: Optional explicit decreasing absolute lambda block.
+            This is used by BASIL-style path rollout to solve only the next
+            unresolved segment of one global path.
+        lambda_max_reference: Global lambda-max used to report ratios for an
+            explicit block.  The candidate-system maximum can differ by tiny
+            floating-point error because global scores are streamed in
+            float32; this value defines the requested grid, not a zero-solution
+            shortcut.
     """
     q = np.asarray(q, dtype=np.float64).reshape(-1)
     Q = np.asfortranarray(Q, dtype=np.float64)
@@ -509,6 +519,10 @@ def solve_lasso_path(
         raise ValueError("Q/q shape mismatch.")
 
     fixed_lam_ratio = cfg.fixed_lam_ratio
+    if lambda_sequence is not None and fixed_lam_ratio is not None:
+        raise ValueError(
+            "Explicit lambda_sequence and fixed_lam_ratio are mutually exclusive."
+        )
     if fixed_lam_ratio is not None:
         if (
             not math.isfinite(float(fixed_lam_ratio))
@@ -518,8 +532,39 @@ def solve_lasso_path(
                 "fixed_lam_ratio must lie in (0, 1]."
             )
 
-    lam_max = float(np.max(np.abs(q))) if q.size > 0 else 0.0
-    if fixed_lam_ratio is None:
+    candidate_lam_max = float(np.max(np.abs(q))) if q.size > 0 else 0.0
+    lam_max = (
+        candidate_lam_max
+        if lambda_max_reference is None
+        else float(lambda_max_reference)
+    )
+    if (
+        not np.isfinite(lam_max)
+        or lam_max < 0.0
+    ):
+        raise ValueError(
+            "lambda_max_reference must be finite and nonnegative."
+        )
+    if lambda_sequence is not None:
+        lam_seq = np.asarray(lambda_sequence, dtype=np.float64).reshape(-1)
+        if (
+            lam_seq.size < 1
+            or not np.all(np.isfinite(lam_seq))
+            or np.any(lam_seq < 0.0)
+            or np.any(np.diff(lam_seq) >= 0.0)
+            or np.any(lam_seq > lam_max + 1e-10 * max(1.0, lam_max))
+        ):
+            raise ValueError(
+                "lambda_sequence must be a finite, nonnegative, strictly "
+                "decreasing block bounded by lambda_max_reference."
+            )
+        lam_ratio_seq = (
+            lam_seq / lam_max
+            if lam_max > 0.0
+            else np.ones(lam_seq.size, dtype=np.float64)
+        )
+        path_role = "explicit_global_path_block"
+    elif fixed_lam_ratio is None:
         lam_seq = make_lambda_sequence(lam_max, cfg.lam_min_ratio, cfg.n_lambda)
         if lam_max > 0.0:
             lam_ratio_seq = lam_seq / lam_max
@@ -528,7 +573,7 @@ def solve_lasso_path(
                 lam_ratio_seq[-1] = float(cfg.lam_min_ratio)
         else:
             lam_ratio_seq = np.ones(lam_seq.size, dtype=np.float64)
-        path_role = "complete_validation_grid"
+        path_role = "candidate_lambda_grid"
     else:
         # The final train+validation refit has already frozen the ratio.  Its
         # convex target depends only on lambda_max and the requested target;
@@ -591,7 +636,12 @@ def solve_lasso_path(
         if (
             external_beta_path is not None
             and external_Qb_path is not None
-            and i > 0
+            and (
+                i > 0
+                or float(lam)
+                < candidate_lam_max
+                - 1e-12 * max(1.0, candidate_lam_max)
+            )
         ):
             external_beta = external_beta_path[i]
             external_Qb = external_Qb_path[i]
@@ -617,10 +667,15 @@ def solve_lasso_path(
                 beta_start = external_beta
                 Qb_start = external_Qb
                 external_warm_rows_used += 1
-        if i == 0:
-            # By construction lambda_max=max(abs(q)), so the exact first path
-            # solution is beta=0.  Avoid entering coordinate descent merely to
-            # rediscover that deterministic KKT point.
+        if (
+            i == 0
+            and float(lam)
+            >= candidate_lam_max
+            - 1e-12 * max(1.0, candidate_lam_max)
+        ):
+            # The zero vector is exact whenever lambda >= max(abs(q)).  This
+            # includes the ordinary path's lambda-max row and an explicit
+            # BASIL block that happens to start there.
             beta = np.zeros_like(q)
             Qb = np.zeros_like(q)
             n_iter = 0
@@ -702,7 +757,9 @@ def solve_lasso_path(
         "selection_method": None,
         "selected_lam_ratio": None,
         "path_role": path_role,
-        "requested_n_lambda": int(cfg.n_lambda),
+        "requested_n_lambda": int(
+            cfg.n_lambda if lambda_sequence is None else lam_seq.size
+        ),
         "external_beta_path_warm_start_provided": bool(
             external_beta_path is not None
         ),
@@ -775,6 +832,8 @@ def fit_weighted_lasso_with_covariates(
     cfg: LassoPathConfig,
     ridge: float = 1e-6,
     beta_snp_path0: np.ndarray | None = None,
+    lambda_sequence: np.ndarray | None = None,
+    lambda_max_reference: float | None = None,
 ) -> dict:
     """
     Weighted sparse fitting with unpenalized covariates and penalized SNP effects.
@@ -784,6 +843,8 @@ def fit_weighted_lasso_with_covariates(
         Hinv_*: PCG solves under current variance components.
         beta_snp_path0: Optional same-grid SNP coefficient path used only as
             a warm start for coordinate descent.
+        lambda_sequence: Optional explicit decreasing absolute lambda block.
+        lambda_max_reference: Global lambda-max defining explicit-block ratios.
     """
     y = np.asarray(y, dtype=np.float64).reshape(-1)
     Z = np.asarray(geno, dtype=np.float64)
@@ -854,6 +915,8 @@ def fit_weighted_lasso_with_covariates(
         yHy=profile_yHy,
         cfg=cfg,
         beta_path0=beta_snp_path0,
+        lambda_sequence=lambda_sequence,
+        lambda_max_reference=lambda_max_reference,
     )
 
     beta_snp_path = np.asarray(lasso["beta_path"], dtype=np.float64)

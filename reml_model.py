@@ -71,6 +71,8 @@ class FitConfig:
     pcg_ridge: float = 1e-6
     reml_pcg_tol: float = 1e-3
     effect_pcg_tol: float = 1e-3
+    response_is_standardized: bool = False
+    unit_variance_components: bool = False
     n_reml_reps: int = 1
     ring_depth: int | None = None
     source_build_chunk_width: int | None = None
@@ -1557,7 +1559,14 @@ class InfinitesimalREMLFitter:
 
         self._ensure_projected_core_precond_ready(ops, var_components_init=theta)
 
-        y_std, y_mean, y_scale = standardize_response(y)
+        if self.cfg.response_is_standardized:
+            y_std = jnp.asarray(y, dtype=jnp.float32).reshape(-1)
+            if not bool(jnp.all(jnp.isfinite(y_std))):
+                raise ValueError("Phenotype contains non-finite values.")
+            y_mean = jnp.asarray(0.0, dtype=y_std.dtype)
+            y_scale = jnp.asarray(1.0, dtype=y_std.dtype)
+        else:
+            y_std, y_mean, y_scale = standardize_response(y)
         xmat = None
         if covar is not None:
             xmat = jnp.asarray(covar, dtype=jnp.float32)
@@ -1832,12 +1841,21 @@ class InfinitesimalREMLFitter:
 
         ops = self._assemble_reml_operators()
         self._ensure_projected_core_precond_ready(ops, var_components_init=var_components_init)
-        genetic_trace_atoms = self._projected_core_diag_atoms(ops.diag_list)
-        residual_trace_atoms = self._projected_core_residual_diag_atoms(
-            ops.residual_diag_list
-        )
         G = len(ops.K_mvs)
-        E = int(residual_trace_atoms.shape[0])
+        if self.cfg.unit_variance_components:
+            genetic_trace_atoms = None
+            residual_trace_atoms = None
+            E = (
+                1
+                if ops.residual_diag_list is None
+                else len(ops.residual_diag_list)
+            )
+        else:
+            genetic_trace_atoms = self._projected_core_diag_atoms(ops.diag_list)
+            residual_trace_atoms = self._projected_core_residual_diag_atoms(
+                ops.residual_diag_list
+            )
+            E = int(residual_trace_atoms.shape[0])
 
         reps = []
         diagnostics = None
@@ -1871,6 +1889,8 @@ class InfinitesimalREMLFitter:
                     if self._smile_operators else "strict"
                 ),
                 pcg_tol=self.cfg.reml_pcg_tol,
+                response_is_standardized=self.cfg.response_is_standardized,
+                unit_variance_components=self.cfg.unit_variance_components,
                 scoring_step_tol=self.cfg.smile_scoring_step_tol,
                 max_linesearch_trials=self.cfg.strict_max_linesearch_trials,
                 return_diagnostics=bool(self.cfg.capture_reml_diagnostics),
@@ -1888,10 +1908,14 @@ class InfinitesimalREMLFitter:
         monte_carlo_se_var = None
         monte_carlo_se_h2 = None
 
-        def _trace_weighted_h2(theta_values: jnp.ndarray) -> jnp.ndarray:
+        def _reported_h2(theta_values: jnp.ndarray) -> jnp.ndarray:
             theta_values = jnp.asarray(theta_values)
-            genetic = theta_values[..., :G] @ genetic_trace_atoms
-            residual = theta_values[..., G : G + E] @ residual_trace_atoms
+            if self.cfg.unit_variance_components:
+                genetic = jnp.sum(theta_values[..., :G], axis=-1)
+                residual = jnp.sum(theta_values[..., G : G + E], axis=-1)
+            else:
+                genetic = theta_values[..., :G] @ genetic_trace_atoms
+                residual = theta_values[..., G : G + E] @ residual_trace_atoms
             return genetic / jnp.maximum(genetic + residual, 1e-8)
 
         if n_reps > 1:
@@ -1905,7 +1929,7 @@ class InfinitesimalREMLFitter:
                 )
             )
             rep_var_components = vc_stack
-            h2_vals = _trace_weighted_h2(vc_stack)
+            h2_vals = _reported_h2(vc_stack)
             h2_center = h2_vals - jnp.mean(h2_vals)
             monte_carlo_se_h2 = float(
                 jnp.sqrt(
@@ -1918,7 +1942,7 @@ class InfinitesimalREMLFitter:
             # AI/gradient/loglik from one replicate do not describe vc_mean.
             diagnostics = None
 
-        heritability = float(jax.device_get(_trace_weighted_h2(vc_mean)))
+        heritability = float(jax.device_get(_reported_h2(vc_mean)))
 
         effects = None
         if estimate_effects:

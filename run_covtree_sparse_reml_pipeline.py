@@ -48,14 +48,14 @@ def _atomic_json(path: Path, value: dict) -> None:
 def _read_prediction(path: Path) -> tuple[list[str], np.ndarray]:
     with path.open(encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle, delimiter="\t")
-        required = {"iid", "lasso_phenotype_prediction_raw"}
+        required = {"iid", "lasso_phenotype_prediction"}
         if not reader.fieldnames or not required.issubset(reader.fieldnames):
             raise ValueError(f"Prediction table has an incompatible schema: {path}")
         iids: list[str] = []
         prediction: list[float] = []
         for row in reader:
             iids.append(str(row["iid"]))
-            prediction.append(float(row["lasso_phenotype_prediction_raw"]))
+            prediction.append(float(row["lasso_phenotype_prediction"]))
     values = np.asarray(prediction, dtype=np.float64)
     if len(iids) != len(set(iids)) or not np.all(np.isfinite(values)):
         raise ValueError("Prediction IDs or values are invalid.")
@@ -82,12 +82,25 @@ def _read_phenotype(path: Path) -> dict[str, float]:
 def prediction_metrics(
     prediction_path: Path,
     phenotype_path: Path,
+    *,
+    phenotype_standardization: dict,
 ) -> dict[str, float | int]:
     iids, prediction = _read_prediction(prediction_path)
     phenotype = _read_phenotype(phenotype_path)
     if set(iids) != set(phenotype) or len(iids) != len(phenotype):
         raise ValueError("Prediction and validation phenotype IID sets differ.")
     outcome = np.asarray([phenotype[iid] for iid in iids], dtype=np.float64)
+    mean = float(phenotype_standardization["mean"])
+    standard_deviation = float(
+        phenotype_standardization["standard_deviation"]
+    )
+    if (
+        not math.isfinite(mean)
+        or not math.isfinite(standard_deviation)
+        or standard_deviation <= 0.0
+    ):
+        raise ValueError("Phenotype input-standardization metadata is invalid.")
+    outcome = (outcome - mean) / standard_deviation
     centered_prediction = prediction - prediction.mean()
     centered_outcome = outcome - outcome.mean()
     prediction_ss = float(centered_prediction @ centered_prediction)
@@ -392,7 +405,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         initial_summary["n_grms"]
     ):
         raise ValueError("Initial CovTree diagnostic and fixed-K fit disagree on K.")
-    initial_metrics = prediction_metrics(initial_prediction_path, validation_phenotype)
+    initial_metrics = prediction_metrics(
+        initial_prediction_path,
+        validation_phenotype,
+        phenotype_standardization=initial_summary[
+            "input_phenotype_standardization"
+        ],
+    )
 
     initial_h2 = float(initial_summary["h2_chive_guarded"])
     layers: list[dict[str, object]] = [
@@ -506,7 +525,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         diagnostic = _read_json(diagnostic_out)
         if int(summary["n_grms"]) != next_k:
             raise RuntimeError("Fixed-K layer returned an unexpected component count.")
-        metrics = prediction_metrics(prediction_path, validation_phenotype)
+        metrics = prediction_metrics(
+            prediction_path,
+            validation_phenotype,
+            phenotype_standardization=summary[
+                "input_phenotype_standardization"
+            ],
+        )
         layer_h2 = float(summary["h2_chive_guarded"])
         record = {
             "step": step,

@@ -121,6 +121,7 @@ def test_validation_selected_path_materializes_alpha_used_downstream():
                 "k": 0,
                 "converged": True,
                 "kkt_passed": True,
+                "global_kkt_passed": True,
             },
             {
                 "lam": 2.0,
@@ -128,6 +129,7 @@ def test_validation_selected_path_materializes_alpha_used_downstream():
                 "k": 2,
                 "converged": True,
                 "kkt_passed": True,
+                "global_kkt_passed": True,
             },
         ],
     }
@@ -173,12 +175,14 @@ def test_validation_selection_excludes_unconverged_path_points():
             "lam_ratio": 0.1,
             "converged": False,
             "kkt_passed": False,
+            "global_kkt_passed": False,
         },
         {
             "k": 1,
             "lam_ratio": 0.5,
             "converged": True,
             "kkt_passed": True,
+            "global_kkt_passed": True,
         },
     ]
     metrics = [
@@ -189,8 +193,304 @@ def test_validation_selection_excludes_unconverged_path_points():
     assert SPARSE._select_converged_validation_path_index(path, metrics) == 1
 
 
+def test_validation_early_stopping_waits_for_an_earlier_peak():
+    flat = [
+        {"correlation_squared": 0.2}
+        for _ in range(9)
+    ]
+    assert not SPARSE._validation_path_early_stopping_decision(
+        flat, stopping_lag=5
+    )["stopped"]
+
+    peaked = [
+        {"correlation_squared": value}
+        for value in [0.10, 0.20, 0.31, 0.30, 0.29, 0.28, 0.27, 0.26]
+    ]
+    decision = SPARSE._validation_path_early_stopping_decision(
+        peaked, stopping_lag=5
+    )
+    assert decision["stopped"] is True
+    assert decision["best_path_index"] == 2
+    assert decision["best_correlation_squared"] == pytest.approx(0.31)
+
+
+def test_batched_hinv_residual_path_matches_columnwise_algebra():
+    hinv_y = np.asarray([3.0, 5.0, 7.0])
+    hinv_covar = np.asarray([[1.0], [2.0], [3.0]])
+    hinv_geno = np.asarray(
+        [[1.0, 0.5], [0.0, 2.0], [2.0, -1.0]]
+    )
+    beta_cov_path = np.asarray([[0.0], [0.5], [-1.0]])
+    beta_snp_path = np.asarray(
+        [[0.0, 0.0], [1.0, -0.5], [0.25, 2.0]]
+    )
+
+    batched = SPARSE._build_hinv_lasso_residual_path(
+        hinv_y=hinv_y,
+        hinv_covar=hinv_covar,
+        hinv_geno=hinv_geno,
+        beta_cov_path=beta_cov_path,
+        beta_snp_path=beta_snp_path,
+    )
+    expected = np.column_stack(
+        [
+            hinv_y
+            - hinv_covar @ beta_cov_path[index]
+            - hinv_geno @ beta_snp_path[index]
+            for index in range(beta_snp_path.shape[0])
+        ]
+    )
+    np.testing.assert_allclose(batched, expected, rtol=1e-6, atol=1e-6)
+    assert batched.dtype == np.float32
+
+
+def test_hinv_column_pcg_batches_bound_rhs_and_match_exact_solution():
+    rhs = np.arange(35, dtype=np.float32).reshape(7, 5) + 1.0
+
+    solution, diagnostic = SPARSE._solve_hinv_columns_batched(
+        hv=lambda value: 2.0 * value,
+        precond=lambda value: 0.5 * value,
+        rhs=rhs,
+        warm_start=np.zeros_like(rhs),
+        tol=1e-6,
+        maxiter=10,
+        batch_size=2,
+        stage="unit test",
+    )
+
+    np.testing.assert_allclose(solution, rhs / 2.0, rtol=1e-6, atol=1e-6)
+    assert diagnostic["n_batches"] == 3
+    assert diagnostic["n_columns"] == 5
+    assert diagnostic["batch_size"] == 2
+    assert diagnostic["max_iterations"] <= 2
+
+
+def test_legacy_complete_path_expansion_is_memory_bounded():
+    assert SPARSE._complete_path_kkt_expansion_budget(100_000, 256, 256) == 256
+    assert SPARSE._complete_path_kkt_expansion_budget(100_000, 256, 2048) == 1024
+    assert SPARSE._complete_path_kkt_expansion_budget(17, 256, 2048) == 17
+
+
+def test_complete_path_global_kkt_unions_violators_before_validation():
+    candidate = np.asarray([0, 2], dtype=np.int64)
+    beta_path = np.asarray(
+        [[0.0, 0.0], [0.5, 0.0], [1.0, -0.25]]
+    )
+    path_rows = [
+        {
+            "lam": 10.0,
+            "lam_ratio": 1.0,
+            "k": 0,
+            "converged": True,
+            "kkt_passed": True,
+        },
+        {
+            "lam": 5.0,
+            "lam_ratio": 0.5,
+            "k": 1,
+            "converged": True,
+            "kkt_passed": True,
+        },
+        {
+            "lam": 1.0,
+            "lam_ratio": 0.1,
+            "k": 2,
+            "converged": True,
+            "kkt_passed": True,
+        },
+    ]
+    # Rows are markers, columns are lambda path points.  Marker 3 violates
+    # only lambda=5 and marker 4 violates only lambda=1.
+    score_path = np.asarray(
+        [
+            [10.0, 5.0, 1.0],
+            [9.0, 4.0, 0.9],
+            [0.0, 0.0, -1.0],
+            [8.0, 6.0, 0.5],
+            [7.0, 4.5, 1.5],
+        ]
+    )
+
+    result = SPARSE._certify_complete_lasso_path_kkt_from_scores(
+        score_path=score_path,
+        candidate=candidate,
+        beta_candidate_path=beta_path,
+        path_rows=path_rows,
+        abs_tol=0.0,
+        rel_tol=0.0,
+    )
+
+    assert result["passed"] is False
+    assert result["n_path_points"] == 3
+    assert result["n_violating_path_points"] == 2
+    np.testing.assert_array_equal(result["outside_violators"], [3, 4])
+    assert result["path_rows"][0]["global_kkt_passed"] is True
+    assert result["path_rows"][1]["global_kkt_passed"] is False
+    assert result["path_rows"][2]["global_kkt_passed"] is False
+    assert result["priority_score"][3] == pytest.approx(6.0 / 5.0)
+    assert result["priority_score"][4] == pytest.approx(1.5)
+
+
+def test_basil_score_batch_allows_strong_rule_to_fill_working_set():
+    selected = SPARSE._top_scored_markers_outside(
+        score_abs=np.asarray([3.0, 2.0, 1.0]),
+        excluded=np.asarray([0], dtype=np.int64),
+        count=0,
+    )
+    assert selected.size == 0
+
+
+def test_weighted_basil_path_matches_full_design_lasso():
+    rng = np.random.RandomState(2718)
+    n_samples, n_markers = 48, 32
+    geno = rng.standard_normal((n_samples, n_markers)).astype(np.float32)
+    geno -= geno.mean(axis=0, keepdims=True)
+    geno /= geno.std(axis=0, keepdims=True)
+    effects = np.zeros(n_markers, dtype=np.float64)
+    effects[[2, 11, 23]] = [0.7, -0.5, 0.35]
+    outcome = geno @ effects + rng.standard_normal(n_samples) * 0.4
+
+    class _DenseIndex:
+        m_total = n_markers
+
+        def extract_standardized_columns(self, indices):
+            return geno[:, np.asarray(indices, dtype=np.int64)]
+
+        def xtv_all(self, vector, normalize=False):
+            assert normalize is False
+            return SPARSE.jnp.asarray(
+                geno.T @ np.asarray(vector), dtype=SPARSE.jnp.float32
+            )
+
+    cfg = LASSO.LassoPathConfig(
+        n_lambda=18,
+        lam_min_ratio=0.08,
+        max_cd_iter=10000,
+        cd_tol=1e-9,
+        kkt_abs_tol=1e-6,
+        kkt_rel_tol=1e-6,
+    )
+    args = SimpleNamespace(
+        candidate_k=4,
+        screen_topk=6,
+        kkt_add_topk=4,
+        kkt_max_candidate=0,
+        kkt_max_rounds=30,
+        basil_marker_batch_size=6,
+        basil_lambda_block_size=10,
+        basil_max_iterations=30,
+        candidate_pcg_rhs_batch_size=4,
+        pcg_tol=1e-7,
+        max_pcg_iters=20,
+        lasso_ridge=1e-6,
+        kkt_tol=1e-6,
+        kkt_rel_tol=1e-6,
+    )
+    performance = {
+        "candidate_hinv_pcg_batches": 0,
+        "candidate_hinv_pcg_columns_solved": 0,
+        "candidate_hinv_columns_reused": 0,
+        "candidate_hinv_pcg_total_batch_iterations": 0,
+        "lasso_path_solves": 0,
+        "lasso_path_solve_seconds": 0.0,
+        "lasso_validation_selection_seconds": 0.0,
+        "lasso_cd_iterations": 0,
+        "lasso_path_warm_start_rows_used": 0,
+        "lasso_path_global_kkt_passes": 0,
+        "lasso_path_global_kkt_seconds": 0.0,
+        "lasso_path_global_kkt_points_checked": 0,
+    }
+    hinv_y = outcome / 2.0
+    hinv_geno = geno / 2.0
+    score = np.abs(geno.T @ hinv_y)
+    validation_offset = [0]
+
+    def _monotone_validation(**kwargs):
+        n_rows = int(np.asarray(kwargs["beta_snp_path"]).shape[0])
+        start = validation_offset[0]
+        validation_offset[0] += n_rows
+        return {
+            "metrics": [
+                {
+                    "path_index": local,
+                    "correlation_squared": float(start + local),
+                }
+                for local in range(n_rows)
+            ],
+            "pcg_rel_res": 0.0,
+            "pcg_iters": 0,
+        }
+
+    basil = SPARSE._fit_complete_weighted_lasso_path_basil(
+        args=args,
+        grm_index=_DenseIndex(),
+        hv=lambda value: 2.0 * value,
+        precond=lambda value: 0.5 * value,
+        y=outcome,
+        covar=None,
+        hinv_y=hinv_y,
+        hinv_covar=None,
+        initial_score_abs=score,
+        path_cfg=cfg,
+        previous_candidate=np.empty((0,), dtype=np.int64),
+        previous_beta_path=None,
+        previous_hinv_z={},
+        outer=1,
+        sparse_path_performance=performance,
+        validation_evaluator=_monotone_validation,
+        validation_stopping_lag=5,
+    )
+    direct = LASSO.fit_weighted_lasso_with_covariates(
+        y=outcome,
+        covar=None,
+        geno=geno,
+        Hinv_y=hinv_y,
+        Hinv_covar=None,
+        Hinv_geno=hinv_geno,
+        cfg=cfg,
+        ridge=args.lasso_ridge,
+    )
+
+    expanded = np.zeros_like(direct["beta_snp_path"])
+    expanded[:, basil["candidate"]] = basil["lasso_path"]["beta_snp_path"]
+    np.testing.assert_allclose(
+        expanded, direct["beta_snp_path"], rtol=2e-4, atol=2e-5
+    )
+    assert basil["global_kkt"]["passed"] is True
+    assert all(
+        row["global_kkt_passed"]
+        for row in basil["lasso_path"]["path"]
+    )
+    assert basil["candidate"].size < n_markers
+
+
+def test_validation_selection_rejects_candidate_only_kkt_point():
+    path = [
+        {
+            "k": 4,
+            "lam_ratio": 0.2,
+            "converged": True,
+            "kkt_passed": True,
+            "global_kkt_passed": False,
+        },
+        {
+            "k": 2,
+            "lam_ratio": 0.5,
+            "converged": True,
+            "kkt_passed": True,
+            "global_kkt_passed": True,
+        },
+    ]
+    metrics = [
+        {"correlation_squared": 0.9},
+        {"correlation_squared": 0.3},
+    ]
+
+    assert SPARSE._select_converged_validation_path_index(path, metrics) == 1
+
+
 def test_sparse_dense_h2_is_invariant_to_phenotype_rescaling():
-    """CHIVE q and REML theta must be combined on the standardized-y scale."""
+    """Input standardization removes arbitrary phenotype-unit changes."""
     rng = np.random.RandomState(314)
     n, s = 120, 7
     z_active = rng.standard_normal((n, s))
@@ -198,28 +498,27 @@ def test_sparse_dense_h2_is_invariant_to_phenotype_rescaling():
     beta = rng.standard_normal(s) * 0.15
     y = z_active @ beta + rng.standard_normal(n) * 0.7
 
-    q_raw, _, _ = SPARSE._chive_q_hat_given_active(z_active, y, beta)
-    _, y_scale = SPARSE._phenotype_standardization_stats(y)
-    q_std = SPARSE._quadratic_variance_to_reml_scale(q_raw, y_scale)
-    h2 = SPARSE._sparse_dense_h2(q_std, 0.22, 0.63)
+    y_standardized, _, y_scale = SPARSE._standardize_phenotype_at_input(y)
+    beta_standardized = beta / y_scale
+    q, _, _ = SPARSE._chive_q_hat_given_active(
+        z_active, y_standardized, beta_standardized
+    )
+    h2 = SPARSE._sparse_dense_h2(q, 0.22, 0.63)
 
     multiplier = 9.0
-    q_scaled_raw, _, _ = SPARSE._chive_q_hat_given_active(
-        z_active, multiplier * y, multiplier * beta
+    y_rescaled, _, y_rescaled_scale = SPARSE._standardize_phenotype_at_input(
+        multiplier * y
     )
-    _, y_scaled_scale = SPARSE._phenotype_standardization_stats(multiplier * y)
-    q_scaled_std = SPARSE._quadratic_variance_to_reml_scale(
-        q_scaled_raw, y_scaled_scale
+    q_rescaled, _, _ = SPARSE._chive_q_hat_given_active(
+        z_active,
+        y_rescaled,
+        multiplier * beta / y_rescaled_scale,
     )
-    h2_scaled = SPARSE._sparse_dense_h2(q_scaled_std, 0.22, 0.63)
+    h2_rescaled = SPARSE._sparse_dense_h2(q_rescaled, 0.22, 0.63)
 
-    assert np.isclose(q_std, q_scaled_std, rtol=2e-6, atol=2e-6)
-    assert np.isclose(h2, h2_scaled, rtol=2e-6, atol=2e-6)
-
-    # The historical raw-q/standardized-theta mixture fails this invariance.
-    h2_old = SPARSE._sparse_dense_h2(q_raw, 0.22, 0.63)
-    h2_scaled_old = SPARSE._sparse_dense_h2(q_scaled_raw, 0.22, 0.63)
-    assert abs(h2_old - h2_scaled_old) > 0.05
+    np.testing.assert_allclose(y_standardized, y_rescaled, rtol=2e-6, atol=2e-6)
+    assert np.isclose(q, q_rescaled, rtol=2e-6, atol=2e-6)
+    assert np.isclose(h2, h2_rescaled, rtol=2e-6, atol=2e-6)
 
 
 def test_raw_lasso_plugin_is_chive_first_term_without_calibration():
@@ -241,10 +540,10 @@ def test_raw_lasso_plugin_is_chive_first_term_without_calibration():
 
 def test_four_estimator_h2_uses_lasso_ml_and_reml_branches():
     values = SPARSE._four_estimator_h2_from_branches(
-        q_lasso_plugin_standardized=0.07,
-        q_lasso_calibrated_standardized=0.13,
-        q_selected_span_plugin_standardized=0.19,
-        q_selected_span_trace_standardized=0.11,
+        q_lasso_plugin=0.07,
+        q_lasso_calibrated=0.13,
+        q_selected_span_plugin=0.19,
+        q_selected_span_trace=0.11,
         lasso_ml_background_variance=0.17,
         lasso_ml_residual_variance=0.71,
         selected_span_reml_background_variance=0.43,
@@ -366,13 +665,13 @@ def test_sparse_output_contract_hides_comparison_fields_by_default():
     default = SPARSE._sparse_output_contract(False)
     comparison = SPARSE._sparse_output_contract(True)
 
-    assert default["sparse_output_schema_version"] == 6
+    assert default["sparse_output_schema_version"] == 7
     assert default["estimator_mode"] == "coherit"
     assert default["computed_estimators"] == ["h2_chive"]
     assert default["selected_snp_columns"][-1] == "beta_lasso"
     assert "beta_gls_reml" not in default["selected_snp_columns"]
 
-    assert comparison["sparse_output_schema_version"] == 6
+    assert comparison["sparse_output_schema_version"] == 7
     assert comparison["estimator_mode"] == "four_estimator_comparison"
     assert comparison["computed_estimators"] == [
         "h2_lasso_plugin",
@@ -534,26 +833,31 @@ def test_kkt_expansion_budget_absorbs_only_small_overflow():
     assert SPARSE._kkt_expansion_budget(3, 2) == 2
 
 
-def test_lasso_path_warm_start_is_reused_for_any_monotone_basis_growth():
-    assert SPARSE._allow_monotone_lasso_path_warm_start(
+def test_lasso_path_warm_start_is_reused_for_any_basis_overlap():
+    assert SPARSE._allow_mapped_lasso_path_warm_start(
         previous_size=2015,
         current_size=2031,
         common_size=2015,
     )
-    assert SPARSE._allow_monotone_lasso_path_warm_start(
+    assert SPARSE._allow_mapped_lasso_path_warm_start(
         previous_size=1759,
         current_size=2015,
         common_size=1759,
     )
-    assert not SPARSE._allow_monotone_lasso_path_warm_start(
+    assert SPARSE._allow_mapped_lasso_path_warm_start(
         previous_size=2015,
         current_size=2031,
         common_size=2000,
     )
-    assert not SPARSE._allow_monotone_lasso_path_warm_start(
+    assert SPARSE._allow_mapped_lasso_path_warm_start(
         previous_size=2031,
         current_size=2015,
         common_size=2015,
+    )
+    assert not SPARSE._allow_mapped_lasso_path_warm_start(
+        previous_size=2031,
+        current_size=2015,
+        common_size=0,
     )
 
 
@@ -597,24 +901,68 @@ def test_partitioned_signed_kkt_distinguishes_candidate_and_outside_failures():
     )
 
 
-def test_variance_component_convergence_uses_mixed_tolerance_near_zero():
-    converged, ratio = SPARSE._variance_components_converged(
-        np.asarray([5e-5, 0.6001]),
-        np.asarray([1e-10, 0.6]),
-        rel_tol=1e-2,
-        abs_tol=1e-4,
-    )
-    assert converged is True
-    assert ratio <= 1.0
-
-    converged, ratio = SPARSE._variance_components_converged(
-        np.asarray([5e-3, 0.6001]),
-        np.asarray([1e-10, 0.6]),
-        rel_tol=1e-2,
-        abs_tol=1e-4,
+def test_outer_convergence_uses_absolute_coherit_h2_change():
+    converged, change = SPARSE._heritability_converged(
+        0.701,
+        None,
+        abs_tol=1e-3,
     )
     assert converged is False
-    assert ratio > 1.0
+    assert np.isinf(change)
+
+    converged, change = SPARSE._heritability_converged(
+        0.701,
+        0.700,
+        abs_tol=1e-3,
+    )
+    assert converged is True
+    assert np.isclose(change, 1e-3)
+
+    converged, change = SPARSE._heritability_converged(
+        0.701001,
+        0.700,
+        abs_tol=1e-3,
+    )
+    assert converged is False
+    assert change > 1e-3
+
+
+def test_outer_coherit_h2_matches_final_chive_functional():
+    rng = np.random.RandomState(941)
+    n_samples, n_markers = 80, 5
+    genotype = rng.standard_normal((n_samples, n_markers))
+    genotype -= genotype.mean(axis=0)
+    beta = rng.standard_normal(n_markers) * 0.1
+    sparse_mean = genotype @ beta
+    residual = rng.standard_normal(n_samples) * 0.7
+    residual -= residual.mean()
+    phenotype = sparse_mean + residual
+    phenotype, _, phenotype_standard_deviation = (
+        SPARSE._standardize_phenotype_at_input(
+            phenotype
+        )
+    )
+    sparse_mean = sparse_mean / phenotype_standard_deviation
+    residual = residual / phenotype_standard_deviation
+    beta = beta / phenotype_standard_deviation
+
+    expected_q, _, _ = SPARSE._chive_q_hat_given_active(
+        genotype,
+        phenotype,
+        beta,
+    )
+    expected_h2 = SPARSE._sparse_dense_h2(expected_q, 0.2, 0.3)
+    observed_h2, observed_q = (
+        SPARSE._outer_coherit_h2_from_fitted_sparse_mean(
+            sparse_mean,
+            residual,
+            background_genetic_variance=0.2,
+            residual_variance=0.3,
+        )
+    )
+
+    assert np.isclose(observed_q, expected_q)
+    assert np.isclose(observed_h2, expected_h2)
 
 
 def test_partitioned_kkt_rejects_nonfinite_outside_score_with_empty_support():
@@ -640,6 +988,7 @@ def test_sparse_defaults_use_twenty_outer_rounds_and_pcg_scaled_kkt_floor(
     default_args = SPARSE.parse_args()
     default_floor = max(1e-4, 2.0 * default_args.pcg_tol)
     assert default_args.outer_max == 20
+    assert np.isclose(default_args.h2_abs_tol, 1e-3)
     assert np.isclose(default_args.kkt_tol, default_floor)
     assert np.isclose(default_args.kkt_rel_tol, default_floor)
 
@@ -939,7 +1288,7 @@ def test_marker_score_probes_are_skipped_only_for_a_declining_adaptive_layer():
         SPARSE._validation_allows_marker_score(None, 0.2)
 
 
-def test_covariate_contrast_reml_passes_full_design_and_maps_scale():
+def test_covariate_contrast_reml_passes_full_design_without_rescaling():
     marker = SimpleNamespace(
         var_components=REML.jnp.asarray(
             [0.25, 0.75], dtype=REML.jnp.float32
@@ -992,58 +1341,17 @@ def test_covariate_contrast_reml_passes_full_design_and_maps_scale():
     assert np.array_equal(fitter.covar, nuisance)
     assert "standardize_y" not in fitter.kwargs
     assert np.isclose(fitter.kwargs["h2_init"], 0.31)
-    _, residual_scale = SPARSE._phenotype_standardization_stats(residual)
-    variance_scale = residual_scale**2
     assert np.array_equal(
         np.asarray(fitter.kwargs["var_components_init"]),
-        np.asarray(theta / variance_scale, dtype=np.float32),
+        theta,
     )
-    np.testing.assert_allclose(
-        np.asarray(result.var_components),
-        np.asarray([0.25, 0.75]) * variance_scale,
-    )
-    np.testing.assert_allclose(
-        np.asarray(result.rep_var_components),
-        np.asarray([[0.2, 0.8], [0.3, 0.7]]) * variance_scale,
-    )
-    np.testing.assert_allclose(
-        np.asarray(result.monte_carlo_se_var),
-        np.asarray([0.01, 0.02]) * variance_scale,
-    )
-    np.testing.assert_allclose(
-        np.asarray(result.final_grad),
-        np.asarray([2.0, 4.0]) / variance_scale,
-    )
-    np.testing.assert_allclose(
-        np.asarray(result.final_ai),
-        np.asarray([[3.0, 0.5], [0.5, 5.0]]) / variance_scale**2,
-    )
-    np.testing.assert_allclose(
-        np.asarray(result.diagnostics["theta"]),
-        np.asarray([0.25, 0.75]) * variance_scale,
-    )
-    np.testing.assert_allclose(
-        np.asarray(result.diagnostics["grad"]),
-        np.asarray([2.0, 4.0]) / variance_scale,
-    )
-    np.testing.assert_allclose(
-        np.asarray(result.diagnostics["ai"]),
-        np.asarray([[3.0, 0.5], [0.5, 5.0]]) / variance_scale**2,
-    )
-    np.testing.assert_allclose(
-        result.history[0]["params"],
-        np.asarray([0.25, 0.75]) * variance_scale,
-    )
-    assert np.isclose(
-        result.history[0]["step_norm"], 0.1 * variance_scale
-    )
-    assert np.isclose(
-        result.history[0]["grad_norm"], 2.0 / variance_scale
-    )
-    assert np.isclose(
-        result.history[0]["variance_scale_to_standardized_phenotype"],
-        variance_scale,
-    )
+    assert result.var_components is marker.var_components
+    assert result.rep_var_components is marker.rep_var_components
+    assert result.monte_carlo_se_var is marker.monte_carlo_se_var
+    assert result.final_grad is marker.final_grad
+    assert result.final_ai is marker.final_ai
+    assert result.diagnostics is marker.diagnostics
+    assert result.history is marker.history
 
 
 def test_covariate_contrast_reml_intercept_fallback_matches_legacy_design():
@@ -1162,6 +1470,8 @@ def test_covariate_contrast_reml_core_is_invariant_to_nuisance_shift():
                 slq_m=24,
                 precond_conf=None,
                 pcg_tol=1e-7,
+                response_is_standardized=True,
+                unit_variance_components=True,
                 return_diagnostics=True,
                 verbose=False,
             )
@@ -1244,10 +1554,7 @@ def test_selected_span_gls_df_correction_matches_fixed_span_formula():
     w = rng.standard_normal((n, n))
     v = w @ w.T / n + 0.7 * np.eye(n)
     vinv = np.linalg.inv(v)
-    phenotype_scale = 2.5
-    y = phenotype_scale * (
-        z_active @ rng.standard_normal(k) + rng.multivariate_normal(np.zeros(n), v)
-    )
+    y = z_active @ rng.standard_normal(k) + rng.multivariate_normal(np.zeros(n), v)
 
     out = SPARSE._selected_span_gls_quadratics(
         y=y,
@@ -1256,19 +1563,18 @@ def test_selected_span_gls_df_correction_matches_fixed_span_formula():
         Hinv_y=vinv @ y,
         Hinv_covar=None,
         Hinv_z_active=vinv @ z_active,
-        phenotype_scale=phenotype_scale,
     )
 
     gram_inv = np.linalg.inv(z_active.T @ vinv @ z_active)
     sparse_gram = z_active.T @ z_active / n
-    expected_df_std = np.trace(sparse_gram @ gram_inv)
-    expected_plugin_std = float(out["q_plugin_raw"]) / phenotype_scale**2
+    expected_df = np.trace(sparse_gram @ gram_inv)
+    expected_plugin = float(np.mean(np.square(z_active @ out["beta_active_basis"])))
 
-    assert np.isclose(out["df_correction_standardized"], expected_df_std)
-    assert np.isclose(out["q_plugin_standardized"], expected_plugin_std)
+    assert np.isclose(out["df_correction"], expected_df)
+    assert np.isclose(out["q_plugin"], expected_plugin)
     assert np.isclose(
-        out["q_df_corrected_standardized"],
-        expected_plugin_std - expected_df_std,
+        out["q_df_corrected"],
+        expected_plugin - expected_df,
     )
 
 
@@ -1289,11 +1595,10 @@ def test_selected_span_gls_uses_independent_basis_for_duplicate_markers():
         Hinv_y=y,
         Hinv_covar=covar,
         Hinv_z_active=z_active,
-        phenotype_scale=float(np.std(y)),
     )
 
     assert len(out["active_basis_idx"]) == 1
-    assert np.isfinite(out["q_df_corrected_standardized"])
+    assert np.isfinite(out["q_df_corrected"])
 
     beta_full = SPARSE._expand_selected_basis_coefficients(
         support_size=z_active.shape[1],
@@ -1304,7 +1609,7 @@ def test_selected_span_gls_uses_independent_basis_for_duplicate_markers():
     assert np.count_nonzero(beta_full) == 1
     assert np.isclose(
         np.mean(np.square(fitted)),
-        out["q_plugin_raw"],
+        out["q_plugin"],
         rtol=1e-12,
         atol=1e-12,
     )
@@ -1324,14 +1629,13 @@ def test_selected_span_gls_recovers_covariates_with_empty_support():
         Hinv_y=y,
         Hinv_covar=covar,
         Hinv_z_active=z_active,
-        phenotype_scale=float(np.std(y)),
     )
 
     assert out["beta_cov"].shape == (1,)
     assert out["beta_active_basis"].shape == (0,)
     assert out["active_basis_idx"].shape == (0,)
-    assert out["q_plugin_raw"] == 0.0
-    assert out["q_df_corrected_raw"] == 0.0
+    assert out["q_plugin"] == 0.0
+    assert out["q_df_corrected"] == 0.0
 
 
 def test_selected_span_basis_expansion_rejects_invalid_positions():

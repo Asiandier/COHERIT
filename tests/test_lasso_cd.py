@@ -239,6 +239,43 @@ class TestLambdaPath:
         assert out["path"][0]["lam_ratio"] == 1.0
         assert out["path"][-1]["lam_ratio"] == 1e-3
 
+    def test_explicit_lambda_block_matches_complete_path_subset(self):
+        Q = _random_spd(8, seed=808)
+        q = np.linspace(-1.5, 2.0, 8)
+        cfg = LassoPathConfig(
+            n_lambda=16,
+            lam_min_ratio=0.05,
+            max_cd_iter=10000,
+            cd_tol=1e-10,
+            kkt_abs_tol=1e-8,
+            kkt_rel_tol=1e-8,
+        )
+        full = solve_lasso_path(Q=Q, q=q, yHy=25.0, cfg=cfg)
+        block_lambdas = np.asarray(
+            [row["lam"] for row in full["path"][5:11]]
+        )
+        block_warm = full["beta_path"][5:11].copy()
+
+        block = solve_lasso_path(
+            Q=Q,
+            q=q,
+            yHy=25.0,
+            cfg=cfg,
+            beta_path0=block_warm,
+            lambda_sequence=block_lambdas,
+            lambda_max_reference=full["lam_max"],
+        )
+
+        assert block["path_role"] == "explicit_global_path_block"
+        np.testing.assert_allclose(
+            block["beta_path"], full["beta_path"][5:11], rtol=1e-6, atol=1e-7
+        )
+        np.testing.assert_allclose(
+            [row["lam_ratio"] for row in block["path"]],
+            [row["lam_ratio"] for row in full["path"][5:11]],
+        )
+        assert block["external_beta_path_warm_start_rows_used"] > 0
+
     def test_external_path_warm_start_preserves_solution_and_reduces_cd_work(self):
         k = 24
         correlation = 0.85

@@ -88,6 +88,7 @@ load_pheno_covar_aligned_with_transform = (
 )
 load_covar_aligned = _data_mod.load_covar_aligned
 LassoPathConfig = _lasso_mod.LassoPathConfig
+make_lambda_sequence = _lasso_mod.make_lambda_sequence
 compute_projected_hinv_vector = _lasso_mod.compute_projected_hinv_vector
 fit_weighted_lasso_with_covariates = _lasso_mod.fit_weighted_lasso_with_covariates
 pcg_solve = _pcg_mod.pcg_solve
@@ -240,10 +241,15 @@ def _load_sparse_numerical_state(
         or np.setdiff1d(source_support, source_candidate).size > 0
     ):
         raise ValueError("Sparse state candidate/support source indices are invalid.")
-    if beta_path.shape != (int(n_lambda), int(source_candidate.size)):
+    if (
+        beta_path.ndim != 2
+        or beta_path.shape[1] != int(source_candidate.size)
+        or not 1 <= beta_path.shape[0] <= int(n_lambda)
+    ):
         raise ValueError(
-            "Sparse state beta path shape mismatch: "
-            f"{beta_path.shape} != {(int(n_lambda), int(source_candidate.size))}."
+            "Sparse state beta path shape mismatch: expected 1.."
+            f"{int(n_lambda)} rows and {int(source_candidate.size)} columns, "
+            f"got {beta_path.shape}."
         )
     if z_solution.shape != (int(n_samples), int(source_candidate.size)):
         raise ValueError("Sparse state Hinv[Z] matrix has the wrong shape.")
@@ -794,6 +800,8 @@ def _build_prediction_fit_context(
         precond_rank=0,
         max_pcg_iters=args.max_pcg_iters,
         pcg_ridge=args.pcg_ridge,
+        response_is_standardized=True,
+        unit_variance_components=True,
         verbose=args.verbose,
     )
     if prediction_sources is not None:
@@ -1003,7 +1011,15 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--screen-topk", type=int, default=2000)
     p.add_argument("--candidate-k", type=int, default=256)
-    p.add_argument("--vc-rel-tol", type=float, default=1e-2)
+    p.add_argument(
+        "--h2-abs-tol",
+        type=float,
+        default=1e-3,
+        help=(
+            "Absolute tolerance for the change in the primary COHERIT h2 "
+            "estimate between consecutive outer updates."
+        ),
+    )
     p.add_argument(
         "--effect-rel-tol",
         type=float,
@@ -1044,6 +1060,16 @@ def parse_args() -> argparse.Namespace:
         help=(
             "JSON audit of the lambda selected by validation R2 inside every "
             "alpha/theta outer iteration."
+        ),
+    )
+    p.add_argument(
+        "--validation-early-stopping-lag",
+        type=int,
+        default=5,
+        help=(
+            "Stop the descending exact lambda path when the best validation "
+            "R2 in the latest lag points is below an earlier best. Only "
+            "full-marker-KKT-certified points count."
         ),
     )
     p.add_argument("--proj-ridge", type=float, default=1e-6)
@@ -1088,6 +1114,40 @@ def parse_args() -> argparse.Namespace:
         help="Optional hard cap for KKT-expanded candidate set size (0 = no explicit cap).",
     )
     p.add_argument(
+        "--candidate-pcg-rhs-batch-size",
+        type=int,
+        default=1024,
+        help=(
+            "Maximum genotype RHS columns per candidate Hinv[Z] block-PCG "
+            "solve. Bounds streamed-GRM X.T@V memory during large working-set "
+            "expansion."
+        ),
+    )
+    p.add_argument(
+        "--basil-marker-batch-size",
+        type=int,
+        default=1000,
+        help=(
+            "Computational marker batch used by exact BASIL lambda-path "
+            "rollout. This changes memory/runtime, not the certified solution."
+        ),
+    )
+    p.add_argument(
+        "--basil-lambda-block-size",
+        type=int,
+        default=10,
+        help=(
+            "Number of unresolved lambda points fitted per BASIL block. "
+            "This changes memory/runtime, not the certified solution."
+        ),
+    )
+    p.add_argument(
+        "--basil-max-iterations",
+        type=int,
+        default=200,
+        help="Maximum exact-prefix/enlargement iterations for one BASIL path.",
+    )
+    p.add_argument(
         "--verbose",
         action="store_true",
         default=env("VERBOSE", "").strip().lower() in {"1", "true", "yes", "on"},
@@ -1123,36 +1183,6 @@ def _canonical_fixed_lam_ratio(value: float, *, atol: float = 1e-12) -> float:
     return ratio
 
 
-def _variance_components_converged(
-    new_v: np.ndarray,
-    old_v: np.ndarray,
-    *,
-    rel_tol: float,
-    abs_tol: float = 1e-4,
-) -> tuple[bool, float]:
-    """Mixed absolute/relative convergence check for variance components.
-
-    A purely relative check is unstable when a component is close to zero.
-    The returned diagnostic is the largest componentwise change divided by
-    its allowed mixed-tolerance bound; values at most one pass.
-    """
-    new_arr = np.asarray(new_v, dtype=np.float64).reshape(-1)
-    old_arr = np.asarray(old_v, dtype=np.float64).reshape(-1)
-    if new_arr.shape != old_arr.shape or new_arr.size == 0:
-        return False, float("inf")
-    scale = max(
-        float(np.sum(np.abs(new_arr))),
-        float(np.sum(np.abs(old_arr))),
-        1.0,
-    )
-    allowed = (
-        float(abs_tol) * scale
-        + float(rel_tol) * np.maximum(np.abs(new_arr), np.abs(old_arr))
-    )
-    ratio = float(np.max(np.abs(new_arr - old_arr) / allowed))
-    return bool(np.isfinite(ratio) and ratio <= 1.0), ratio
-
-
 def _relative_fitted_mean_change(
     current: np.ndarray,
     previous: np.ndarray | None,
@@ -1177,6 +1207,27 @@ def _relative_fitted_mean_change(
         np.finfo(np.float64).tiny,
     )
     return float(np.linalg.norm(current_arr - previous_arr) / denom)
+
+
+def _heritability_converged(
+    current_h2: float,
+    previous_h2: float | None,
+    *,
+    abs_tol: float = 1e-3,
+) -> tuple[bool, float]:
+    """Check absolute change in the primary COHERIT heritability estimate."""
+    if previous_h2 is None:
+        return False, float("inf")
+    current = float(current_h2)
+    previous = float(previous_h2)
+    change = abs(current - previous)
+    tolerance = float(abs_tol)
+    at_boundary = bool(
+        np.isclose(change, tolerance, rtol=1e-12, atol=1e-15)
+    )
+    return bool(
+        np.isfinite(change) and (change <= tolerance or at_boundary)
+    ), float(change)
 
 
 def _accepted_reml_theta(
@@ -1233,7 +1284,7 @@ def _accepted_reml_theta(
 
 def _fit_covariate_contrast_residual_reml(
     fitter,
-    residual_standardized: np.ndarray,
+    residual: np.ndarray,
     theta_init: np.ndarray,
     *,
     covar: np.ndarray | None,
@@ -1246,12 +1297,11 @@ def _fit_covariate_contrast_residual_reml(
     the complete design ``C`` here is what makes the update equivalent to
     profiling the nuisance coefficients at every candidate covariance.
 
-    Core REML standardizes its response internally.  The Lasso residual already
-    has units of the globally standardized phenotype, so estimates on the
-    internal unit-residual scale are mapped back before they are combined with
-    sparse quadratic terms.
+    The sparse pipeline standardizes the phenotype once at input.  This REML
+    block therefore consumes the residual on that same scale and performs no
+    response rescaling.
     """
-    residual = np.asarray(residual_standardized, dtype=np.float32).reshape(-1)
+    residual = np.asarray(residual, dtype=np.float32).reshape(-1)
     theta = np.asarray(theta_init, dtype=np.float32).reshape(-1)
     if residual.size < 2:
         raise ValueError("Covariate-contrast REML requires at least two samples.")
@@ -1271,66 +1321,12 @@ def _fit_covariate_contrast_residual_reml(
             )
         if not np.all(np.isfinite(nuisance_design)):
             raise ValueError("Covariate design contains non-finite values.")
-    _, residual_scale = _phenotype_standardization_stats(residual)
-    variance_scale = float(residual_scale) ** 2
-    fit_result = fitter.fit_infinitesimal(
+    return fitter.fit_infinitesimal(
         jnp.asarray(residual, dtype=jnp.float32),
         jnp.asarray(nuisance_design, dtype=jnp.float32),
         h2_init=float(h2_init),
-        var_components_init=jnp.asarray(
-            theta / variance_scale, dtype=jnp.float32
-        ),
+        var_components_init=jnp.asarray(theta, dtype=jnp.float32),
     )
-    fit_result.var_components = (
-        jnp.asarray(fit_result.var_components) * variance_scale
-    )
-    if fit_result.rep_var_components is not None:
-        fit_result.rep_var_components = (
-            jnp.asarray(fit_result.rep_var_components) * variance_scale
-        )
-    if fit_result.monte_carlo_se_var is not None:
-        fit_result.monte_carlo_se_var = (
-            jnp.asarray(fit_result.monte_carlo_se_var) * variance_scale
-        )
-    if fit_result.final_grad is not None:
-        fit_result.final_grad = (
-            jnp.asarray(fit_result.final_grad) / variance_scale
-        )
-    if fit_result.final_ai is not None:
-        fit_result.final_ai = (
-            jnp.asarray(fit_result.final_ai) / (variance_scale**2)
-        )
-    if fit_result.diagnostics is not None:
-        diagnostics = dict(fit_result.diagnostics)
-        if diagnostics.get("theta") is not None:
-            diagnostics["theta"] = (
-                jnp.asarray(diagnostics["theta"]) * variance_scale
-            )
-        if diagnostics.get("grad") is not None:
-            diagnostics["grad"] = (
-                jnp.asarray(diagnostics["grad"]) / variance_scale
-            )
-        if diagnostics.get("ai") is not None:
-            diagnostics["ai"] = (
-                jnp.asarray(diagnostics["ai"]) / (variance_scale**2)
-            )
-        fit_result.diagnostics = diagnostics
-
-    history = []
-    for source_row in fit_result.history:
-        row = dict(source_row)
-        if row.get("params") is not None:
-            row["params"] = (
-                np.asarray(row["params"], dtype=np.float64) * variance_scale
-            ).tolist()
-        if row.get("step_norm") is not None:
-            row["step_norm"] = float(row["step_norm"]) * variance_scale
-        if row.get("grad_norm") is not None:
-            row["grad_norm"] = float(row["grad_norm"]) / variance_scale
-        row["variance_scale_to_standardized_phenotype"] = variance_scale
-        history.append(row)
-    fit_result.history = history
-    return fit_result
 
 
 def _require_pcg_converged(
@@ -1363,6 +1359,109 @@ def _true_pcg_relative_residual(hv, rhs, solution) -> float:
     return float(np.asarray(jax.device_get(relative)))
 
 
+def _solve_hinv_columns_batched(
+    *,
+    hv,
+    precond,
+    rhs: np.ndarray,
+    warm_start: np.ndarray | None,
+    tol: float,
+    maxiter: int,
+    batch_size: int,
+    stage: str,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """Solve ``H X = B`` in bounded RHS batches.
+
+    A streamed GRM matvec forms an ``X.T @ V`` intermediate whose memory is
+    proportional to the number of right-hand sides.  Candidate expansion can
+    therefore make one monolithic Hinv[Z] solve much larger than the Lasso
+    Gram matrix itself.  Fixed-size batches bound that temporary while still
+    using block PCG inside every batch.
+    """
+    rhs_np = np.asarray(rhs, dtype=np.float32)
+    if rhs_np.ndim != 2:
+        raise ValueError("Batched PCG right-hand side must be a matrix.")
+    n_rows, n_columns = rhs_np.shape
+    batch = int(batch_size)
+    if batch < 1:
+        raise ValueError("Batched PCG size must be positive.")
+    warm_np = None
+    if warm_start is not None:
+        warm_np = np.asarray(warm_start, dtype=np.float32)
+        if warm_np.shape != rhs_np.shape:
+            raise ValueError("Batched PCG warm start does not align with RHS.")
+        if not np.all(np.isfinite(warm_np)):
+            raise ValueError("Batched PCG warm start must be finite.")
+    if not np.all(np.isfinite(rhs_np)):
+        raise ValueError("Batched PCG right-hand side must be finite.")
+    if n_columns == 0:
+        return np.empty((n_rows, 0), dtype=np.float32), {
+            "batch_size": batch,
+            "n_batches": 0,
+            "n_columns": 0,
+            "max_reported_relative_residual": 0.0,
+            "max_true_relative_residual": 0.0,
+            "max_iterations": 0,
+            "total_batch_iterations": 0,
+        }
+
+    solution_np = np.empty_like(rhs_np)
+    max_reported = 0.0
+    max_true = 0.0
+    max_iterations = 0
+    total_iterations = 0
+    n_batches = 0
+    for start in range(0, n_columns, batch):
+        stop = min(start + batch, n_columns)
+        rhs_batch = jnp.asarray(rhs_np[:, start:stop], dtype=jnp.float32)
+        warm_batch = (
+            jnp.asarray(warm_np[:, start:stop], dtype=jnp.float32)
+            if warm_np is not None
+            else None
+        )
+        solution, reported_residual, iterations = pcg_solve(
+            hv,
+            rhs_batch,
+            M=precond,
+            tol=float(tol),
+            maxiter=int(maxiter),
+            X0=warm_batch,
+        )
+        reported = _require_pcg_converged(
+            reported_residual,
+            tol=float(tol),
+            iters=int(iterations),
+            maxiter=int(maxiter),
+            stage=f"{stage} columns {start}:{stop}",
+        )
+        true_residual = _true_pcg_relative_residual(
+            hv, rhs_batch, solution
+        )
+        if not np.isfinite(true_residual):
+            raise RuntimeError(
+                f"{stage} columns {start}:{stop} produced a non-finite "
+                "true residual."
+            )
+        solution_np[:, start:stop] = np.asarray(
+            jax.device_get(solution), dtype=np.float32
+        )
+        max_reported = max(max_reported, float(reported))
+        max_true = max(max_true, float(true_residual))
+        max_iterations = max(max_iterations, int(iterations))
+        total_iterations += int(iterations)
+        n_batches += 1
+
+    return solution_np, {
+        "batch_size": batch,
+        "n_batches": int(n_batches),
+        "n_columns": int(n_columns),
+        "max_reported_relative_residual": float(max_reported),
+        "max_true_relative_residual": float(max_true),
+        "max_iterations": int(max_iterations),
+        "total_batch_iterations": int(total_iterations),
+    }
+
+
 def _chive_q_hat_given_active(
     z_active: np.ndarray,
     y: np.ndarray,
@@ -1389,30 +1488,30 @@ def _chive_q_hat_given_active(
     return term1 + term2, term1, term2
 
 
-def _phenotype_standardization_stats(y: np.ndarray) -> tuple[float, float]:
-    """Return the exact mean/scale convention used internally by ``fit_reml``."""
-    _y_std, y_mean, y_scale = standardize_response(
+def _standardize_phenotype_at_input(
+    y: np.ndarray,
+) -> tuple[np.ndarray, float, float]:
+    """Standardize the phenotype once at the sparse-pipeline input boundary."""
+    y_standardized, y_mean, y_scale = standardize_response(
         jnp.asarray(np.asarray(y, dtype=np.float32).reshape(-1), dtype=jnp.float32)
     )
-    mean_host, scale_host = jax.device_get((y_mean, y_scale))
-    return float(mean_host), float(scale_host)
-
-
-def _quadratic_variance_to_reml_scale(q_raw: float, y_scale: float) -> float:
-    """Convert a phenotype-variance quantity to fit_reml's standardized-y scale."""
-    scale = float(y_scale)
-    if not np.isfinite(scale) or scale <= 0.0:
-        raise ValueError("y_scale must be positive and finite.")
-    return float(q_raw) / (scale * scale)
+    standardized_host, mean_host, scale_host = jax.device_get(
+        (y_standardized, y_mean, y_scale)
+    )
+    return (
+        np.asarray(standardized_host, dtype=np.float32),
+        float(mean_host),
+        float(scale_host),
+    )
 
 
 def _sparse_dense_h2(
-    q_sparse_standardized: float,
+    q_sparse: float,
     background_genetic_variance: float,
     residual_variance: float,
 ) -> float:
     """Combine sparse, dense-background, and residual variance on one scale."""
-    genetic = float(q_sparse_standardized) + float(background_genetic_variance)
+    genetic = float(q_sparse) + float(background_genetic_variance)
     residual = float(residual_variance)
     denominator = genetic + residual
     if (
@@ -1423,6 +1522,46 @@ def _sparse_dense_h2(
     ):
         return float("nan")
     return genetic / denominator
+
+
+def _outer_coherit_h2_from_fitted_sparse_mean(
+    sparse_mean: np.ndarray,
+    residual: np.ndarray,
+    *,
+    background_genetic_variance: float,
+    residual_variance: float,
+) -> tuple[float, float]:
+    """Return current COHERIT h2 and calibrated sparse variance.
+
+    This is the same calibrated sparse-variance functional used by the final
+    primary estimator, expressed through the already available fitted sparse
+    mean ``g`` and residual ``r``:
+
+        q_sparse = (g'g + 2 g'r) / n.
+
+    Using these vectors avoids another genotype matrix product inside the
+    outer convergence check.
+    """
+    sparse_arr = np.asarray(sparse_mean, dtype=np.float64).reshape(-1)
+    residual_arr = np.asarray(residual, dtype=np.float64).reshape(-1)
+    if sparse_arr.shape != residual_arr.shape or sparse_arr.size == 0:
+        raise ValueError(
+            "Sparse fitted mean and residual must be non-empty aligned vectors."
+        )
+    n_samples = float(sparse_arr.size)
+    q_sparse = float(
+        (
+            sparse_arr @ sparse_arr
+            + 2.0 * (sparse_arr @ residual_arr)
+        )
+        / n_samples
+    )
+    h2 = _sparse_dense_h2(
+        q_sparse,
+        background_genetic_variance,
+        residual_variance,
+    )
+    return float(h2), float(q_sparse)
 
 
 def _finite_float_or_none(value: float) -> float | None:
@@ -1467,7 +1606,7 @@ def _select_converged_validation_path_index(
     path_rows: list[dict],
     metrics: list[dict],
 ) -> int:
-    """Select validation R2 only among converged, candidate-KKT path points."""
+    """Select validation R2 only among full-genome KKT path solutions."""
     if len(path_rows) != len(metrics) or not path_rows:
         raise ValueError("Lasso path and validation metrics must align.")
     eligible = [
@@ -1475,12 +1614,14 @@ def _select_converged_validation_path_index(
         for index, (row, metric) in enumerate(zip(path_rows, metrics))
         if bool(row.get("converged", False))
         and bool(row.get("kkt_passed", False))
+        and bool(row.get("global_kkt_passed", False))
         and metric.get("correlation_squared") is not None
         and np.isfinite(float(metric["correlation_squared"]))
     ]
     if not eligible:
         raise RuntimeError(
-            "No converged candidate-KKT Lasso path point has finite validation R2."
+            "No converged full-genome-KKT Lasso path point has finite "
+            "validation R2."
         )
     return max(
         eligible,
@@ -1516,9 +1657,11 @@ def _materialize_validation_selected_lasso(
     if not (
         bool(selected_row.get("converged", False))
         and bool(selected_row.get("kkt_passed", False))
+        and bool(selected_row.get("global_kkt_passed", False))
     ):
         raise RuntimeError(
-            "Validation-selected Lasso path point is not candidate-KKT converged."
+            "Validation-selected Lasso path point is not full-genome-KKT "
+            "converged."
         )
     beta_snp = beta_snp_path[index].copy()
     beta_cov = beta_cov_path[index].copy()
@@ -1557,6 +1700,104 @@ def _materialize_validation_selected_lasso(
     return selected, selection_record
 
 
+def _validation_path_early_stopping_decision(
+    metrics: list[dict],
+    *,
+    stopping_lag: int,
+) -> dict[str, object]:
+    """Apply snpnet-style validation early stopping to an exact path prefix.
+
+    For a lag of ``L``, stop when the best metric before the most recent
+    ``L`` certified models is strictly better than every metric in that recent
+    window.  Equal/flat leading metrics therefore cannot stop the path before
+    an actual earlier peak has appeared.
+    """
+    lag = int(stopping_lag)
+    if lag < 1:
+        raise ValueError("Validation early-stopping lag must be positive.")
+    values = np.asarray(
+        [metric.get("correlation_squared") for metric in metrics],
+        dtype=np.float64,
+    )
+    if values.size > 0 and not np.all(np.isfinite(values)):
+        raise ValueError(
+            "Validation early stopping requires finite R2 at every exact point."
+        )
+    best_index = int(np.argmax(values)) if values.size > 0 else None
+    best_r2 = float(values[best_index]) if best_index is not None else None
+    if values.size <= lag:
+        return {
+            "stopped": False,
+            "stopping_lag": lag,
+            "n_evaluated": int(values.size),
+            "best_path_index": best_index,
+            "best_correlation_squared": best_r2,
+            "earlier_max": None,
+            "recent_max": None,
+            "reason": "insufficient_certified_points",
+        }
+    earlier_max = float(np.max(values[:-lag]))
+    recent_max = float(np.max(values[-lag:]))
+    stopped = bool(earlier_max > recent_max)
+    return {
+        "stopped": stopped,
+        "stopping_lag": lag,
+        "n_evaluated": int(values.size),
+        "best_path_index": best_index,
+        "best_correlation_squared": best_r2,
+        "earlier_max": earlier_max,
+        "recent_max": recent_max,
+        "reason": (
+            "earlier_peak_exceeds_latest_window"
+            if stopped
+            else "latest_window_still_reaches_global_prefix_max"
+        ),
+    }
+
+
+def _evaluate_lasso_path_on_validation(
+    *,
+    args,
+    fitter,
+    prediction_context: _PredictionFitContext,
+    y_train: np.ndarray,
+    train_covar: np.ndarray | None,
+    train_candidate: np.ndarray,
+    candidate: np.ndarray,
+    beta_cov_path: np.ndarray,
+    beta_snp_path: np.ndarray,
+    theta: np.ndarray,
+    validation_outcome: np.ndarray,
+) -> dict[str, object]:
+    """Evaluate one already-certified coefficient block on validation data."""
+    validation_candidate = (
+        prediction_context.grm_index.extract_standardized_columns(candidate)
+        .astype(np.float32, copy=False)
+    )
+    path_prediction = predict_sparse_path_partitioned(
+        fitter=fitter,
+        test_fitter=prediction_context.fitter,
+        y_train=y_train,
+        train_covar=train_covar,
+        test_covar=prediction_context.covar,
+        train_candidate_geno=train_candidate,
+        test_candidate_geno=validation_candidate,
+        beta_cov_path=beta_cov_path,
+        beta_candidate_path=beta_snp_path,
+        theta=theta,
+        pcg_tol=float(args.pcg_tol),
+        max_pcg_iters=int(args.max_pcg_iters),
+    )
+    return {
+        "metrics": evaluate_prediction_path(
+            path_prediction.phenotype_prediction,
+            validation_outcome,
+        ),
+        "pcg_rel_res": float(path_prediction.pcg_rel_res),
+        "pcg_iters": int(path_prediction.pcg_iters),
+    }
+
+
 def _select_lasso_by_validation_prediction(
     *,
     args,
@@ -1567,34 +1808,24 @@ def _select_lasso_by_validation_prediction(
     train_candidate: np.ndarray,
     candidate: np.ndarray,
     lasso_path: dict,
-    theta_standardized: np.ndarray,
-    phenotype_scale: float,
+    theta: np.ndarray,
     validation_outcome: np.ndarray,
 ) -> tuple[dict, dict]:
     """Evaluate the complete path and return the validation-selected alpha."""
-    validation_candidate = (
-        prediction_context.grm_index.extract_standardized_columns(candidate)
-        .astype(np.float32, copy=False)
-    )
-    path_prediction = predict_sparse_path_partitioned(
+    evaluated = _evaluate_lasso_path_on_validation(
+        args=args,
         fitter=fitter,
-        test_fitter=prediction_context.fitter,
-        y_train_raw=y_train,
+        prediction_context=prediction_context,
+        y_train=y_train,
         train_covar=train_covar,
-        test_covar=prediction_context.covar,
-        train_candidate_geno=train_candidate,
-        test_candidate_geno=validation_candidate,
-        beta_cov_path_raw=lasso_path["beta_cov_path"],
-        beta_candidate_path_raw=lasso_path["beta_snp_path"],
-        theta_standardized=theta_standardized,
-        phenotype_scale=float(phenotype_scale),
-        pcg_tol=float(args.pcg_tol),
-        max_pcg_iters=int(args.max_pcg_iters),
+        train_candidate=train_candidate,
+        candidate=candidate,
+        beta_cov_path=lasso_path["beta_cov_path"],
+        beta_snp_path=lasso_path["beta_snp_path"],
+        theta=theta,
+        validation_outcome=validation_outcome,
     )
-    metrics = evaluate_prediction_path(
-        path_prediction.phenotype_prediction_raw,
-        validation_outcome,
-    )
+    metrics = list(evaluated["metrics"])
     selected_index = _select_converged_validation_path_index(
         list(lasso_path["path"]), metrics
     )
@@ -1602,8 +1833,8 @@ def _select_lasso_by_validation_prediction(
         lasso_path,
         metrics,
         selected_index=selected_index,
-        path_prediction_pcg_res=float(path_prediction.pcg_rel_res),
-        path_prediction_pcg_iters=int(path_prediction.pcg_iters),
+        path_prediction_pcg_res=float(evaluated["pcg_rel_res"]),
+        path_prediction_pcg_iters=int(evaluated["pcg_iters"]),
     )
 
 
@@ -1616,8 +1847,7 @@ def _write_iterative_validation_output(
     final_lasso: dict,
     final_candidate: np.ndarray,
     grm_index: MultiGRMIndex,
-    theta_standardized: np.ndarray,
-    phenotype_scale: float,
+    theta: np.ndarray,
     outer_converged: bool,
     outer_stop_reason: str,
 ) -> dict[str, object]:
@@ -1649,12 +1879,9 @@ def _write_iterative_validation_output(
         "n_validation_samples": int(
             np.asarray(validation_outcome).reshape(-1).size
         ),
-        "phenotype_scale": float(phenotype_scale),
         "outer_converged": bool(outer_converged),
         "outer_stop_reason": str(outer_stop_reason),
-        "theta_standardized_final": np.asarray(
-            theta_standardized, dtype=np.float64
-        ).tolist(),
+        "theta_final": np.asarray(theta, dtype=np.float64).tolist(),
         "n_path_selections": int(len(selection_trace)),
         "outer_selection_trace": selection_trace,
         "final_selected": selected,
@@ -1767,10 +1994,10 @@ def _lasso_kkt_certificate_from_scores(
 
 def _four_estimator_h2_from_branches(
     *,
-    q_lasso_plugin_standardized: float,
-    q_lasso_calibrated_standardized: float,
-    q_selected_span_plugin_standardized: float,
-    q_selected_span_trace_standardized: float,
+    q_lasso_plugin: float,
+    q_lasso_calibrated: float,
+    q_selected_span_plugin: float,
+    q_selected_span_trace: float,
     lasso_ml_background_variance: float,
     lasso_ml_residual_variance: float,
     selected_span_reml_background_variance: float,
@@ -1779,22 +2006,22 @@ def _four_estimator_h2_from_branches(
     """Map the four sparse quadratics to their two variance branches."""
     return {
         "h2_lasso_plugin": _sparse_dense_h2(
-            q_lasso_plugin_standardized,
+            q_lasso_plugin,
             lasso_ml_background_variance,
             lasso_ml_residual_variance,
         ),
         "h2_chive": _sparse_dense_h2(
-            q_lasso_calibrated_standardized,
+            q_lasso_calibrated,
             lasso_ml_background_variance,
             lasso_ml_residual_variance,
         ),
         "h2_ss_gls_plugin": _sparse_dense_h2(
-            q_selected_span_plugin_standardized,
+            q_selected_span_plugin,
             selected_span_reml_background_variance,
             selected_span_reml_residual_variance,
         ),
         "h2_ss_gls_df_corrected": _sparse_dense_h2(
-            q_selected_span_trace_standardized,
+            q_selected_span_trace,
             selected_span_reml_background_variance,
             selected_span_reml_residual_variance,
         ),
@@ -1920,7 +2147,7 @@ def _sparse_output_contract(comparison_enabled: bool) -> dict[str, object]:
     """Return the mode-labelled sparse output contract for one run."""
     if comparison_enabled:
         return {
-            "sparse_output_schema_version": 6,
+            "sparse_output_schema_version": 7,
             "estimator_mode": "four_estimator_comparison",
             "computed_estimators": [
                 "h2_lasso_plugin",
@@ -1944,7 +2171,7 @@ def _sparse_output_contract(comparison_enabled: bool) -> dict[str, object]:
             ],
         }
     return {
-        "sparse_output_schema_version": 6,
+        "sparse_output_schema_version": 7,
         "estimator_mode": "coherit",
         "computed_estimators": ["h2_chive"],
         "selected_snp_columns": [
@@ -1970,16 +2197,8 @@ def _selected_span_gls_quadratics(
     Hinv_y: np.ndarray,
     Hinv_covar: np.ndarray | None,
     Hinv_z_active: np.ndarray,
-    phenotype_scale: float,
 ) -> dict[str, object]:
-    """Construct raw and trace-corrected quadratics after selected-span GLS.
-
-    The covariance operator represented by the ``Hinv_*`` arguments is on the
-    internally standardized phenotype scale.  GLS coefficients and the
-    squared fitted score are returned on the raw phenotype scale; the
-    fixed-span estimation-noise trace correction is reported on both scales.
-    Output field names use ``df`` for this analytic trace correction.
-    """
+    """Construct plug-in and trace-corrected quadratics after selected-span GLS."""
     y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
     z_arr = np.asarray(z_active, dtype=np.float64)
     hy = np.asarray(Hinv_y, dtype=np.float64).reshape(-1)
@@ -2014,12 +2233,9 @@ def _selected_span_gls_quadratics(
             "active_basis_idx": active_basis_idx,
             "beta_cov": np.empty((0,), dtype=np.float64),
             "beta_active_basis": np.empty((0,), dtype=np.float64),
-            "q_plugin_raw": 0.0,
-            "q_plugin_standardized": 0.0,
-            "df_correction_raw": 0.0,
-            "df_correction_standardized": 0.0,
-            "q_df_corrected_raw": 0.0,
-            "q_df_corrected_standardized": 0.0,
+            "q_plugin": 0.0,
+            "df_correction": 0.0,
+            "q_df_corrected": 0.0,
         }
 
     gram = fixed.T @ hfixed
@@ -2035,30 +2251,21 @@ def _selected_span_gls_quadratics(
     beta_active = np.asarray(coef[p_c:], dtype=np.float64)
     fitted_sparse = z_basis @ beta_active
     n = float(y_arr.size)
-    q_plugin_raw = float(fitted_sparse @ fitted_sparse / n)
+    q_plugin = float(fitted_sparse @ fitted_sparse / n)
 
     sparse_gram = z_basis.T @ z_basis / n
-    covariance_active_standardized = gram_inv[p_c:, p_c:]
-    df_standardized = float(
-        np.trace(sparse_gram @ covariance_active_standardized)
+    covariance_active = gram_inv[p_c:, p_c:]
+    df_correction = float(
+        np.trace(sparse_gram @ covariance_active)
     )
-    scale = float(phenotype_scale)
-    if not np.isfinite(scale) or scale <= 0.0:
-        raise ValueError("phenotype_scale must be positive and finite.")
-    scale_sq = scale * scale
-    q_plugin_standardized = q_plugin_raw / scale_sq
-    df_raw = df_standardized * scale_sq
 
     return {
         "active_basis_idx": active_basis_idx,
         "beta_cov": beta_cov,
         "beta_active_basis": beta_active,
-        "q_plugin_raw": q_plugin_raw,
-        "q_plugin_standardized": q_plugin_standardized,
-        "df_correction_raw": df_raw,
-        "df_correction_standardized": df_standardized,
-        "q_df_corrected_raw": q_plugin_raw - df_raw,
-        "q_df_corrected_standardized": q_plugin_standardized - df_standardized,
+        "q_plugin": q_plugin,
+        "df_correction": df_correction,
+        "q_df_corrected": q_plugin - df_correction,
     }
 
 
@@ -2179,6 +2386,955 @@ def _partitioned_lasso_kkt_from_scores(
     }
 
 
+def _build_hinv_lasso_residual_path(
+    *,
+    hinv_y: np.ndarray,
+    hinv_covar: np.ndarray | None,
+    hinv_geno: np.ndarray,
+    beta_cov_path: np.ndarray,
+    beta_snp_path: np.ndarray,
+) -> np.ndarray:
+    """Build H^-1 residual for a complete Lasso path with batched GEMMs.
+
+    The candidate Gram system already used the supplied H^-1 y,
+    H^-1 C and H^-1 Z solves. Recombining those same solutions keeps
+    the outside-marker KKT score consistent with that convex objective and
+    avoids one PCG solve per lambda.
+    """
+    hy = np.asarray(hinv_y, dtype=np.float32).reshape(-1)
+    hz = np.asarray(hinv_geno, dtype=np.float32)
+    beta_z = np.asarray(beta_snp_path, dtype=np.float32)
+    beta_c = np.asarray(beta_cov_path, dtype=np.float32)
+    if hz.ndim != 2 or hz.shape[0] != hy.size:
+        raise ValueError("Hinv genotype path basis has an invalid shape.")
+    if beta_z.ndim != 2 or beta_z.shape[1] != hz.shape[1]:
+        raise ValueError("SNP coefficient path does not align with Hinv genotype.")
+    if beta_c.ndim != 2 or beta_c.shape[0] != beta_z.shape[0]:
+        raise ValueError("Covariate and SNP coefficient paths do not align.")
+    if not (
+        np.all(np.isfinite(hy))
+        and np.all(np.isfinite(hz))
+        and np.all(np.isfinite(beta_z))
+        and np.all(np.isfinite(beta_c))
+    ):
+        raise ValueError("Lasso path residual inputs must be finite.")
+
+    n_path = int(beta_z.shape[0])
+    residual_path = np.repeat(hy[:, None], n_path, axis=1)
+    if beta_c.shape[1] > 0:
+        if hinv_covar is None:
+            raise ValueError("Covariate coefficients require Hinv covariates.")
+        hc = np.asarray(hinv_covar, dtype=np.float32)
+        if hc.shape != (hy.size, beta_c.shape[1]):
+            raise ValueError("Hinv covariates do not align with coefficient path.")
+        if not np.all(np.isfinite(hc)):
+            raise ValueError("Hinv covariates must be finite.")
+        residual_path -= hc @ np.ascontiguousarray(beta_c.T)
+    elif hinv_covar is not None:
+        hc = np.asarray(hinv_covar)
+        if hc.ndim != 2 or hc.shape[0] != hy.size:
+            raise ValueError("Hinv covariates have an invalid shape.")
+    if hz.shape[1] > 0:
+        residual_path -= hz @ np.ascontiguousarray(beta_z.T)
+    if not np.all(np.isfinite(residual_path)):
+        raise RuntimeError("Batched Hinv residual path is non-finite.")
+    return np.asarray(residual_path, dtype=np.float32)
+
+
+def _certify_complete_lasso_path_kkt_from_scores(
+    *,
+    score_path: np.ndarray,
+    candidate: np.ndarray,
+    beta_candidate_path: np.ndarray,
+    path_rows: list[dict],
+    abs_tol: float,
+    rel_tol: float,
+) -> dict[str, object]:
+    """Certify outside-marker KKT conditions for every Lasso path point.
+
+    Candidate-set score KKT is checked by the coordinate-descent solver.
+    This routine checks every marker that was fixed to zero outside that
+    candidate, returns the union of strict violators, and annotates every path
+    row before validation is allowed to compare their predictions.
+    """
+    scores = np.asarray(score_path, dtype=np.float64)
+    cand = np.asarray(candidate, dtype=np.int64).reshape(-1)
+    beta_path = np.asarray(beta_candidate_path, dtype=np.float64)
+    rows = [dict(row) for row in path_rows]
+    if scores.ndim == 1:
+        scores = scores[:, None]
+    if scores.ndim != 2 or beta_path.ndim != 2:
+        raise ValueError("Path KKT scores and coefficients must be matrices.")
+    if scores.shape[1] != len(rows) or beta_path.shape != (
+        len(rows),
+        cand.size,
+    ):
+        raise ValueError("Path KKT arrays do not align with path diagnostics.")
+    if (
+        cand.size > 0
+        and (
+            np.any(cand < 0)
+            or np.any(cand >= scores.shape[0])
+            or np.unique(cand).size != cand.size
+        )
+    ):
+        raise ValueError("Candidate indices are invalid for path KKT scores.")
+    if not np.all(np.isfinite(scores)) or not np.all(np.isfinite(beta_path)):
+        raise ValueError("Path KKT scores and coefficients must be finite.")
+
+    outside = np.ones(scores.shape[0], dtype=bool)
+    outside[cand] = False
+    union_mask = np.zeros(scores.shape[0], dtype=bool)
+    priority = np.zeros(scores.shape[0], dtype=np.float64)
+    row_summaries: list[dict[str, object]] = []
+    max_excess = 0.0
+    violating_path_points = 0
+    for path_index, row in enumerate(rows):
+        if not (
+            bool(row.get("converged", False))
+            and bool(row.get("kkt_passed", False))
+        ):
+            raise RuntimeError(
+                "Complete-path global KKT certification requires every "
+                "candidate path point to be score-KKT converged."
+            )
+        lam = float(row["lam"])
+        violators, max_outside, threshold = _outside_kkt_violators(
+            score_abs=np.abs(scores[:, path_index]),
+            candidate=cand,
+            lam=lam,
+            abs_tol=float(abs_tol),
+            rel_tol=float(rel_tol),
+        )
+        if violators.size > 0:
+            violating_path_points += 1
+            union_mask[violators] = True
+        if np.any(outside):
+            normalized = (
+                np.abs(scores[:, path_index])
+                / max(float(threshold), np.finfo(np.float64).tiny)
+            )
+            priority[outside] = np.maximum(
+                priority[outside], normalized[outside]
+            )
+        outside_excess = max(float(max_outside) - float(threshold), 0.0)
+        max_excess = max(max_excess, outside_excess)
+        passed = bool(violators.size == 0)
+        row.update(
+            {
+                "global_kkt_scope": "all_markers",
+                "global_kkt_passed": passed,
+                "global_kkt_max_outside_score": float(max_outside),
+                "global_kkt_threshold": float(threshold),
+                "global_kkt_n_outside_violators": int(violators.size),
+            }
+        )
+        row_summaries.append(
+            {
+                "path_index": int(path_index),
+                "lam": lam,
+                "lam_ratio": float(row["lam_ratio"]),
+                "support_size": int(row["k"]),
+                "passed": passed,
+                "max_outside_score": float(max_outside),
+                "threshold": float(threshold),
+                "n_outside_violators": int(violators.size),
+            }
+        )
+
+    union_violators = np.flatnonzero(union_mask).astype(np.int64)
+    return {
+        "passed": bool(union_violators.size == 0),
+        "n_path_points": int(len(rows)),
+        "n_violating_path_points": int(violating_path_points),
+        "n_union_violators": int(union_violators.size),
+        "max_outside_excess_over_threshold": float(max_excess),
+        "outside_violators": union_violators,
+        "priority_score": priority,
+        "path_rows": rows,
+        "row_summaries": row_summaries,
+        "score_backend": "batched_hinv_path_then_single_full_marker_xtv",
+    }
+
+
+def _top_scored_markers_outside(
+    *,
+    score_abs: np.ndarray,
+    excluded: np.ndarray,
+    count: int,
+) -> np.ndarray:
+    """Return the strongest marker scores outside a working set."""
+    scores = np.asarray(score_abs, dtype=np.float64).reshape(-1)
+    blocked = np.asarray(excluded, dtype=np.int64).reshape(-1)
+    requested = int(count)
+    if requested < 0:
+        raise ValueError("BASIL marker batch size must be nonnegative.")
+    if requested == 0:
+        return np.empty((0,), dtype=np.int64)
+    if not np.all(np.isfinite(scores)):
+        raise ValueError("BASIL screening scores must be finite.")
+    eligible = np.ones(scores.size, dtype=bool)
+    if blocked.size > 0:
+        if (
+            np.any(blocked < 0)
+            or np.any(blocked >= scores.size)
+            or np.unique(blocked).size != blocked.size
+        ):
+            raise ValueError("BASIL excluded marker indices are invalid.")
+        eligible[blocked] = False
+    pool = np.flatnonzero(eligible)
+    take = min(requested, int(pool.size))
+    if take == 0:
+        return np.empty((0,), dtype=np.int64)
+    if take == pool.size:
+        selected = pool
+    else:
+        local = np.argpartition(scores[pool], -take)[-take:]
+        selected = pool[local]
+    selected = np.asarray(selected, dtype=np.int64)
+    selected.sort()
+    return selected
+
+
+def _fit_complete_weighted_lasso_path_basil(
+    *,
+    args,
+    grm_index: MultiGRMIndex,
+    hv,
+    precond,
+    y: np.ndarray,
+    covar: np.ndarray | None,
+    hinv_y: np.ndarray,
+    hinv_covar: np.ndarray | None,
+    initial_score_abs: np.ndarray,
+    path_cfg: LassoPathConfig,
+    previous_candidate: np.ndarray,
+    previous_beta_path: np.ndarray | None,
+    previous_hinv_z: dict[int, np.ndarray],
+    outer: int,
+    sparse_path_performance: dict[str, object],
+    validation_evaluator=None,
+    validation_stopping_lag: int = 5,
+) -> dict[str, object]:
+    """Compute an exact global path with weighted BASIL rollout.
+
+    This is the weighted, matrix-free analogue of snpnet's Batch Screening
+    Iterative Lasso.  It solves only a short unresolved lambda block on an
+    in-memory strong set, checks every block residual in one full-marker
+    ``X.T @ V`` pass, accepts the longest KKT-certified prefix, and then
+    refreshes the strong set from the last exact residual.  Screen-only
+    markers are discarded after progress; true ever-active markers persist.
+    """
+    y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
+    score_abs = np.asarray(initial_score_abs, dtype=np.float64).reshape(-1)
+    if score_abs.shape != (int(grm_index.m_total),):
+        raise ValueError("BASIL initial score does not cover every marker.")
+    if not np.all(np.isfinite(score_abs)) or np.any(score_abs < 0.0):
+        raise ValueError("BASIL initial marker scores must be finite/nonnegative.")
+    if path_cfg.fixed_lam_ratio is not None:
+        raise ValueError("BASIL path rollout cannot use a fixed lambda ratio.")
+    if validation_evaluator is None:
+        raise ValueError("BASIL validation path requires an incremental evaluator.")
+    if int(validation_stopping_lag) < 1:
+        raise ValueError("BASIL validation stopping lag must be positive.")
+
+    lam_max = float(np.max(score_abs)) if score_abs.size > 0 else 0.0
+    lam_sequence = make_lambda_sequence(
+        lam_max,
+        float(path_cfg.lam_min_ratio),
+        int(path_cfg.n_lambda),
+    )
+    n_path = int(lam_sequence.size)
+    if n_path < 1:
+        raise RuntimeError("BASIL received an empty lambda path.")
+
+    previous = np.asarray(previous_candidate, dtype=np.int64).reshape(-1)
+    previous_path = None
+    if previous_beta_path is not None:
+        candidate_previous_path = np.asarray(
+            previous_beta_path, dtype=np.float64
+        )
+        if (
+            candidate_previous_path.ndim == 2
+            and candidate_previous_path.shape[1] == previous.size
+            and 1 <= candidate_previous_path.shape[0] <= n_path
+        ):
+            previous_path = candidate_previous_path
+        else:
+            previous_path = None
+
+    base_marker_batch = min(
+        int(grm_index.m_total),
+        max(
+            int(args.candidate_k),
+            min(int(args.screen_topk), int(args.basil_marker_batch_size)),
+        ),
+    )
+    marker_batch = base_marker_batch
+    marker_batch_increment = int(args.kkt_add_topk)
+    lambda_block_size = min(int(args.basil_lambda_block_size), n_path)
+    current_lambda_block_size = lambda_block_size
+    max_iterations = int(args.basil_max_iterations)
+
+    next_path_index = 0
+    priority_score = score_abs.copy()
+    ever_active = np.empty((0,), dtype=np.int64)
+    stalled_markers = np.empty((0,), dtype=np.int64)
+    outer_hinv_z: dict[int, np.ndarray] = {}
+    solution_markers: list[np.ndarray | None] = [None] * n_path
+    solution_coefficients: list[np.ndarray | None] = [None] * n_path
+    solution_covariates: list[np.ndarray | None] = [None] * n_path
+    certified_rows: list[dict | None] = [None] * n_path
+    validation_metrics: list[dict | None] = [None] * n_path
+    validation_trace: list[dict[str, object]] = []
+    validation_early_stopping = (
+        _validation_path_early_stopping_decision(
+            [], stopping_lag=int(validation_stopping_lag)
+        )
+    )
+    validation_early_stopped = False
+    validation_pcg_max_residual = 0.0
+    validation_pcg_max_iterations = 0
+    total_validation_seconds = 0.0
+    basil_trace: list[dict[str, object]] = []
+    total_path_seconds = 0.0
+    total_kkt_seconds = 0.0
+    total_validation_warm_rows = 0
+    any_external_path_warm_start = False
+    aggregate_pcg = {
+        "batch_size": int(args.candidate_pcg_rhs_batch_size),
+        "n_batches": 0,
+        "n_columns": 0,
+        "max_reported_relative_residual": 0.0,
+        "max_true_relative_residual": 0.0,
+        "max_iterations": 0,
+        "total_batch_iterations": 0,
+        "warm_start_columns": 0,
+        "reused_within_outer_columns": 0,
+    }
+
+    for basil_iteration in range(1, max_iterations + 1):
+        if next_path_index >= n_path:
+            break
+        requested_lambda_block_size = int(current_lambda_block_size)
+        block_stop = min(
+            next_path_index + requested_lambda_block_size, n_path
+        )
+        unresolved_indices = np.arange(
+            next_path_index, block_stop, dtype=np.int64
+        )
+        if next_path_index > 0:
+            fit_indices = np.concatenate(
+                [
+                    np.asarray([next_path_index - 1], dtype=np.int64),
+                    unresolved_indices,
+                ]
+            )
+            boundary_offset = 1
+        else:
+            fit_indices = unresolved_indices
+            boundary_offset = 0
+
+        prior_block_active = np.empty((0,), dtype=np.int64)
+        if previous_path is not None and previous.size > 0:
+            prior_valid_indices = fit_indices[
+                fit_indices < previous_path.shape[0]
+            ]
+            if prior_valid_indices.size > 0:
+                prior_mask = np.any(
+                    previous_path[prior_valid_indices, :] != 0.0, axis=0
+                )
+                prior_block_active = previous[prior_mask]
+
+        ever_active_size_before = int(ever_active.size)
+        requested_marker_batch = int(marker_batch)
+        retained = np.unique(
+            np.concatenate(
+                [ever_active, stalled_markers, prior_block_active]
+            )
+        ).astype(np.int64)
+        # glmnet's sequential strong rule predicts coordinates that can enter
+        # at the next lambda from the last exact residual.  It is deliberately
+        # only a screen: the subsequent all-marker KKT pass is the certificate.
+        strong_rule_threshold = None
+        strong_rule_markers = np.empty((0,), dtype=np.int64)
+        if next_path_index > 0:
+            previous_lambda = float(lam_sequence[next_path_index - 1])
+            next_lambda = float(lam_sequence[next_path_index])
+            strong_rule_threshold = max(
+                2.0 * next_lambda - previous_lambda, 0.0
+            )
+            strong_rule_markers = np.flatnonzero(
+                priority_score >= strong_rule_threshold
+            ).astype(np.int64)
+            if retained.size > 0:
+                strong_rule_markers = np.setdiff1d(
+                    strong_rule_markers, retained, assume_unique=True
+                )
+        # In p >> n genotype data the raw sequential rule can admit tens of
+        # thousands of correlated markers at small lambda.  BASIL's bounded
+        # top-M rollout is the appropriate out-of-core guard: strong-rule
+        # markers receive their natural score priority, but never enlarge the
+        # computational batch.  A failed global KKT scan triggers the ordinary
+        # exact enlargement step below.
+        new_markers = _top_scored_markers_outside(
+            score_abs=priority_score,
+            excluded=retained,
+            count=marker_batch,
+        )
+        selected_strong_rule_markers = int(
+            np.intersect1d(
+                new_markers, strong_rule_markers, assume_unique=True
+            ).size
+        )
+        candidate = np.unique(
+            np.concatenate([retained, new_markers])
+        ).astype(np.int64)
+        candidate.sort()
+        if candidate.size == 0:
+            raise RuntimeError("BASIL could not construct a nonempty strong set.")
+        max_candidate = int(args.kkt_max_candidate)
+        if max_candidate > 0 and candidate.size > max_candidate:
+            raise RuntimeError(
+                "BASIL strong set exceeds --kkt-max-candidate "
+                f"({candidate.size} > {max_candidate})."
+            )
+
+        Z_candidate = grm_index.extract_standardized_columns(candidate).astype(
+            np.float32, copy=False
+        )
+        missing_positions = np.asarray(
+            [
+                column
+                for column, marker in enumerate(candidate.tolist())
+                if int(marker) not in outer_hinv_z
+            ],
+            dtype=np.int64,
+        )
+        reused_columns = int(candidate.size - missing_positions.size)
+        pcg_diagnostic = {
+            "batch_size": int(args.candidate_pcg_rhs_batch_size),
+            "n_batches": 0,
+            "n_columns": 0,
+            "max_reported_relative_residual": 0.0,
+            "max_true_relative_residual": 0.0,
+            "max_iterations": 0,
+            "total_batch_iterations": 0,
+            "warm_start_columns": 0,
+            "reused_within_outer_columns": reused_columns,
+        }
+        if missing_positions.size > 0:
+            missing_markers = candidate[missing_positions]
+            missing_rhs = np.ascontiguousarray(
+                Z_candidate[:, missing_positions], dtype=np.float32
+            )
+            missing_warm = np.zeros_like(missing_rhs)
+            warm_hits = 0
+            for column, marker in enumerate(missing_markers.tolist()):
+                previous_solution = previous_hinv_z.get(int(marker))
+                if previous_solution is not None:
+                    missing_warm[:, column] = previous_solution
+                    warm_hits += 1
+            solved_missing, solved_diagnostic = _solve_hinv_columns_batched(
+                hv=hv,
+                precond=precond,
+                rhs=missing_rhs,
+                warm_start=missing_warm if warm_hits > 0 else None,
+                tol=float(args.pcg_tol),
+                maxiter=int(args.max_pcg_iters),
+                batch_size=int(args.candidate_pcg_rhs_batch_size),
+                stage=(
+                    f"outer {outer} BASIL iteration {basil_iteration} candidate"
+                ),
+            )
+            pcg_diagnostic.update(solved_diagnostic)
+            pcg_diagnostic["warm_start_columns"] = int(warm_hits)
+            pcg_diagnostic["reused_within_outer_columns"] = reused_columns
+            for column, marker in enumerate(missing_markers.tolist()):
+                outer_hinv_z[int(marker)] = solved_missing[:, column]
+
+        Hinv_Z_candidate = np.empty_like(Z_candidate, dtype=np.float32)
+        for column, marker in enumerate(candidate.tolist()):
+            Hinv_Z_candidate[:, column] = outer_hinv_z[int(marker)]
+
+        for key in ("n_batches", "n_columns", "total_batch_iterations"):
+            aggregate_pcg[key] += int(pcg_diagnostic[key])
+        for key in ("warm_start_columns", "reused_within_outer_columns"):
+            aggregate_pcg[key] += int(pcg_diagnostic[key])
+        for key in (
+            "max_reported_relative_residual",
+            "max_true_relative_residual",
+        ):
+            aggregate_pcg[key] = max(
+                float(aggregate_pcg[key]), float(pcg_diagnostic[key])
+            )
+        aggregate_pcg["max_iterations"] = max(
+            int(aggregate_pcg["max_iterations"]),
+            int(pcg_diagnostic["max_iterations"]),
+        )
+        sparse_path_performance["candidate_hinv_pcg_batches"] += int(
+            pcg_diagnostic["n_batches"]
+        )
+        sparse_path_performance[
+            "candidate_hinv_pcg_columns_solved"
+        ] += int(pcg_diagnostic["n_columns"])
+        sparse_path_performance[
+            "candidate_hinv_columns_reused"
+        ] += reused_columns
+        sparse_path_performance[
+            "candidate_hinv_pcg_total_batch_iterations"
+        ] += int(pcg_diagnostic["total_batch_iterations"])
+
+        beta_path0 = None
+        warm_columns = 0
+        if previous_path is not None:
+            mapped_previous, warm_columns = _remap_lasso_beta_path(
+                previous_candidate=previous,
+                previous_beta_path=previous_path,
+                candidate=candidate,
+            )
+            if mapped_previous is not None:
+                beta_path0 = np.zeros(
+                    (fit_indices.size, candidate.size), dtype=np.float64
+                )
+                valid_rows = fit_indices < mapped_previous.shape[0]
+                beta_path0[valid_rows, :] = mapped_previous[
+                    fit_indices[valid_rows], :
+                ]
+        if boundary_offset:
+            boundary_markers = solution_markers[next_path_index - 1]
+            boundary_beta = solution_coefficients[next_path_index - 1]
+            if boundary_markers is None or boundary_beta is None:
+                raise RuntimeError("BASIL boundary solution is unavailable.")
+            if beta_path0 is None:
+                beta_path0 = np.zeros(
+                    (fit_indices.size, candidate.size), dtype=np.float64
+                )
+            common, boundary_pos, candidate_pos = np.intersect1d(
+                np.asarray(boundary_markers, dtype=np.int64),
+                candidate,
+                assume_unique=True,
+                return_indices=True,
+            )
+            if common.size != np.asarray(boundary_markers).size:
+                raise RuntimeError(
+                    "BASIL strong set omitted an active boundary marker."
+                )
+            beta_path0[0, :] = 0.0
+            beta_path0[0, candidate_pos] = np.asarray(
+                boundary_beta, dtype=np.float64
+            )[boundary_pos]
+
+        path_started = time.perf_counter()
+        block_fit = fit_weighted_lasso_with_covariates(
+            y=y_arr,
+            covar=covar,
+            geno=Z_candidate,
+            Hinv_y=hinv_y,
+            Hinv_covar=hinv_covar,
+            Hinv_geno=Hinv_Z_candidate,
+            cfg=path_cfg,
+            ridge=float(args.lasso_ridge),
+            beta_snp_path0=beta_path0,
+            lambda_sequence=lam_sequence[fit_indices],
+            lambda_max_reference=lam_max,
+        )
+        path_seconds = float(time.perf_counter() - path_started)
+        total_path_seconds += path_seconds
+        sparse_path_performance["lasso_path_solves"] += 1
+        sparse_path_performance["lasso_path_solve_seconds"] += path_seconds
+        sparse_path_performance["lasso_cd_iterations"] += int(
+            sum(int(row["cd_iter"]) for row in block_fit["path"])
+        )
+        warm_rows_used = int(
+            block_fit["external_beta_path_warm_start_rows_used"]
+        )
+        total_validation_warm_rows += warm_rows_used
+        any_external_path_warm_start = bool(
+            any_external_path_warm_start
+            or block_fit["external_beta_path_warm_start_used"]
+        )
+        sparse_path_performance[
+            "lasso_path_warm_start_rows_used"
+        ] += warm_rows_used
+
+        kkt_started = time.perf_counter()
+        hinv_residual_path = _build_hinv_lasso_residual_path(
+            hinv_y=hinv_y,
+            hinv_covar=hinv_covar,
+            hinv_geno=Hinv_Z_candidate,
+            beta_cov_path=block_fit["beta_cov_path"],
+            beta_snp_path=block_fit["beta_snp_path"],
+        )
+        path_score_signed = np.asarray(
+            grm_index.xtv_all(
+                jnp.asarray(hinv_residual_path, dtype=jnp.float32),
+                normalize=False,
+            ),
+            dtype=np.float64,
+        )
+        block_kkt = _certify_complete_lasso_path_kkt_from_scores(
+            score_path=path_score_signed,
+            candidate=candidate,
+            beta_candidate_path=block_fit["beta_snp_path"],
+            path_rows=list(block_fit["path"]),
+            abs_tol=float(args.kkt_tol),
+            rel_tol=float(args.kkt_rel_tol),
+        )
+        kkt_seconds = float(time.perf_counter() - kkt_started)
+        total_kkt_seconds += kkt_seconds
+        sparse_path_performance["lasso_path_global_kkt_passes"] += 1
+        sparse_path_performance["lasso_path_global_kkt_seconds"] += (
+            kkt_seconds
+        )
+        sparse_path_performance[
+            "lasso_path_global_kkt_points_checked"
+        ] += int(block_kkt["n_path_points"])
+        block_rows = list(block_kkt["path_rows"])
+        if boundary_offset and not bool(block_rows[0]["global_kkt_passed"]):
+            raise RuntimeError(
+                "Previously certified BASIL boundary failed after basis remap."
+            )
+
+        n_new_valid = 0
+        for local_index in range(boundary_offset, len(block_rows)):
+            if not bool(block_rows[local_index]["global_kkt_passed"]):
+                break
+            n_new_valid += 1
+
+        accepted_local = range(
+            boundary_offset, boundary_offset + n_new_valid
+        )
+        newly_active_parts: list[np.ndarray] = []
+        for local_index in accepted_local:
+            global_path_index = int(fit_indices[local_index])
+            beta_local = np.asarray(
+                block_fit["beta_snp_path"][local_index], dtype=np.float64
+            )
+            active_local = np.flatnonzero(beta_local != 0.0).astype(
+                np.int64
+            )
+            active_markers = candidate[active_local]
+            solution_markers[global_path_index] = active_markers.copy()
+            solution_coefficients[global_path_index] = beta_local[
+                active_local
+            ].copy()
+            solution_covariates[global_path_index] = np.asarray(
+                block_fit["beta_cov_path"][local_index], dtype=np.float64
+            ).copy()
+            certified_row = dict(block_rows[local_index])
+            certified_row.update(
+                {
+                    "basil_iteration": int(basil_iteration),
+                    "basil_strong_set_size": int(candidate.size),
+                }
+            )
+            certified_rows[global_path_index] = certified_row
+            if active_markers.size > 0:
+                newly_active_parts.append(active_markers)
+
+        validation_batch_record = None
+        if n_new_valid > 0:
+            if newly_active_parts:
+                ever_active = np.unique(
+                    np.concatenate([ever_active, *newly_active_parts])
+                ).astype(np.int64)
+            last_local = boundary_offset + n_new_valid - 1
+            priority_score = np.abs(path_score_signed[:, last_local])
+            next_path_index += n_new_valid
+            stalled_markers = np.empty((0,), dtype=np.int64)
+            marker_batch = base_marker_batch
+            if n_new_valid < unresolved_indices.size:
+                # Do not repeatedly solve the rest of a block after its exact
+                # prefix has shown that the current screen supports fewer
+                # points.  Dense low-lambda tails naturally settle at one
+                # lambda per KKT scan.
+                current_lambda_block_size = max(1, int(n_new_valid))
+            decision = "advance_exact_prefix"
+
+            validation_started = time.perf_counter()
+            validation_block = validation_evaluator(
+                candidate=candidate,
+                train_candidate=Z_candidate,
+                beta_cov_path=np.asarray(
+                    block_fit["beta_cov_path"][
+                        boundary_offset : boundary_offset + n_new_valid
+                    ],
+                    dtype=np.float64,
+                ),
+                beta_snp_path=np.asarray(
+                    block_fit["beta_snp_path"][
+                        boundary_offset : boundary_offset + n_new_valid
+                    ],
+                    dtype=np.float64,
+                ),
+            )
+            validation_seconds = float(
+                time.perf_counter() - validation_started
+            )
+            total_validation_seconds += validation_seconds
+            sparse_path_performance[
+                "lasso_validation_selection_seconds"
+            ] += validation_seconds
+            block_metrics = list(validation_block["metrics"])
+            if len(block_metrics) != n_new_valid:
+                raise RuntimeError(
+                    "Incremental validation metrics do not align with the "
+                    "new exact BASIL prefix."
+                )
+            first_new_index = next_path_index - n_new_valid
+            for metric_offset, metric in enumerate(block_metrics):
+                global_metric_index = first_new_index + metric_offset
+                metric_global = dict(metric)
+                metric_global["path_index"] = int(global_metric_index)
+                validation_metrics[global_metric_index] = metric_global
+            validation_pcg_max_residual = max(
+                validation_pcg_max_residual,
+                float(validation_block["pcg_rel_res"]),
+            )
+            validation_pcg_max_iterations = max(
+                validation_pcg_max_iterations,
+                int(validation_block["pcg_iters"]),
+            )
+            validation_prefix = [
+                dict(value)
+                for value in validation_metrics[:next_path_index]
+                if value is not None
+            ]
+            if len(validation_prefix) != next_path_index:
+                raise RuntimeError(
+                    "Incremental validation path has a missing exact prefix row."
+                )
+            validation_early_stopping = (
+                _validation_path_early_stopping_decision(
+                    validation_prefix,
+                    stopping_lag=int(validation_stopping_lag),
+                )
+            )
+            validation_early_stopped = bool(
+                validation_early_stopping["stopped"]
+            )
+            validation_batch_record = {
+                "path_indices": list(
+                    range(first_new_index, next_path_index)
+                ),
+                "metrics": block_metrics,
+                "pcg_rel_res": float(validation_block["pcg_rel_res"]),
+                "pcg_iters": int(validation_block["pcg_iters"]),
+                "seconds": validation_seconds,
+                "early_stopping": dict(validation_early_stopping),
+            }
+            validation_trace.append(validation_batch_record)
+            if validation_early_stopped:
+                decision = "early_stop_after_exact_validation_peak"
+        else:
+            stalled_markers = np.unique(
+                np.concatenate([stalled_markers, new_markers])
+            ).astype(np.int64)
+            marker_batch += marker_batch_increment
+            current_lambda_block_size = 1
+            decision = "enlarge_strong_set"
+
+        basil_trace.append(
+            {
+                "iteration": int(basil_iteration),
+                "fit_path_indices": fit_indices.tolist(),
+                "requested_lambda_block_size": requested_lambda_block_size,
+                "first_unresolved_index": int(
+                    fit_indices[boundary_offset]
+                ),
+                "strong_set_size": int(candidate.size),
+                "ever_active_size_before": ever_active_size_before,
+                "retained_marker_size_before": int(retained.size),
+                "prior_outer_block_active_size": int(
+                    prior_block_active.size
+                ),
+                "new_marker_batch_size": int(new_markers.size),
+                "sequential_strong_rule_threshold": (
+                    float(strong_rule_threshold)
+                    if strong_rule_threshold is not None
+                    else None
+                ),
+                "sequential_strong_rule_candidates": int(
+                    strong_rule_markers.size
+                ),
+                "sequential_strong_rule_selected_in_batch": (
+                    selected_strong_rule_markers
+                ),
+                "score_batch_markers": int(new_markers.size),
+                "configured_marker_batch_size": requested_marker_batch,
+                "n_new_valid": int(n_new_valid),
+                "next_path_index": int(next_path_index),
+                "n_fit_points": int(len(block_rows)),
+                "n_violating_fit_points": int(
+                    block_kkt["n_violating_path_points"]
+                ),
+                "n_union_violators": int(
+                    block_kkt["n_union_violators"]
+                ),
+                "path_solve_seconds": path_seconds,
+                "global_kkt_seconds": kkt_seconds,
+                "path_warm_start_common_columns": int(warm_columns),
+                "path_warm_start_rows_used": warm_rows_used,
+                "candidate_pcg": dict(pcg_diagnostic),
+                "validation_batch": validation_batch_record,
+                "decision": decision,
+            }
+        )
+        logger.info(
+            "[outer %s BASIL %s] unresolved=%s:%s strong=%s ever=%s "
+            "new=%s exact_advance=%s next=%s/%s path_sec=%.1f "
+            "kkt_sec=%.1f validation_best=%.8f early_stop=%s decision=%s",
+            outer,
+            basil_iteration,
+            int(fit_indices[boundary_offset]),
+            int(fit_indices[-1]),
+            int(candidate.size),
+            int(ever_active.size),
+            int(new_markers.size),
+            int(n_new_valid),
+            int(next_path_index),
+            n_path,
+            path_seconds,
+            kkt_seconds,
+            float(
+                validation_early_stopping[
+                    "best_correlation_squared"
+                ]
+            )
+            if validation_early_stopping[
+                "best_correlation_squared"
+            ] is not None
+            else float("nan"),
+            validation_early_stopped,
+            decision,
+        )
+        if validation_early_stopped:
+            break
+
+    if next_path_index != n_path and not validation_early_stopped:
+        raise RuntimeError(
+            "BASIL failed to certify the complete global lambda path within "
+            f"{max_iterations} iterations (certified {next_path_index}/{n_path})."
+        )
+    evaluated_n_path = int(next_path_index)
+    if any(value is None for value in certified_rows[:evaluated_n_path]):
+        raise RuntimeError("BASIL complete path has missing diagnostics.")
+
+    final_candidate = np.asarray(ever_active, dtype=np.int64)
+    if final_candidate.size == 0:
+        final_candidate = _top_scored_markers_outside(
+            score_abs=score_abs,
+            excluded=np.empty((0,), dtype=np.int64),
+            count=1,
+        )
+    final_candidate.sort()
+    beta_snp_path = np.zeros(
+        (evaluated_n_path, final_candidate.size), dtype=np.float64
+    )
+    n_covar = 0 if covar is None else int(np.asarray(covar).shape[1])
+    beta_cov_path = np.zeros((evaluated_n_path, n_covar), dtype=np.float64)
+    for path_index in range(evaluated_n_path):
+        markers = np.asarray(solution_markers[path_index], dtype=np.int64)
+        coefficients = np.asarray(
+            solution_coefficients[path_index], dtype=np.float64
+        )
+        if markers.size > 0:
+            positions = np.searchsorted(final_candidate, markers)
+            if not np.array_equal(final_candidate[positions], markers):
+                raise RuntimeError(
+                    "BASIL ever-active set omitted a certified coefficient."
+                )
+            beta_snp_path[path_index, positions] = coefficients
+        beta_cov_path[path_index] = np.asarray(
+            solution_covariates[path_index], dtype=np.float64
+        )
+
+    Z_final = grm_index.extract_standardized_columns(final_candidate).astype(
+        np.float32, copy=False
+    )
+    Hinv_Z_final = np.empty_like(Z_final, dtype=np.float32)
+    for column, marker in enumerate(final_candidate.tolist()):
+        if int(marker) not in outer_hinv_z:
+            raise RuntimeError("BASIL final Hinv[Z] cache is incomplete.")
+        Hinv_Z_final[:, column] = outer_hinv_z[int(marker)]
+
+    lasso_path = {
+        "path": [
+            dict(value) for value in certified_rows[:evaluated_n_path]
+        ],
+        "beta_snp_path": beta_snp_path,
+        "beta_cov_path": beta_cov_path,
+        "lam_max": lam_max,
+        "selected_index": None,
+        "selection_method": None,
+        "selected_lam_ratio": None,
+        "path_role": (
+            "early_stopped_kkt_certified_validation_prefix_weighted_basil"
+            if validation_early_stopped
+            else "complete_validation_grid_weighted_basil"
+        ),
+        "requested_n_lambda": n_path,
+        "evaluated_n_lambda": evaluated_n_path,
+        "validation_metrics": [
+            dict(value) for value in validation_metrics[:evaluated_n_path]
+        ],
+        "validation_early_stopping": dict(validation_early_stopping),
+        "external_beta_path_warm_start_used": bool(
+            any_external_path_warm_start
+        ),
+        "external_beta_path_warm_start_rows_used": int(
+            total_validation_warm_rows
+        ),
+        "basil": {
+            "algorithm": "weighted_batch_screening_iterative_lasso",
+            "n_iterations": int(len(basil_trace)),
+            "base_marker_batch_size": int(base_marker_batch),
+            "lambda_block_size": int(lambda_block_size),
+            "ever_active_size": int(final_candidate.size),
+            "path_solve_seconds": float(total_path_seconds),
+            "global_kkt_seconds": float(total_kkt_seconds),
+            "validation_seconds": float(total_validation_seconds),
+            "validation_trace": validation_trace,
+            "trace": basil_trace,
+        },
+    }
+    final_hinv_z = {
+        int(marker): outer_hinv_z[int(marker)]
+        for marker in final_candidate.tolist()
+    }
+    return {
+        "lasso_path": lasso_path,
+        "candidate": final_candidate,
+        "geno": Z_final,
+        "hinv_geno": Hinv_Z_final,
+        "hinv_z_dict": final_hinv_z,
+        "kkt_trace": basil_trace,
+        "candidate_pcg": aggregate_pcg,
+        "global_kkt": {
+            "passed": True,
+            "n_path_points": evaluated_n_path,
+            "n_violating_path_points": 0,
+            "n_union_violators": 0,
+            "max_outside_excess_over_threshold": 0.0,
+            "score_backend": (
+                "weighted_basil_batched_hinv_blocks_then_full_marker_xtv"
+            ),
+        },
+        "validation": {
+            "metrics": [
+                dict(value)
+                for value in validation_metrics[:evaluated_n_path]
+            ],
+            "pcg_max_rel_res": float(validation_pcg_max_residual),
+            "pcg_max_iters": int(validation_pcg_max_iterations),
+            "seconds": float(total_validation_seconds),
+            "early_stopping": dict(validation_early_stopping),
+            "trace": validation_trace,
+        },
+    }
+
+
 def _build_lasso_candidate(
     *,
     previous_support: np.ndarray,
@@ -2268,23 +3424,51 @@ def _remap_lasso_beta_path(
     return mapped, int(common.size)
 
 
-def _allow_monotone_lasso_path_warm_start(
+def _allow_mapped_lasso_path_warm_start(
     *,
     previous_size: int,
     current_size: int,
     common_size: int,
 ) -> bool:
-    """Reuse a mapped path whenever the old marker basis is fully retained.
+    """Reuse any nonempty overlap of two marker bases as a warm start.
 
     The mapped coefficients are only initial values.  ``solve_lasso_path``
     compares them with the ordinary descending-lambda start row by row and
-    still requires the same complete score-KKT certificate, so candidate-set
-    growth does not need an arbitrary size cutoff.
+    still requires the same complete score-KKT certificate.  It is therefore
+    safe to drop coordinates that are zero along the entire old path and map
+    the remaining rows into a pruned/expanded working set.
     """
     previous = int(previous_size)
     current = int(current_size)
     common = int(common_size)
-    return bool(previous >= 1 and current >= previous and common == previous)
+    return bool(
+        previous >= 1
+        and current >= 1
+        and common >= 1
+        and common <= min(previous, current)
+    )
+
+
+def _complete_path_active_union(
+    *,
+    candidate: np.ndarray,
+    beta_path: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return candidate markers active at one or more lambda path points."""
+    candidate_arr = np.asarray(candidate, dtype=np.int64).reshape(-1)
+    beta_arr = np.asarray(beta_path, dtype=np.float64)
+    if beta_arr.ndim != 2 or beta_arr.shape[1] != candidate_arr.size:
+        raise ValueError("Complete Lasso path does not align with candidate.")
+    if not np.all(np.isfinite(beta_arr)):
+        raise ValueError("Complete Lasso path coefficients must be finite.")
+    keep_local = np.flatnonzero(np.any(beta_arr != 0.0, axis=0)).astype(
+        np.int64
+    )
+    # Preserve a nonempty numerical basis for the downstream sparse-state
+    # schema in the degenerate all-zero path.  No pruning is needed there.
+    if keep_local.size == 0:
+        keep_local = np.arange(candidate_arr.size, dtype=np.int64)
+    return candidate_arr[keep_local], keep_local
 
 
 def _buffered_kkt_expansion_indices(
@@ -2375,6 +3559,27 @@ def _kkt_expansion_budget(n_violators: int, nominal_budget: int) -> int:
     return nominal
 
 
+def _complete_path_kkt_expansion_budget(
+    n_violators: int,
+    nominal_budget: int,
+    current_candidate_size: int,
+) -> int:
+    """Grow a complete-path working set geometrically when violations abound.
+
+    A low-lambda path point can initially violate KKT at hundreds of thousands
+    of markers.  Reusing the whole coefficient path makes a moderately larger
+    expansion cheap relative to repeating PCG and Gram construction in fixed
+    256-column increments.  The increment grows with the working set but is
+    capped at 1024 so scores are refreshed before admitting another block.
+    """
+    count = int(n_violators)
+    current = int(current_candidate_size)
+    if current < 1:
+        raise ValueError("Complete-path candidate size must be positive.")
+    nominal = _kkt_expansion_budget(count, int(nominal_budget))
+    return min(count, max(nominal, min(current, 1024)))
+
+
 def _parse_variance_components_init(
     value: str,
     *,
@@ -2408,9 +3613,8 @@ def _parse_variance_components_init(
 def _compute_adaptive_marker_scores(
     *,
     output_path: str,
-    residual_raw: np.ndarray,
+    residual: np.ndarray,
     covar: np.ndarray | None,
-    phenotype_scale: float,
     fitter,
     ops,
     grm_index: MultiGRMIndex,
@@ -2420,7 +3624,7 @@ def _compute_adaptive_marker_scores(
     pcg_tol: float,
     max_pcg_iters: int,
 ) -> dict[str, object]:
-    """Write legacy association and signed REML covariance marker scores.
+    """Write association and signed REML covariance marker scores.
 
     Both information diagonals are estimated without materializing X or V.
     For a sample-space Rademacher probe q,
@@ -2432,13 +3636,10 @@ def _compute_adaptive_marker_scores(
         raise ValueError("marker-score-probes must be >= 1.")
     if not output_path.lower().endswith(".npz"):
         raise ValueError("--marker-score-out must end in .npz.")
-    residual = np.asarray(residual_raw, dtype=np.float32).reshape(-1)
+    residual = np.asarray(residual, dtype=np.float32).reshape(-1)
     n_samples = int(fitter.streamers[0].n)
     if residual.shape != (n_samples,) or not np.all(np.isfinite(residual)):
         raise ValueError("Adaptive marker-score residual is malformed.")
-    scale = float(phenotype_scale)
-    if not np.isfinite(scale) or scale <= 0.0:
-        raise ValueError("phenotype_scale must be finite and positive.")
     if covar is None:
         fixed_design = np.empty((n_samples, 0), dtype=np.float32)
     else:
@@ -2510,7 +3711,6 @@ def _compute_adaptive_marker_scores(
     else:
         projected_solution = core_solution
 
-    projected_solution[:, 0] /= np.float32(scale)
     xt_solution = np.asarray(
         grm_index.xtv_all(
             jnp.asarray(core_solution, dtype=jnp.float32), normalize=False
@@ -2642,10 +3842,9 @@ def _compute_adaptive_marker_scores(
         "path": os.path.abspath(output_path),
         "definition": "abs(x_t_Vinv_residual)/sqrt(x_t_Vinv_x)",
         "covariance_score_definition": (
-            "0.5*((x_t_P_residual_standardized)^2-x_t_P_x)"
+            "0.5*((x_t_P_residual)^2-x_t_P_x)"
         ),
         "fixed_effect_projection": "P_includes_all_unpenalized_covariates",
-        "residual_scale_for_covariance_score": "standardized_phenotype",
         "information_diagonal_estimator": (
             "sample_space_rademacher_hutchinson"
         ),
@@ -2732,7 +3931,6 @@ def _write_covtree_bootstrap_marker_scores(
             "path": os.path.abspath(output_path),
             "definition": "0.5*((x_t_P_e)^2-x_t_P_x)",
             "fixed_effect_projection": "P_includes_all_unpenalized_covariates",
-            "residual_scale": "standardized_phenotype",
             "information_diagonal_estimator": (
                 "fitted_null_parametric_bootstrap_mean_square"
             ),
@@ -2754,9 +3952,8 @@ def _run_covtree_diagnostic(
     component_spec_path: str,
     bed_prefix: str,
     marker_score_path: str,
-    residual_raw: np.ndarray,
+    residual: np.ndarray,
     covar: np.ndarray | None,
-    phenotype_scale: float,
     theta: np.ndarray,
 ) -> dict[str, object]:
     """Test all genotype-only splits and optionally emit one accepted spec."""
@@ -2836,9 +4033,7 @@ def _run_covtree_diagnostic(
         else:
             eligible_candidates.append(candidate)
 
-    residual_standardized = np.asarray(residual_raw, dtype=np.float32) / np.float32(
-        phenotype_scale
-    )
+    residual = np.asarray(residual, dtype=np.float32)
     selected_candidate = None
     marker_score_summary: dict[str, object] = {
         "requested": True,
@@ -2854,7 +4049,7 @@ def _run_covtree_diagnostic(
                 candidates=eligible_candidates,
                 theta=theta_values,
                 covar=covar,
-                residual_standardized=residual_standardized,
+                residual=residual,
                 bootstrap_draws=int(args.covtree_bootstrap_draws),
                 seed=int(args.covtree_bootstrap_seed),
                 alpha=float(args.covtree_alpha),
@@ -3025,14 +4220,24 @@ def main() -> None:
         raise SystemExit("minq-iter must be >= 1 for both variance blocks.")
     if int(args.reml_max_linesearch_trials) < 1:
         raise SystemExit("reml-max-linesearch-trials must be >= 1.")
-    if float(args.vc_rel_tol) <= 0.0:
-        raise SystemExit("vc-rel-tol must be > 0.")
+    if float(args.h2_abs_tol) <= 0.0:
+        raise SystemExit("h2-abs-tol must be > 0.")
     if float(args.effect_rel_tol) <= 0.0:
         raise SystemExit("effect-rel-tol must be > 0.")
     if int(args.kkt_max_rounds) < 1:
         raise SystemExit("kkt-max-rounds must be >= 1.")
     if int(args.kkt_add_topk) < 1:
         raise SystemExit("kkt-add-topk must be >= 1.")
+    if int(args.candidate_pcg_rhs_batch_size) < 1:
+        raise SystemExit("candidate-pcg-rhs-batch-size must be >= 1.")
+    if int(args.basil_marker_batch_size) < 1:
+        raise SystemExit("basil-marker-batch-size must be >= 1.")
+    if int(args.basil_lambda_block_size) < 1:
+        raise SystemExit("basil-lambda-block-size must be >= 1.")
+    if int(args.basil_max_iterations) < 1:
+        raise SystemExit("basil-max-iterations must be >= 1.")
+    if int(args.validation_early_stopping_lag) < 1:
+        raise SystemExit("validation-early-stopping-lag must be >= 1.")
     if (
         not np.isfinite(float(args.kkt_tol))
         or not np.isfinite(float(args.kkt_rel_tol))
@@ -3282,7 +4487,9 @@ def main() -> None:
         add_intercept=True,
         keep_ids=keep_ids,
     )
-    y_np = y_np.astype(np.float32, copy=False)
+    y_np, input_phenotype_mean, input_phenotype_standard_deviation = (
+        _standardize_phenotype_at_input(y_np)
+    )
     if covar_np is not None:
         covar_np = covar_np.astype(np.float32, copy=False)
 
@@ -3412,6 +4619,8 @@ def main() -> None:
             slq_samples=args.slq_samples, slq_m=args.slq_m,
             precond_rank=plan.precond_rank,
             reml_pcg_tol=args.pcg_tol,
+            response_is_standardized=True,
+            unit_variance_components=True,
             strict_max_linesearch_trials=args.reml_max_linesearch_trials,
             max_pcg_iters=args.max_pcg_iters, pcg_ridge=args.pcg_ridge,
             verbose=args.verbose,
@@ -3430,6 +4639,8 @@ def main() -> None:
             slq_samples=args.slq_samples, slq_m=args.slq_m,
             precond_rank=plan.precond_rank,
             reml_pcg_tol=args.pcg_tol,
+            response_is_standardized=True,
+            unit_variance_components=True,
             strict_max_linesearch_trials=args.reml_max_linesearch_trials,
             max_pcg_iters=args.max_pcg_iters, pcg_ridge=args.pcg_ridge,
             verbose=args.verbose,
@@ -3457,35 +4668,21 @@ def main() -> None:
     )
 
     y_jax = jnp.asarray(y_np, dtype=jnp.float32)
-    phenotype_mean, phenotype_scale = _phenotype_standardization_stats(y_np)
     n_grm = len(ops.K_mvs)
-    genetic_trace_atoms = np.asarray(
-        jax.device_get(fitter._projected_core_diag_atoms(ops.diag_list)),
-        dtype=np.float64,
-    )
-    if (
-        genetic_trace_atoms.shape != (n_grm,)
-        or not np.all(np.isfinite(genetic_trace_atoms))
-        or not np.all(genetic_trace_atoms >= 0.0)
-    ):
-        raise RuntimeError("Invalid genetic trace atoms for sparse REML initialization.")
 
-    def _trace_weighted_h2(theta_values: np.ndarray) -> float:
+    def _background_h2(theta_values: np.ndarray) -> float:
         theta_arr = np.asarray(theta_values, dtype=np.float64).reshape(-1)
-        genetic_var = float(np.dot(theta_arr[:n_grm], genetic_trace_atoms))
+        genetic_var = float(np.sum(theta_arr[:n_grm]))
         residual_var = float(theta_arr[n_grm])
         return genetic_var / max(genetic_var + residual_var, 1e-8)
 
-    def _trace_weighted_genetic_var(theta_values: np.ndarray) -> float:
+    def _background_genetic_variance(theta_values: np.ndarray) -> float:
         theta_arr = np.asarray(theta_values, dtype=np.float64).reshape(-1)
-        return float(np.dot(theta_arr[:n_grm], genetic_trace_atoms))
+        return float(np.sum(theta_arr[:n_grm]))
 
-    # Match fit_reml's trace-calibrated default initialization unless an
-    # adaptive parent fit supplies an exactly covariance-preserving child init.
+    # Every standardized GRM is modeled with unit mean diagonal.  Finite-sample
+    # deviations from one are intentionally not propagated as scale factors.
     h2_init_default = 0.5
-    trace_sum = float(np.sum(genetic_trace_atoms))
-    if trace_sum <= 0.0:
-        raise RuntimeError("Sparse REML requires at least one positive-trace GRM.")
     supplied_theta_init = args.variance_components_init.strip()
     if supplied_theta_init:
         theta = _parse_variance_components_init(
@@ -3494,14 +4691,14 @@ def main() -> None:
         )
         theta_init_source = "command_line_json"
     else:
-        theta_g0 = np.where(
-            genetic_trace_atoms > 0.0,
-            h2_init_default / trace_sum,
-            0.0,
+        theta_g0 = np.full(
+            n_grm,
+            h2_init_default / float(n_grm),
+            dtype=np.float64,
         )
         theta_e0 = np.array([1.0 - h2_init_default], dtype=np.float64)
         theta = np.concatenate([theta_g0, theta_e0], axis=0)
-        theta_init_source = "trace_calibrated_default"
+        theta_init_source = "unit_grm_default"
     theta_initial = theta.copy()
     fitter._ensure_projected_core_precond_ready(
         ops,
@@ -3528,8 +4725,9 @@ def main() -> None:
 
     if iterative_validation_selection:
         logger.info(
-            "[validation alpha] complete Lasso path will be evaluated inside "
-            "every alpha/theta outer iteration."
+            "[validation alpha] full-marker-KKT Lasso prefix will be evaluated "
+            "incrementally with validation early stopping inside every "
+            "alpha/theta outer iteration."
         )
 
     prediction_context: _PredictionFitContext | None = None
@@ -3552,6 +4750,10 @@ def main() -> None:
             args.sparsity_validation_pheno_txt,
             prediction_context.sample_ids,
         )
+        validation_outcome = (
+            np.asarray(validation_outcome, dtype=np.float64)
+            - float(input_phenotype_mean)
+        ) / float(input_phenotype_standard_deviation)
         logger.info(
             "[validation alpha] aligned validation phenotype for %s samples.",
             int(validation_outcome.size),
@@ -3560,6 +4762,7 @@ def main() -> None:
     support = np.array([], dtype=np.int64)
     candidate_cache = np.array([], dtype=np.int64)
     previous_fixed_mean = None
+    previous_outer_h2: float | None = None
     history: list[dict] = []
 
     warm_screen = None
@@ -3571,15 +4774,62 @@ def main() -> None:
         "buffered_kkt_expansion": True,
         "kkt_small_overflow_absorption": True,
         "lasso_path_coefficient_warm_start": True,
-        "lasso_path_monotone_basis_warm_start": True,
+        "lasso_path_mapped_basis_warm_start": True,
         "lasso_column_major_gram": True,
         "lasso_density_adaptive_qb_updates": True,
         "lasso_filtered_exact_kkt_matvec": True,
         "lasso_batched_external_path_products": True,
         "lasso_batched_covariate_path_solves": True,
+        "lasso_complete_path_global_kkt": bool(
+            iterative_validation_selection
+        ),
+        "lasso_complete_path_global_kkt_backend": (
+            "weighted_basil_short_blocks_with_full_marker_xtv"
+            if iterative_validation_selection
+            else None
+        ),
+        "lasso_validation_path_solver": (
+            "weighted_batch_screening_iterative_lasso"
+            if iterative_validation_selection
+            else None
+        ),
+        "validation_path_early_stopping": bool(
+            iterative_validation_selection
+        ),
+        "validation_path_early_stopping_lag": (
+            int(args.validation_early_stopping_lag)
+            if iterative_validation_selection
+            else None
+        ),
+        "basil_marker_batch_size": (
+            int(args.basil_marker_batch_size)
+            if iterative_validation_selection
+            else None
+        ),
+        "basil_lambda_block_size": (
+            int(args.basil_lambda_block_size)
+            if iterative_validation_selection
+            else None
+        ),
+        "basil_max_iterations": (
+            int(args.basil_max_iterations)
+            if iterative_validation_selection
+            else None
+        ),
+        "candidate_hinv_columns_reused_within_outer": True,
+        "candidate_hinv_pcg_rhs_batch_size": int(
+            args.candidate_pcg_rhs_batch_size
+        ),
+        "candidate_hinv_pcg_batches": 0,
+        "candidate_hinv_pcg_columns_solved": 0,
+        "candidate_hinv_columns_reused": 0,
+        "candidate_hinv_pcg_total_batch_iterations": 0,
         "lasso_path_solves": 0,
         "lasso_path_solve_seconds": 0.0,
         "lasso_validation_selection_seconds": 0.0,
+        "lasso_path_global_kkt_passes": 0,
+        "lasso_path_global_kkt_seconds": 0.0,
+        "lasso_path_global_kkt_points_checked": 0,
         "lasso_cd_iterations": 0,
         "lasso_path_warm_start_rows_used": 0,
         "outer_start_candidate_columns_reused": 0,
@@ -3667,13 +4917,13 @@ def main() -> None:
     if sparse_state_in_summary is not None:
         settling_residual = (
             np.asarray(y_np, dtype=np.float64) - previous_fixed_mean
-        ) / float(phenotype_scale)
+        )
         settling_result = _fit_covariate_contrast_residual_reml(
             fitter,
             settling_residual,
             theta,
             covar=covar_np,
-            h2_init=_trace_weighted_h2(theta),
+            h2_init=_background_h2(theta),
         )
         settled_theta, settling_stop_reason = _accepted_reml_theta(
             settling_result,
@@ -3699,18 +4949,18 @@ def main() -> None:
     else:
         sparse_path_performance["covtree_covariance_only_settling"] = False
 
-    # Kept for output-schema compatibility.  It now records the single KKT
-    # check from the final covariance-aligned Lasso update; it is not a second
-    # independent acceptance gate.
-    returned_covariance_kkt = {
+    final_kkt_certificate = {
         "passed": False,
         "tolerance": float("nan"),
         "max_active_error": float("inf"),
         "max_inactive_excess": float("inf"),
         "decision_precision": "ordinary_pcg",
-        "method": "candidate_gram_plus_outside_marker_score",
+        "method": (
+            "weighted_basil_complete_path_global_kkt"
+            if iterative_validation_selection
+            else "candidate_gram_plus_outside_marker_score"
+        ),
     }
-    returned_covariance_kkt_error = None
     outer = 0
     while outer < int(args.outer_max) or final_alignment_pending:
         final_alignment = bool(final_alignment_pending)
@@ -3836,59 +5086,318 @@ def main() -> None:
         support_new = np.array([], dtype=np.int64)
         certified_kkt = False
         penalized_block_failure = None
+        # H and therefore Hinv[Z_j] stay fixed throughout candidate expansion
+        # inside this outer update.  Cache certified columns here so an
+        # expansion solves only its newly admitted markers.
+        outer_hinv_z_dict: dict[int, np.ndarray] = {}
 
-        max_kkt_rounds = int(args.kkt_max_rounds)
         accepted_kkt_record = None
+        Hinv_y_for_path = np.asarray(sol_screen[:, 0], dtype=np.float64)
+        Hinv_covar_for_path = None
+        if covar_np is not None and covar_np.shape[1] > 0:
+            Hinv_covar_for_path = np.asarray(
+                sol_screen[:, 1:n_screen], dtype=np.float64
+            )
+
+        # Validation selection must compare exact solutions of the *global*
+        # weighted-Lasso problem at every lambda.  Use a BASIL rollout rather
+        # than growing one shared candidate until it happens to solve the whole
+        # path: short lambda blocks retain only ever-active markers, add a score
+        # batch, and receive one all-marker KKT scan before their certified
+        # prefix can enter the validation comparison.
+        if iterative_validation_selection:
+            try:
+                if prediction_context is None or validation_outcome is None:
+                    raise RuntimeError(
+                        "Iterative validation selection context is unavailable."
+                    )
+
+                def evaluate_basil_validation_block(
+                    *,
+                    candidate,
+                    train_candidate,
+                    beta_cov_path,
+                    beta_snp_path,
+                ):
+                    return _evaluate_lasso_path_on_validation(
+                        args=args,
+                        fitter=fitter,
+                        prediction_context=prediction_context,
+                        y_train=y_np,
+                        train_covar=covar_np,
+                        train_candidate=train_candidate,
+                        candidate=candidate,
+                        beta_cov_path=beta_cov_path,
+                        beta_snp_path=beta_snp_path,
+                        theta=theta,
+                        validation_outcome=validation_outcome,
+                    )
+
+                basil_result = _fit_complete_weighted_lasso_path_basil(
+                    args=args,
+                    grm_index=grm_index,
+                    hv=hv,
+                    precond=precond,
+                    y=y_np,
+                    covar=covar_np,
+                    hinv_y=Hinv_y_for_path,
+                    hinv_covar=Hinv_covar_for_path,
+                    initial_score_abs=np.asarray(score, dtype=np.float64),
+                    path_cfg=path_cfg,
+                    previous_candidate=warm_lasso_candidate,
+                    previous_beta_path=warm_lasso_beta_path,
+                    previous_hinv_z=warm_z_dict,
+                    outer=outer,
+                    sparse_path_performance=sparse_path_performance,
+                    validation_evaluator=evaluate_basil_validation_block,
+                    validation_stopping_lag=int(
+                        args.validation_early_stopping_lag
+                    ),
+                )
+                lasso_path = basil_result["lasso_path"]
+                candidate = np.asarray(
+                    basil_result["candidate"], dtype=np.int64
+                )
+                Z_cand = np.asarray(basil_result["geno"], dtype=np.float32)
+                sol_z_np = np.asarray(
+                    basil_result["hinv_geno"], dtype=np.float32
+                )
+                warm_z_dict = dict(basil_result["hinv_z_dict"])
+                kkt_trace = list(basil_result["kkt_trace"])
+                candidate_pcg = dict(basil_result["candidate_pcg"])
+                path_global_kkt = dict(basil_result["global_kkt"])
+                validation_bundle = dict(basil_result["validation"])
+                validation_metrics = list(validation_bundle["metrics"])
+                selected_index = _select_converged_validation_path_index(
+                    list(lasso_path["path"]), validation_metrics
+                )
+                lasso, validation_record = (
+                    _materialize_validation_selected_lasso(
+                        lasso_path,
+                        validation_metrics,
+                        selected_index=selected_index,
+                        path_prediction_pcg_res=float(
+                            validation_bundle["pcg_max_rel_res"]
+                        ),
+                        path_prediction_pcg_iters=int(
+                            validation_bundle["pcg_max_iters"]
+                        ),
+                    )
+                )
+                validation_record["early_stopping"] = dict(
+                    validation_bundle["early_stopping"]
+                )
+                validation_record["incremental_batches"] = list(
+                    validation_bundle["trace"]
+                )
+                lasso["validation_selection"] = validation_record
+                validation_selection_seconds = float(
+                    validation_bundle["seconds"]
+                )
+
+                warm_lasso_candidate = candidate.copy()
+                warm_lasso_beta_path = np.asarray(
+                    lasso["beta_snp_path"], dtype=np.float64
+                ).copy()
+                active_local = np.asarray(lasso["active_idx"], dtype=np.int64)
+                support_new = np.sort(candidate[active_local])
+                best_path = dict(lasso["path"][int(lasso["selected_index"])])
+                accepted_kkt_record = {
+                    "passed": True,
+                    "tolerance": float(best_path["kkt_tolerance"]),
+                    "max_active_error": float(
+                        best_path["max_active_kkt_error"]
+                    ),
+                    "max_inactive_excess": float(
+                        max(
+                            float(best_path["max_inactive_kkt_excess"]),
+                            float(
+                                best_path.get(
+                                    "global_kkt_max_outside_score", 0.0
+                                )
+                            )
+                            - float(best_path["lam"]),
+                            0.0,
+                        )
+                    ),
+                    "method": "weighted_basil_complete_path_global_kkt",
+                    "decision_precision": "ordinary_pcg",
+                    "pcg_tol": float(args.pcg_tol),
+                    "candidate_path_kkt_passed": bool(
+                        best_path["kkt_passed"]
+                    ),
+                    "complete_path_global_kkt_passed": True,
+                    "complete_path_global_kkt_points": int(
+                        path_global_kkt["n_path_points"]
+                    ),
+                    "max_outside_score": float(
+                        best_path.get("global_kkt_max_outside_score", 0.0)
+                    ),
+                    "n_outside_violators": 0,
+                }
+                certified_kkt = True
+                theta_lasso = theta.copy()
+
+                trace_record = {
+                    "outer": int(outer),
+                    "stage": (
+                        "final_covariance_lasso"
+                        if final_alignment
+                        else "outer_update"
+                    ),
+                    "final_alignment": bool(final_alignment),
+                    "path_solver": "weighted_basil",
+                    "candidate_size": int(candidate.size),
+                    "lasso_path_warm_start_used": bool(
+                        lasso[
+                            "external_beta_path_warm_start_used"
+                        ]
+                    ),
+                    "lasso_path_warm_start_rows_used": int(
+                        lasso[
+                            "external_beta_path_warm_start_rows_used"
+                        ]
+                    ),
+                    "lasso_path_solve_seconds": float(
+                        lasso["basil"]["path_solve_seconds"]
+                    ),
+                    "path_global_kkt_seconds": float(
+                        lasso["basil"]["global_kkt_seconds"]
+                    ),
+                    "validation_selection_seconds": (
+                        validation_selection_seconds
+                    ),
+                    "theta": np.asarray(
+                        theta, dtype=np.float64
+                    ).tolist(),
+                    **validation_record,
+                }
+                iterative_validation_trace.append(trace_record)
+                logger.info(
+                    "[outer %s validation alpha/BASIL] ever_active=%s "
+                    "ratio=%.6g active=%s validation_R2=%.8f",
+                    outer,
+                    int(candidate.size),
+                    float(lasso["selected_lam_ratio"]),
+                    int(active_local.size),
+                    float(
+                        validation_record["selected"][
+                            "correlation_squared"
+                        ]
+                    ),
+                )
+            except (
+                FloatingPointError,
+                RuntimeError,
+                ValueError,
+                np.linalg.LinAlgError,
+            ) as error:
+                penalized_block_failure = (
+                    "Weighted BASIL Lasso path failed: " f"{error}"
+                )
+            # The fixed-ratio branch below retains its selected-lambda KKT
+            # refinement.  The validation branch has already certified every
+            # path point and therefore has no second refinement loop.
+            max_kkt_rounds = 0
+        else:
+            max_kkt_rounds = int(args.kkt_max_rounds)
+
         for kkt_round in range(1, max_kkt_rounds + 1):
             path_pcg_tol = float(args.pcg_tol)
-            Hinv_y_for_path = np.asarray(
-                sol_screen[:, 0], dtype=np.float64
-            )
-            Hinv_covar_for_path = None
-            if covar_np is not None and covar_np.shape[1] > 0:
-                Hinv_covar_for_path = np.asarray(
-                    sol_screen[:, 1:n_screen], dtype=np.float64
-                )
-            # Z_cand PCG with dictionary warm-start as the candidate expands.
+            # Extract the current design, but solve Hinv[Z] only for columns
+            # not already certified under this outer iteration's covariance.
             Z_cand = grm_index.extract_standardized_columns(candidate).astype(
                 np.float32, copy=False
             )
-            B_z = jnp.asarray(Z_cand, dtype=jnp.float32)
-            x0_z = None
-            if warm_z_dict:
-                x0_arr = np.zeros(
-                    (n_samples, candidate.size), dtype=np.float32
-                )
-                hit = 0
-                for j, snp_idx in enumerate(candidate.tolist()):
-                    snp_i = int(snp_idx)
-                    if snp_i in warm_z_dict:
-                        x0_arr[:, j] = warm_z_dict[snp_i]
-                        hit += 1
-                if hit > 0:
-                    x0_z = jnp.asarray(x0_arr, dtype=jnp.float32)
-                    if args.verbose:
-                        logger.info(
-                            "[outer %s kkt %s] Z warm-start: %s/%s columns reused",
-                            outer, kkt_round, hit, candidate.size,
-                        )
+            missing_positions = np.asarray(
+                [
+                    column
+                    for column, marker in enumerate(candidate.tolist())
+                    if int(marker) not in outer_hinv_z_dict
+                ],
+                dtype=np.int64,
+            )
+            reused_hinv_columns = int(candidate.size - missing_positions.size)
+            candidate_pcg = {
+                "batch_size": int(args.candidate_pcg_rhs_batch_size),
+                "n_batches": 0,
+                "n_columns": 0,
+                "max_reported_relative_residual": 0.0,
+                "max_true_relative_residual": 0.0,
+                "max_iterations": 0,
+                "total_batch_iterations": 0,
+                "warm_start_columns": 0,
+                "reused_within_outer_columns": reused_hinv_columns,
+            }
 
             try:
-                sol_z, res_all, it_all = pcg_solve(
-                    hv,
-                    B_z,
-                    M=precond,
-                    tol=path_pcg_tol,
-                    maxiter=args.max_pcg_iters,
-                    X0=x0_z,
-                )
-                candidate_true_res = _true_pcg_relative_residual(
-                    hv, B_z, sol_z
-                )
-                if not np.isfinite(candidate_true_res):
-                    raise RuntimeError(
-                        "Candidate PCG produced a non-finite true residual."
+                if missing_positions.size > 0:
+                    missing_markers = candidate[missing_positions]
+                    missing_rhs = np.ascontiguousarray(
+                        Z_cand[:, missing_positions], dtype=np.float32
                     )
+                    missing_warm = np.zeros_like(missing_rhs)
+                    warm_hits = 0
+                    for column, marker in enumerate(
+                        missing_markers.tolist()
+                    ):
+                        previous = warm_z_dict.get(int(marker))
+                        if previous is not None:
+                            missing_warm[:, column] = previous
+                            warm_hits += 1
+                    solved_missing, solve_diagnostic = (
+                        _solve_hinv_columns_batched(
+                            hv=hv,
+                            precond=precond,
+                            rhs=missing_rhs,
+                            warm_start=(
+                                missing_warm if warm_hits > 0 else None
+                            ),
+                            tol=path_pcg_tol,
+                            maxiter=int(args.max_pcg_iters),
+                            batch_size=int(
+                                args.candidate_pcg_rhs_batch_size
+                            ),
+                            stage=(
+                                f"outer {outer} KKT round {kkt_round} "
+                                "candidate"
+                            ),
+                        )
+                    )
+                    candidate_pcg.update(solve_diagnostic)
+                    candidate_pcg["warm_start_columns"] = int(warm_hits)
+                    candidate_pcg["reused_within_outer_columns"] = int(
+                        reused_hinv_columns
+                    )
+                    for column, marker in enumerate(
+                        missing_markers.tolist()
+                    ):
+                        outer_hinv_z_dict[int(marker)] = solved_missing[
+                            :, column
+                        ]
+                sol_z_np = np.empty_like(Z_cand, dtype=np.float32)
+                for column, marker in enumerate(candidate.tolist()):
+                    sol_z_np[:, column] = outer_hinv_z_dict[int(marker)]
+                res_all = np.asarray(
+                    candidate_pcg["max_reported_relative_residual"],
+                    dtype=np.float32,
+                )
+                candidate_true_res = float(
+                    candidate_pcg["max_true_relative_residual"]
+                )
+                it_all = int(candidate_pcg["max_iterations"])
+                sparse_path_performance[
+                    "candidate_hinv_pcg_batches"
+                ] += int(candidate_pcg["n_batches"])
+                sparse_path_performance[
+                    "candidate_hinv_pcg_columns_solved"
+                ] += int(candidate_pcg["n_columns"])
+                sparse_path_performance[
+                    "candidate_hinv_columns_reused"
+                ] += reused_hinv_columns
+                sparse_path_performance[
+                    "candidate_hinv_pcg_total_batch_iterations"
+                ] += int(candidate_pcg["total_batch_iterations"])
                 _require_pcg_converged(
                     res_all,
                     tol=path_pcg_tol,
@@ -3912,10 +5421,11 @@ def main() -> None:
                 )
                 break
 
-            sol_z_np = np.asarray(sol_z, dtype=np.float32)
+            # Retain only the current monotone candidate as a warm start for
+            # the next covariance update and for optional sparse-state output.
             warm_z_dict = {
-                int(snp_idx): sol_z_np[:, j]
-                for j, snp_idx in enumerate(candidate.tolist())
+                int(marker): outer_hinv_z_dict[int(marker)]
+                for marker in candidate.tolist()
             }
 
             beta_snp_path0, warm_lasso_columns = _remap_lasso_beta_path(
@@ -3927,7 +5437,7 @@ def main() -> None:
             # complete path into that enlarged basis; the solver chooses the
             # better initial point independently at each lambda and preserves
             # the same complete score-KKT acceptance rule.
-            if not _allow_monotone_lasso_path_warm_start(
+            if not _allow_mapped_lasso_path_warm_start(
                 previous_size=int(warm_lasso_candidate.size),
                 current_size=int(candidate.size),
                 common_size=warm_lasso_columns,
@@ -3938,6 +5448,8 @@ def main() -> None:
             lasso_path_started = time.perf_counter()
             lasso_path_solve_seconds = float("nan")
             validation_selection_seconds = 0.0
+            path_global_kkt = None
+            path_global_kkt_seconds = 0.0
             try:
                 try:
                     lasso = fit_weighted_lasso_with_covariates(
@@ -3996,6 +5508,246 @@ def main() -> None:
                         raise RuntimeError(
                             "Iterative validation selection context is unavailable."
                         )
+                    # Validation may compare path points only after every one
+                    # is a full-genome Lasso solution.  Recombine the PCG
+                    # solves already used by the candidate Gram objective,
+                    # then obtain all-marker scores for every lambda in one
+                    # streamed X'V pass.  No per-lambda PCG loop is needed.
+                    path_kkt_started = time.perf_counter()
+                    hinv_residual_path = _build_hinv_lasso_residual_path(
+                        hinv_y=Hinv_y_for_path,
+                        hinv_covar=Hinv_covar_for_path,
+                        hinv_geno=sol_z_np,
+                        beta_cov_path=lasso["beta_cov_path"],
+                        beta_snp_path=lasso["beta_snp_path"],
+                    )
+                    path_score_signed = np.asarray(
+                        grm_index.xtv_all(
+                            jnp.asarray(
+                                hinv_residual_path, dtype=jnp.float32
+                            ),
+                            normalize=False,
+                        ),
+                        dtype=np.float64,
+                    )
+                    path_global_kkt = (
+                        _certify_complete_lasso_path_kkt_from_scores(
+                            score_path=path_score_signed,
+                            candidate=candidate,
+                            beta_candidate_path=lasso["beta_snp_path"],
+                            path_rows=list(lasso["path"]),
+                            abs_tol=float(args.kkt_tol),
+                            rel_tol=float(args.kkt_rel_tol),
+                        )
+                    )
+                    lasso["path"] = list(path_global_kkt["path_rows"])
+                    path_global_kkt_seconds = float(
+                        time.perf_counter() - path_kkt_started
+                    )
+                    sparse_path_performance[
+                        "lasso_path_global_kkt_passes"
+                    ] += 1
+                    sparse_path_performance[
+                        "lasso_path_global_kkt_seconds"
+                    ] += path_global_kkt_seconds
+                    sparse_path_performance[
+                        "lasso_path_global_kkt_points_checked"
+                    ] += int(path_global_kkt["n_path_points"])
+
+                    path_violators = np.asarray(
+                        path_global_kkt["outside_violators"],
+                        dtype=np.int64,
+                    )
+                    if path_violators.size > 0:
+                        n_path_viol = int(path_violators.size)
+                        expansion_budget = (
+                            _complete_path_kkt_expansion_budget(
+                                n_path_viol,
+                                int(args.kkt_add_topk),
+                                int(candidate.size),
+                            )
+                        )
+                        max_candidate = int(args.kkt_max_candidate)
+                        candidate_limit_error = None
+                        if max_candidate > 0:
+                            available = max_candidate - int(candidate.size)
+                            strict_required = min(
+                                expansion_budget, n_path_viol
+                            )
+                            if available < strict_required:
+                                candidate_limit_error = (
+                                    "Complete-path KKT refinement cannot add "
+                                    "the required union of strict violators "
+                                    "without exceeding --kkt-max-candidate "
+                                    f"({candidate.size} + {strict_required} "
+                                    f"> {max_candidate})."
+                                )
+                            else:
+                                expansion_budget = min(
+                                    expansion_budget, available
+                                )
+                        expansion = {
+                            "add_indices": np.empty(
+                                (0,), dtype=np.int64
+                            ),
+                            "n_strict_added": 0,
+                            "n_buffered_added": 0,
+                        }
+                        if candidate_limit_error is None:
+                            expansion = _buffered_kkt_expansion_indices(
+                                score_abs=np.asarray(
+                                    path_global_kkt["priority_score"],
+                                    dtype=np.float64,
+                                ),
+                                candidate=candidate,
+                                violators=path_violators,
+                                max_add=expansion_budget,
+                            )
+                        action = (
+                            "candidate_limit_reached"
+                            if candidate_limit_error is not None
+                            else "expand_candidate"
+                        )
+                        kkt_trace.append(
+                            {
+                                "round": int(kkt_round),
+                                "candidate_size": int(candidate.size),
+                                "support_size": int(
+                                    max(
+                                        int(row["k"])
+                                        for row in lasso["path"]
+                                    )
+                                ),
+                                "lambda": None,
+                                "lambda_ratio": None,
+                                "selection_method": (
+                                    "pending_complete_path_global_kkt"
+                                ),
+                                "validation_correlation_squared": None,
+                                "n_violators": n_path_viol,
+                                "n_expansion_strict_added": int(
+                                    expansion["n_strict_added"]
+                                ),
+                                "n_expansion_buffered_added": int(
+                                    expansion["n_buffered_added"]
+                                ),
+                                "lasso_path_warm_start_columns": int(
+                                    warm_lasso_columns
+                                ),
+                                "lasso_path_warm_start_used": bool(
+                                    lasso[
+                                        "external_beta_path_warm_start_used"
+                                    ]
+                                ),
+                                "lasso_path_warm_start_rows_used": int(
+                                    lasso[
+                                        "external_beta_path_warm_start_rows_used"
+                                    ]
+                                ),
+                                "lasso_path_solve_seconds": (
+                                    lasso_path_solve_seconds
+                                ),
+                                "path_global_kkt_seconds": (
+                                    path_global_kkt_seconds
+                                ),
+                                "validation_selection_seconds": 0.0,
+                                "decision": action,
+                                "path_pcg_tol": path_pcg_tol,
+                                "candidate_pcg_reported_res": float(
+                                    np.asarray(res_all)
+                                ),
+                                "candidate_pcg_true_res": float(
+                                    candidate_true_res
+                                ),
+                                "candidate_pcg_iters": int(it_all),
+                                "candidate_pcg": dict(candidate_pcg),
+                                "complete_path_global_kkt": {
+                                    "passed": False,
+                                    "n_path_points": int(
+                                        path_global_kkt["n_path_points"]
+                                    ),
+                                    "n_violating_path_points": int(
+                                        path_global_kkt[
+                                            "n_violating_path_points"
+                                        ]
+                                    ),
+                                    "n_union_violators": n_path_viol,
+                                    "max_outside_excess_over_threshold": (
+                                        float(
+                                            path_global_kkt[
+                                                "max_outside_excess_over_threshold"
+                                            ]
+                                        )
+                                    ),
+                                    "score_backend": str(
+                                        path_global_kkt["score_backend"]
+                                    ),
+                                },
+                            }
+                        )
+                        logger.info(
+                            "[outer %s kkt %s path] cand=%s lambdas=%s "
+                            "violating_lambdas=%s union_violators=%s "
+                            "add=%s buffer=%s warm_cols=%s path_sec=%.1f "
+                            "global_kkt_sec=%.1f decision=%s",
+                            outer,
+                            kkt_round,
+                            int(candidate.size),
+                            int(path_global_kkt["n_path_points"]),
+                            int(
+                                path_global_kkt[
+                                    "n_violating_path_points"
+                                ]
+                            ),
+                            n_path_viol,
+                            int(expansion["n_strict_added"]),
+                            int(expansion["n_buffered_added"]),
+                            int(warm_lasso_columns),
+                            lasso_path_solve_seconds,
+                            path_global_kkt_seconds,
+                            action,
+                        )
+                        if candidate_limit_error is not None:
+                            penalized_block_failure = (
+                                candidate_limit_error
+                            )
+                            break
+                        add_idx = np.asarray(
+                            expansion["add_indices"], dtype=np.int64
+                        )
+                        if add_idx.size == 0:
+                            penalized_block_failure = (
+                                "Complete-path KKT refinement produced an "
+                                "empty expansion despite "
+                                f"{n_path_viol} union violators."
+                            )
+                            break
+                        sparse_path_performance[
+                            "kkt_strict_violators_added"
+                        ] += int(expansion["n_strict_added"])
+                        sparse_path_performance[
+                            "kkt_buffered_markers_added"
+                        ] += int(expansion["n_buffered_added"])
+                        candidate = np.unique(
+                            np.concatenate([candidate, add_idx])
+                        ).astype(np.int64)
+                        candidate.sort()
+                        if (
+                            max_candidate > 0
+                            and candidate.size > max_candidate
+                        ):
+                            penalized_block_failure = (
+                                "Complete-path KKT refinement exceeded "
+                                "--kkt-max-candidate "
+                                f"({candidate.size} > {max_candidate})."
+                            )
+                            break
+                        # The next round remaps this complete alpha path onto
+                        # the expanded basis and uses it as a same-lambda warm
+                        # start.  Validation is intentionally deferred until
+                        # every path point passes the all-marker certificate.
+                        continue
+
                     validation_started = time.perf_counter()
                     lasso, validation_record = (
                         _select_lasso_by_validation_prediction(
@@ -4007,8 +5759,7 @@ def main() -> None:
                             train_candidate=Z_cand,
                             candidate=candidate,
                             lasso_path=lasso,
-                            theta_standardized=theta,
-                            phenotype_scale=phenotype_scale,
+                            theta=theta,
                             validation_outcome=validation_outcome,
                         )
                     )
@@ -4045,7 +5796,7 @@ def main() -> None:
                         "validation_selection_seconds": (
                             validation_selection_seconds
                         ),
-                        "theta_standardized": np.asarray(
+                        "theta": np.asarray(
                             theta, dtype=np.float64
                         ).tolist(),
                         **validation_record,
@@ -4086,10 +5837,14 @@ def main() -> None:
             if not (
                 bool(best_path.get("converged", False))
                 and bool(best_path.get("kkt_passed", False))
+                and (
+                    not iterative_validation_selection
+                    or bool(best_path.get("global_kkt_passed", False))
+                )
             ):
                 penalized_block_failure = (
-                    "Selected LASSO solution did not converge; KKT "
-                    "optimality cannot be certified. Increase "
+                    "Selected LASSO solution did not receive complete "
+                    "candidate/full-genome KKT convergence. Increase "
                     "--lasso-cd-max-iter or inspect its score certificate."
                 )
                 break
@@ -4225,7 +5980,11 @@ def main() -> None:
                 "max_inactive_excess": max(
                     internal_inactive_excess, outside_inactive_excess
                 ),
-                "method": "candidate_gram_plus_outside_marker_score",
+                "method": (
+                    "complete_path_batched_global_kkt_plus_selected_direct_score"
+                    if iterative_validation_selection
+                    else "candidate_gram_plus_outside_marker_score"
+                ),
                 "decision_precision": "ordinary_pcg",
                 "pcg_tol": path_pcg_tol,
                 "pcg_reported_res": float(np.asarray(res_kkt)),
@@ -4234,6 +5993,16 @@ def main() -> None:
                 "max_outside_score": max_outside_score,
                 "n_outside_violators": n_viol,
                 "candidate_path_kkt_passed": internal_kkt_passed,
+                "complete_path_global_kkt_passed": (
+                    bool(path_global_kkt["passed"])
+                    if path_global_kkt is not None
+                    else None
+                ),
+                "complete_path_global_kkt_points": (
+                    int(path_global_kkt["n_path_points"])
+                    if path_global_kkt is not None
+                    else None
+                ),
                 # This independent score is diagnostic only: finite-PCG
                 # differences on candidate coordinates do not reject an
                 # otherwise solved Lasso block.
@@ -4279,6 +6048,7 @@ def main() -> None:
                         ]
                     ),
                     "lasso_path_solve_seconds": lasso_path_solve_seconds,
+                    "path_global_kkt_seconds": path_global_kkt_seconds,
                     "validation_selection_seconds": (
                         validation_selection_seconds
                     ),
@@ -4287,6 +6057,33 @@ def main() -> None:
                     "candidate_pcg_reported_res": float(np.asarray(res_all)),
                     "candidate_pcg_true_res": float(candidate_true_res),
                     "candidate_pcg_iters": int(it_all),
+                    "candidate_pcg": dict(candidate_pcg),
+                    "complete_path_global_kkt": (
+                        {
+                            "passed": bool(path_global_kkt["passed"]),
+                            "n_path_points": int(
+                                path_global_kkt["n_path_points"]
+                            ),
+                            "n_violating_path_points": int(
+                                path_global_kkt[
+                                    "n_violating_path_points"
+                                ]
+                            ),
+                            "n_union_violators": int(
+                                path_global_kkt["n_union_violators"]
+                            ),
+                            "max_outside_excess_over_threshold": float(
+                                path_global_kkt[
+                                    "max_outside_excess_over_threshold"
+                                ]
+                            ),
+                            "score_backend": str(
+                                path_global_kkt["score_backend"]
+                            ),
+                        }
+                        if path_global_kkt is not None
+                        else None
+                    ),
                     "kkt": dict(current_record),
                 }
             )
@@ -4363,7 +6160,7 @@ def main() -> None:
                 support = last_aligned_pair["support"]
                 theta = last_aligned_pair["theta"]
                 theta_lasso = theta.copy()
-                returned_covariance_kkt = last_aligned_pair["kkt"]
+                final_kkt_certificate = last_aligned_pair["kkt"]
                 final_pair_available = True
                 final_pair_source = "last_complete_pair"
                 final_alignment_warning = str(penalized_block_failure)
@@ -4399,7 +6196,7 @@ def main() -> None:
                     "support_size": int(support_new.size),
                     "lam": (
                         float(lasso["lam"])
-                        if lasso is not None
+                        if lasso is not None and lasso.get("lam") is not None
                         else None
                     ),
                     "kkt_certified": False,
@@ -4422,7 +6219,6 @@ def main() -> None:
         # Only a candidate that passed the full outside-marker KKT check is
         # carried into the next covariance update.
         candidate_cache = candidate.copy()
-        support_same = bool(np.array_equal(support_new, support))
 
         if args.verbose:
             logger.info(
@@ -4445,14 +6241,14 @@ def main() -> None:
             lasso.get("beta_cov", np.empty((0,))), dtype=np.float64
         )
         beta_snp_current = np.asarray(lasso["beta_snp"], dtype=np.float64)
-        residual_raw = _lasso_residual(
+        residual = _lasso_residual(
             y=y_np,
             covar=covar_np,
             geno=Z_cand,
             beta_cov=beta_cov_current,
             beta_snp=beta_snp_current,
         )
-        fixed_mean_current = np.asarray(y_np, dtype=np.float64) - residual_raw
+        fixed_mean_current = np.asarray(y_np, dtype=np.float64) - residual
 
         if not final_alignment:
             last_aligned_pair = {
@@ -4472,14 +6268,13 @@ def main() -> None:
             final_alignment_completed = True
             final_pair_available = True
             final_pair_source = "final_covariance_lasso"
-            returned_covariance_kkt = dict(accepted_kkt_record)
+            final_kkt_certificate = dict(accepted_kkt_record)
             history.append(
                 {
                     "outer": outer,
                     "stage": "final_covariance_lasso",
                     "theta": theta.tolist(),
                     "support_size": int(support_new.size),
-                    "support_same": support_same,
                     "lam": float(lasso["lam"]),
                     "lam_ratio": float(lasso["selected_lam_ratio"]),
                     "lambda_selection_method": str(
@@ -4508,14 +6303,13 @@ def main() -> None:
             )
             break
 
-        residual_standardized = residual_raw / float(phenotype_scale)
         try:
             ml_res = _fit_covariate_contrast_residual_reml(
                 fitter,
-                residual_standardized,
+                residual,
                 theta,
                 covar=covar_np,
-                h2_init=_trace_weighted_h2(theta),
+                h2_init=_background_h2(theta),
             )
             theta_new, lasso_reml_stop_reason = _accepted_reml_theta(
                 ml_res,
@@ -4536,7 +6330,6 @@ def main() -> None:
                     "outer": outer,
                     "theta": theta.tolist(),
                     "support_size": int(support_new.size),
-                    "support_same": support_same,
                     "lam": float(lasso["lam"]),
                     "kkt_certified": bool(certified_kkt),
                     "kkt_trace": kkt_trace,
@@ -4560,12 +6353,6 @@ def main() -> None:
             )
 
         # ---- Convergence checks ------------------------------------------
-        vc_rel = _max_rel_change(theta_new, theta)
-        vc_stable, vc_change_ratio = _variance_components_converged(
-            theta_new,
-            theta,
-            rel_tol=float(args.vc_rel_tol),
-        )
         effect_rel = _relative_fitted_mean_change(
             fixed_mean_current,
             previous_fixed_mean,
@@ -4574,6 +6361,34 @@ def main() -> None:
         effect_stable = bool(
             np.isfinite(effect_rel)
             and effect_rel <= float(args.effect_rel_tol)
+        )
+        sparse_mean_current = np.asarray(
+            fixed_mean_current,
+            dtype=np.float64,
+        ).copy()
+        if (
+            covar_np is not None
+            and covar_np.size > 0
+            and beta_cov_current.size > 0
+        ):
+            sparse_mean_current -= (
+                np.asarray(covar_np, dtype=np.float64)
+                @ beta_cov_current
+            )
+        outer_h2, outer_q_sparse = (
+            _outer_coherit_h2_from_fitted_sparse_mean(
+                sparse_mean_current,
+                residual,
+                background_genetic_variance=(
+                    _background_genetic_variance(theta_new)
+                ),
+                residual_variance=float(theta_new[-1]),
+            )
+        )
+        h2_stable, h2_abs_change = _heritability_converged(
+            outer_h2,
+            previous_outer_h2,
+            abs_tol=float(args.h2_abs_tol),
         )
 
         history.append({
@@ -4585,12 +6400,12 @@ def main() -> None:
             "pcg_all_res": float(np.asarray(res_all)),
             "theta": theta_new.tolist(),
             "support_size": int(support_new.size),
-            "support_same": support_same,
-            "vc_rel": float(vc_rel),
-            "vc_change_ratio": float(vc_change_ratio),
-            "vc_stable": bool(vc_stable),
             "effect_rel": float(effect_rel),
             "effect_stable": bool(effect_stable),
+            "coherit_h2": float(outer_h2),
+            "q_sparse": float(outer_q_sparse),
+            "h2_abs_change": float(h2_abs_change),
+            "h2_stable": bool(h2_stable),
             "lam": float(lasso["lam"]),
             "lam_ratio": float(lasso["selected_lam_ratio"]),
             "lambda_selection_method": str(lasso["selection_method"]),
@@ -4619,8 +6434,8 @@ def main() -> None:
 
         logger.info(
             "[outer %s] pcg_screen=%s pcg_all=%s cand=%s active=%s "
-            "kkt_rounds=%s lam=%.3e validation_R2=%s vc_ratio=%.3e "
-            "effect_rel=%.3e support_same=%s iter_time=%.1fs",
+            "kkt_rounds=%s lam=%.3e validation_R2=%s h2=%.6f "
+            "h2_change=%.3e effect_rel=%.3e iter_time=%.1fs",
             outer,
             int(it_screen),
             int(it_all),
@@ -4638,9 +6453,9 @@ def main() -> None:
                 if lasso.get("validation_selection") is not None
                 else "fixed"
             ),
-            vc_change_ratio,
+            outer_h2,
+            h2_abs_change,
             effect_rel,
-            support_same,
             time.time() - iter_t0,
         )
 
@@ -4649,13 +6464,9 @@ def main() -> None:
         final_candidate = candidate
         final_lasso = lasso
         previous_fixed_mean = fixed_mean_current
+        previous_outer_h2 = float(outer_h2)
 
-        stable_candidate = bool(
-            variance_blocks_completed >= 2
-            and vc_stable
-            and effect_stable
-        )
-        if stable_candidate:
+        if h2_stable and effect_stable:
             outer_converged = True
             outer_stop_reason = "converged"
             final_alignment_pending = True
@@ -4696,7 +6507,7 @@ def main() -> None:
         final_pair_available
         and final_lasso is not None
         and last_round_kkt_certified
-        and bool(returned_covariance_kkt["passed"])
+        and bool(final_kkt_certificate["passed"])
         and finite_valid_theta
         and penalized_failure_reason is None
     )
@@ -4748,7 +6559,7 @@ def main() -> None:
                     if X_selected_span is not None
                     else None
                 ),
-                h2_init=_trace_weighted_h2(theta_lasso_ml),
+                h2_init=_background_h2(theta_lasso_ml),
                 var_components_init=jnp.asarray(
                     theta_lasso_ml, dtype=jnp.float32
                 ),
@@ -4785,10 +6596,10 @@ def main() -> None:
         os.makedirs(out_dir, exist_ok=True)
 
     unavailable = float("nan")
-    theta_lasso_ml_sum = _trace_weighted_genetic_var(theta_lasso_ml)
+    theta_lasso_ml_sum = _background_genetic_variance(theta_lasso_ml)
     theta_e_lasso_ml = float(theta_lasso_ml[-1])
     theta_final_sum = (
-        _trace_weighted_genetic_var(theta_selected_span_reml)
+        _background_genetic_variance(theta_selected_span_reml)
         if selected_span_refit_ok
         else unavailable
     )
@@ -4798,17 +6609,11 @@ def main() -> None:
         else unavailable
     )
     q_chive = unavailable
-    q_chive_standardized = unavailable
     q_chive_term1 = unavailable
     q_chive_term2 = unavailable
-    q_chive_term1_standardized = unavailable
-    q_chive_term2_standardized = unavailable
-    q_ss_gls_plugin_raw = unavailable
-    q_ss_gls_plugin_standardized = unavailable
-    q_ss_gls_df_corrected_raw = unavailable
-    q_ss_gls_df_corrected_standardized = unavailable
-    ss_gls_df_correction_raw = unavailable
-    ss_gls_df_correction_standardized = unavailable
+    q_ss_gls_plugin = unavailable
+    q_ss_gls_df_corrected = unavailable
+    ss_gls_df_correction = unavailable
     ss_gls_basis_size = 0
     beta_cov_lasso = np.empty((0,), dtype=np.float64)
     beta_cov_gls = np.empty((0,), dtype=np.float64)
@@ -4905,31 +6710,15 @@ def main() -> None:
                     beta_lasso_active,
                 )
             )
-            q_chive_standardized = _quadratic_variance_to_reml_scale(
-                q_chive, phenotype_scale
-            )
-            q_chive_term1_standardized = (
-                _quadratic_variance_to_reml_scale(
-                    q_chive_term1, phenotype_scale
-                )
-            )
-            q_chive_term2_standardized = (
-                _quadratic_variance_to_reml_scale(
-                    q_chive_term2, phenotype_scale
-                )
-            )
 
     # Comparison estimators 3 and 4 and exported refit coefficients use this
     # one selected-span REML--GLS solution.  The independent basis is mapped
     # back to the selected support with zero coefficients for numerically
     # dependent marker columns.
     if selected_span_refit_ok:
-        q_ss_gls_plugin_raw = 0.0
-        q_ss_gls_plugin_standardized = 0.0
-        q_ss_gls_df_corrected_raw = 0.0
-        q_ss_gls_df_corrected_standardized = 0.0
-        ss_gls_df_correction_raw = 0.0
-        ss_gls_df_correction_standardized = 0.0
+        q_ss_gls_plugin = 0.0
+        q_ss_gls_df_corrected = 0.0
+        ss_gls_df_correction = 0.0
         beta_gls_active = np.zeros(support.size, dtype=np.float64)
 
     if selected_span_refit_ok:
@@ -4982,7 +6771,6 @@ def main() -> None:
                 Hinv_y=Hinv_y_final,
                 Hinv_covar=Hinv_covar_final,
                 Hinv_z_active=Hinv_Z_support,
-                phenotype_scale=phenotype_scale,
             )
             selected_span_basis_positions = np.asarray(
                 ss_gls["active_basis_idx"], dtype=np.int64
@@ -4995,22 +6783,9 @@ def main() -> None:
                     "Selected-span REML and GLS retained different marker "
                     "bases."
                 )
-            q_ss_gls_plugin_raw = float(ss_gls["q_plugin_raw"])
-            q_ss_gls_plugin_standardized = float(
-                ss_gls["q_plugin_standardized"]
-            )
-            q_ss_gls_df_corrected_raw = float(
-                ss_gls["q_df_corrected_raw"]
-            )
-            q_ss_gls_df_corrected_standardized = float(
-                ss_gls["q_df_corrected_standardized"]
-            )
-            ss_gls_df_correction_raw = float(
-                ss_gls["df_correction_raw"]
-            )
-            ss_gls_df_correction_standardized = float(
-                ss_gls["df_correction_standardized"]
-            )
+            q_ss_gls_plugin = float(ss_gls["q_plugin"])
+            q_ss_gls_df_corrected = float(ss_gls["q_df_corrected"])
+            ss_gls_df_correction = float(ss_gls["df_correction"])
             ss_gls_basis_size = int(
                 selected_span_basis_positions.size
             )
@@ -5038,12 +6813,9 @@ def main() -> None:
             )
             theta_final_sum = unavailable
             theta_e_final = unavailable
-            q_ss_gls_plugin_raw = unavailable
-            q_ss_gls_plugin_standardized = unavailable
-            q_ss_gls_df_corrected_raw = unavailable
-            q_ss_gls_df_corrected_standardized = unavailable
-            ss_gls_df_correction_raw = unavailable
-            ss_gls_df_correction_standardized = unavailable
+            q_ss_gls_plugin = unavailable
+            q_ss_gls_df_corrected = unavailable
+            ss_gls_df_correction = unavailable
             beta_cov_gls = np.empty((0,), dtype=np.float64)
             beta_gls_active = np.empty((0,), dtype=np.float64)
             selected_span_basis_positions = np.empty(
@@ -5056,7 +6828,7 @@ def main() -> None:
     # branch. The other three estimators are constructed only in explicit
     # comparison mode.
     h2_chive = _sparse_dense_h2(
-        q_chive_standardized,
+        q_chive,
         theta_lasso_ml_sum,
         theta_e_lasso_ml,
     )
@@ -5065,12 +6837,10 @@ def main() -> None:
     h2_ss_gls_df_corrected = unavailable
     if comparison_enabled:
         four_h2 = _four_estimator_h2_from_branches(
-            q_lasso_plugin_standardized=q_chive_term1_standardized,
-            q_lasso_calibrated_standardized=q_chive_standardized,
-            q_selected_span_plugin_standardized=q_ss_gls_plugin_standardized,
-            q_selected_span_trace_standardized=(
-                q_ss_gls_df_corrected_standardized
-            ),
+            q_lasso_plugin=q_chive_term1,
+            q_lasso_calibrated=q_chive,
+            q_selected_span_plugin=q_ss_gls_plugin,
+            q_selected_span_trace=q_ss_gls_df_corrected,
             lasso_ml_background_variance=theta_lasso_ml_sum,
             lasso_ml_residual_variance=theta_e_lasso_ml,
             selected_span_reml_background_variance=theta_final_sum,
@@ -5149,7 +6919,7 @@ def main() -> None:
     )
 
     h2_background_selected_span_reml = (
-        _trace_weighted_h2(theta_selected_span_reml)
+        _background_h2(theta_selected_span_reml)
         if selected_support_refit_branch_valid
         else unavailable
     )
@@ -5206,9 +6976,8 @@ def main() -> None:
             )
             adaptive_marker_score_summary = _compute_adaptive_marker_scores(
                 output_path=marker_score_output,
-                residual_raw=marker_score_residual,
+                residual=marker_score_residual,
                 covar=covar_np,
-                phenotype_scale=phenotype_scale,
                 fitter=fitter,
                 ops=ops,
                 grm_index=grm_index,
@@ -5243,9 +7012,8 @@ def main() -> None:
             component_spec_path=component_spec_source,
             bed_prefix=bed_list[0],
             marker_score_path=marker_score_output,
-            residual_raw=marker_score_residual,
+            residual=marker_score_residual,
             covar=covar_np,
-            phenotype_scale=phenotype_scale,
             theta=theta_lasso_ml,
         )
         adaptive_marker_score_summary = covtree_diagnostic_summary["marker_score"]
@@ -5331,9 +7099,7 @@ def main() -> None:
     )
     # Preserve the partitioned, PCG-compatible KKT diagnostic. Non-finite
     # placeholders from an unavailable check become JSON null.
-    returned_covariance_kkt_summary = _json_safe_value(
-        returned_covariance_kkt
-    )
+    final_kkt_certificate_summary = _json_safe_value(final_kkt_certificate)
 
     prediction_summary = {
         "requested": bool(prediction_active),
@@ -5352,8 +7118,7 @@ def main() -> None:
             final_lasso=final_lasso,
             final_candidate=final_candidate,
             grm_index=grm_index,
-            theta_standardized=theta_lasso_ml,
-            phenotype_scale=phenotype_scale,
+            theta=theta_lasso_ml,
             outer_converged=lasso_ml_outer_converged,
             outer_stop_reason=outer_stop_reason,
         )
@@ -5394,25 +7159,11 @@ def main() -> None:
                     else prediction_bed_list
                 ),
             },
-            "scale_metadata": {
-                "variance_components": (
-                    "standardized_phenotype_variance"
+            "input_phenotype_standardization": {
+                "mean": float(input_phenotype_mean),
+                "standard_deviation": float(
+                    input_phenotype_standard_deviation
                 ),
-                "fixed_effect_coefficients": (
-                    "raw_phenotype_units_per_training_transformed_design_unit"
-                ),
-                "fixed_snp_score": "raw_phenotype_units",
-                "background_blup": "raw_phenotype_units",
-                "genetic_score": (
-                    "raw_phenotype_units; "
-                    "fixed_snp_score_plus_background_blup"
-                ),
-                "phenotype_prediction": (
-                    "raw_phenotype_units; "
-                    "nuisance_fixed_score_plus_genetic_score"
-                ),
-                "phenotype_scale": float(phenotype_scale),
-                "phenotype_mean": float(phenotype_mean),
             },
         }
         if not emitted_branches:
@@ -5510,15 +7261,14 @@ def main() -> None:
                     name="lasso",
                     fitter=fitter,
                     test_fitter=prediction_fitter,
-                    y_train_raw=y_np,
+                    y_train=y_np,
                     train_covar=covar_np,
                     test_covar=prediction_covar,
                     train_active_geno=Z_support,
                     test_active_geno=prediction_support,
-                    beta_cov_raw=beta_cov_lasso,
-                    beta_active_raw=beta_lasso_active,
-                    theta_standardized=theta_lasso_ml,
-                    phenotype_scale=phenotype_scale,
+                    beta_cov=beta_cov_lasso,
+                    beta_active=beta_lasso_active,
+                    theta=theta_lasso_ml,
                     pcg_tol=args.pcg_tol,
                     max_pcg_iters=args.max_pcg_iters,
                 )
@@ -5528,15 +7278,14 @@ def main() -> None:
                         name="selected_span",
                         fitter=fitter,
                         test_fitter=prediction_fitter,
-                        y_train_raw=y_np,
+                        y_train=y_np,
                         train_covar=covar_np,
                         test_covar=prediction_covar,
                         train_active_geno=Z_support,
                         test_active_geno=prediction_support,
-                        beta_cov_raw=beta_cov_gls,
-                        beta_active_raw=beta_gls_active,
-                        theta_standardized=theta_selected_span_reml,
-                        phenotype_scale=phenotype_scale,
+                        beta_cov=beta_cov_gls,
+                        beta_active=beta_gls_active,
+                        theta=theta_selected_span_reml,
                         pcg_tol=args.pcg_tol,
                         max_pcg_iters=args.max_pcg_iters,
                     )
@@ -5550,11 +7299,8 @@ def main() -> None:
                     "invalid_reasons": [],
                     "mean_estimator": "final_weighted_lasso",
                     "covariance_estimator": "lasso_covariate_contrast_reml",
-                    "theta_standardized": theta_lasso_ml.tolist(),
-                    "residual": (
-                        "(y-X_beta_cov_lasso-Z_support_beta_lasso)"
-                        "/phenotype_scale"
-                    ),
+                    "theta": theta_lasso_ml.tolist(),
+                    "residual": "y-X_beta_cov_lasso-Z_support_beta_lasso",
                     "support_size": int(support.size),
                     "pcg_rel_res": lasso_prediction.pcg_rel_res,
                     "pcg_iters": lasso_prediction.pcg_iters,
@@ -5579,13 +7325,8 @@ def main() -> None:
                 branch_metadata["selected_span"].update({
                     "mean_estimator": "selected_span_gls",
                     "covariance_estimator": "selected_span_reml",
-                    "theta_standardized": (
-                        theta_selected_span_reml.tolist()
-                    ),
-                    "residual": (
-                        "(y-X_beta_cov_gls-Z_support_beta_gls)"
-                        "/phenotype_scale"
-                    ),
+                    "theta": theta_selected_span_reml.tolist(),
+                    "residual": "y-X_beta_cov_gls-Z_support_beta_gls",
                     "support_size": int(support.size),
                     "independent_basis_size": int(ss_gls_basis_size),
                     "pcg_rel_res": (
@@ -5614,10 +7355,21 @@ def main() -> None:
             }
 
     output_contract = _sparse_output_contract(comparison_enabled)
+    evaluated_path_kkt_certified = bool(
+        final_lasso is not None
+        and final_lasso.get("path")
+        and (
+            all(
+                bool(row.get("global_kkt_passed", False))
+                for row in final_lasso["path"]
+            )
+            if iterative_validation_selection
+            else bool(final_kkt_certificate["passed"])
+        )
+    )
     summary = {
-        # Schema 6 fixes validation R2 as the training-stage lambda selector,
-        # reserves fixed-lambda-ratio selection for the final refit, and
-        # removes the former information-criterion fields.
+        # Schema 7 uses one analysis scale after input standardization and
+        # removes the former raw/standardized duplicate fields.
         "sparse_output_schema_version": output_contract[
             "sparse_output_schema_version"
         ],
@@ -5630,13 +7382,16 @@ def main() -> None:
         "n_snps_total": grm_index.m_total,
         "n_grms": grm_index.n_grm,
         "m_per_grm": grm_index.m_per_grm.tolist(),
-        "genetic_trace_atoms": genetic_trace_atoms.tolist(),
+        "grm_variance_scale": "unit_mean_diagonal",
         "lambda_selection_method": (
             str(final_lasso["selection_method"])
             if final_lasso is not None
             else None
         ),
-        "lasso_path_complete": True,
+        "lasso_path_complete": bool(
+            final_lasso is not None
+            and len(final_lasso["path"]) == int(args.lasso_n_lambda)
+        ),
         "lasso_path_role": (
             str(final_lasso["path_role"])
             if final_lasso is not None
@@ -5648,6 +7403,12 @@ def main() -> None:
             else 0
         ),
         "lasso_path_points_requested": int(args.lasso_n_lambda),
+        "lasso_validation_early_stopping": (
+            dict(final_lasso.get("validation_early_stopping", {}))
+            if final_lasso is not None
+            and iterative_validation_selection
+            else None
+        ),
         "sparse_path_performance_optimizations": dict(
             sparse_path_performance
         ),
@@ -5679,9 +7440,12 @@ def main() -> None:
             "h2_chive": "var_components_lasso_ml",
         },
         "var_components_at_lasso": theta_lasso.tolist(),
-        "phenotype_mean": phenotype_mean,
-        "phenotype_scale": phenotype_scale,
-        "variance_component_scale": "standardized_phenotype",
+        "input_phenotype_standardization": {
+            "mean": float(input_phenotype_mean),
+            "standard_deviation": float(
+                input_phenotype_standard_deviation
+            ),
+        },
         "primary_h2_method": primary_h2_method,
         "all_requested_estimators_valid": all_requested_estimators_valid,
         "lasso_branch_valid": lasso_branch_valid,
@@ -5699,7 +7463,7 @@ def main() -> None:
         "pcg_tol": float(args.pcg_tol),
         "kkt_abs_tol_effective": float(args.kkt_tol),
         "kkt_rel_tol_effective": float(args.kkt_rel_tol),
-        "vc_rel_tol": float(args.vc_rel_tol),
+        "h2_abs_tol": float(args.h2_abs_tol),
         "effect_rel_tol": float(args.effect_rel_tol),
         "outer_stop_reason": outer_stop_reason,
         "outer_convergence_warning": outer_convergence_warning,
@@ -5717,49 +7481,37 @@ def main() -> None:
         "final_covariance_lasso_completed": final_alignment_completed,
         "final_pair_source": final_pair_source,
         "final_alignment_warning": final_alignment_warning,
-        "returned_covariance_kkt": returned_covariance_kkt_summary,
-        "returned_covariance_kkt_error": returned_covariance_kkt_error,
+        "final_kkt_certificate": final_kkt_certificate_summary,
         "theta_lasso_to_lasso_ml_rel_change": (
             theta_lasso_to_lasso_ml_rel
         ),
-        "h2_background_lasso_ml": _trace_weighted_h2(theta_lasso_ml),
+        "h2_background_lasso_ml": _background_h2(theta_lasso_ml),
         "h2_chive": _finite_float_or_none(h2_chive),
         "h2_chive_guarded": h2_chive_guarded,
         "h2": h2,
-        "q_chive_raw": _finite_float_or_none(q_chive),
-        "q_chive_standardized": _finite_float_or_none(
-            q_chive_standardized
-        ),
+        "q_chive": _finite_float_or_none(q_chive),
         "q_chive_components": {
             "term1_g2_over_n": _finite_float_or_none(q_chive_term1),
             "term2_cross": _finite_float_or_none(q_chive_term2),
-            "scale": "raw_phenotype_variance",
-        },
-        "q_chive_components_standardized": {
-            "term1_g2_over_n": _finite_float_or_none(
-                q_chive_term1_standardized
-            ),
-            "term2_cross": _finite_float_or_none(
-                q_chive_term2_standardized
-            ),
-            "scale": "standardized_phenotype_variance",
         },
         "support_size": int(support.size),
         "support_indices": support.tolist(),
         "support_source_indices": grm_index.source_variant_indices(support).tolist(),
-        # Candidate expansion certifies the selected lambda in each outer
-        # round. It does not certify every unselected point on the path.
-        "kkt_certification_scope": "selected_lambda_only",
+        "kkt_certification_scope": (
+            "all_evaluated_path_points"
+            if iterative_validation_selection
+            else "fixed_lambda_target"
+        ),
         "kkt_certificate_definition": (
             "candidate_gram_plus_outside_marker_score"
         ),
-        "lasso_path_globally_kkt_certified": False,
+        "evaluated_lasso_path_kkt_certified": (
+            evaluated_path_kkt_certified
+        ),
         "kkt_certified": bool(
             history and bool(history[-1].get("kkt_certified", False))
         ),
-        "returned_covariance_kkt_certified": bool(
-            returned_covariance_kkt["passed"]
-        ),
+        "final_kkt_certified": bool(final_kkt_certificate["passed"]),
         "outer_history": history,
         "sparse_prediction": prediction_summary,
         "sparsity_validation": sparsity_validation_summary,
@@ -5846,27 +7598,13 @@ def main() -> None:
             "h2_ss_gls_role": (
                 "estimators_3_and_4_selected_support_reml_gls"
             ),
-            "q_lasso_plugin_raw": _finite_float_or_none(q_chive_term1),
-            "q_lasso_plugin_standardized": _finite_float_or_none(
-                q_chive_term1_standardized
+            "q_lasso_plugin": _finite_float_or_none(q_chive_term1),
+            "q_ss_gls_plugin": _finite_float_or_none(q_ss_gls_plugin),
+            "q_ss_gls_df_corrected": _finite_float_or_none(
+                q_ss_gls_df_corrected
             ),
-            "q_ss_gls_plugin_raw": _finite_float_or_none(
-                q_ss_gls_plugin_raw
-            ),
-            "q_ss_gls_plugin_standardized": _finite_float_or_none(
-                q_ss_gls_plugin_standardized
-            ),
-            "q_ss_gls_df_corrected_raw": _finite_float_or_none(
-                q_ss_gls_df_corrected_raw
-            ),
-            "q_ss_gls_df_corrected_standardized": _finite_float_or_none(
-                q_ss_gls_df_corrected_standardized
-            ),
-            "ss_gls_df_correction_raw": _finite_float_or_none(
-                ss_gls_df_correction_raw
-            ),
-            "ss_gls_df_correction_standardized": _finite_float_or_none(
-                ss_gls_df_correction_standardized
+            "ss_gls_df_correction": _finite_float_or_none(
+                ss_gls_df_correction
             ),
             "ss_gls_basis_size": ss_gls_basis_size,
         })

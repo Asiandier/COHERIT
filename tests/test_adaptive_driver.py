@@ -43,12 +43,19 @@ def test_prediction_metrics_aligns_by_iid(tmp_path):
     phenotype.write_text("f2 i2 2\nf1 i1 1\nf3 i3 3\n", encoding="utf-8")
     prediction = tmp_path / "prediction.tsv"
     prediction.write_text(
-        "sample_index\tiid\tlasso_phenotype_prediction_raw\n"
-        "0\ti1\t1\n1\ti2\t2\n2\ti3\t3\n",
+        "sample_index\tiid\tlasso_phenotype_prediction\n"
+        "0\ti1\t-1\n1\ti2\t0\n2\ti3\t1\n",
         encoding="utf-8",
     )
 
-    metrics = DRIVER.prediction_metrics(prediction, phenotype)
+    metrics = DRIVER.prediction_metrics(
+        prediction,
+        phenotype,
+        phenotype_standardization={
+            "mean": 2.0,
+            "standard_deviation": 1.0,
+        },
+    )
 
     assert metrics["n"] == 3
     assert metrics["correlation_squared"] == pytest.approx(1.0)
@@ -202,11 +209,19 @@ def test_adaptive_sparse_commands_isolate_validation_and_final_test_stages(tmp_p
 def test_adaptive_layer_requires_iterative_validation_contract(tmp_path):
     prefix = tmp_path / "coherit"
     summary = {
+        "sparse_output_schema_version": 7,
+        "input_phenotype_standardization": {
+            "mean": 0.0,
+            "standard_deviation": 1.0,
+        },
         "n_grms": 1,
         "lasso_branch_valid": True,
         "sparse_prediction": {"status": "emitted"},
         "lambda_selection_method": "validation_r2",
-        "lasso_path_role": "complete_validation_grid",
+        "lasso_path_role": "complete_validation_grid_weighted_basil",
+        "lasso_path_complete": True,
+        "lasso_path_points_solved": 80,
+        "lasso_path_points_requested": 80,
         "validation_selection_inside_outer_loop": True,
         "lasso_selected_lam_ratio": 0.25,
         "var_components_lasso_ml": [0.2, 0.8],
@@ -215,7 +230,7 @@ def test_adaptive_layer_requires_iterative_validation_contract(tmp_path):
         json.dumps(summary), encoding="utf-8"
     )
     (tmp_path / "coherit.sparse_prediction.tsv").write_text(
-        "sample_index\tiid\tlasso_phenotype_prediction_raw\n"
+        "sample_index\tiid\tlasso_phenotype_prediction\n"
         "0\ti1\t1\n1\ti2\t2\n2\ti3\t3\n",
         encoding="utf-8",
     )

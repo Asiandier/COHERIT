@@ -22,7 +22,7 @@ DRIVER = importlib.import_module(
 def _write_prediction(path, outcome, prediction):
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle, delimiter="\t")
-        writer.writerow(["iid", "lasso_phenotype_prediction_raw"])
+        writer.writerow(["iid", "lasso_phenotype_prediction"])
         for index, value in enumerate(prediction):
             writer.writerow([f"i{index}", value])
 
@@ -66,6 +66,10 @@ def test_prediction_metrics_remain_available_for_audit(tmp_path):
     result = DRIVER.prediction_metrics(
         prediction_path,
         phenotype_path,
+        phenotype_standardization={
+            "mean": 0.0,
+            "standard_deviation": 1.0,
+        },
     )
 
     assert result["n"] == 400

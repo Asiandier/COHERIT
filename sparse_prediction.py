@@ -21,17 +21,17 @@ from .reml_model import (
 
 @dataclasses.dataclass(frozen=True)
 class SparseBranchPrediction:
-    """Raw-outcome-scale predictions for one internally coherent branch."""
+    """Predictions for one branch on the pipeline's analysis scale."""
 
     name: str
-    theta_standardized: np.ndarray
-    residual_standardized: np.ndarray
-    nuisance_fixed_score_raw: np.ndarray
-    fixed_snp_score_raw: np.ndarray
-    background_blup_raw: np.ndarray
-    background_components_raw: tuple[np.ndarray, ...]
-    genetic_score_raw: np.ndarray
-    phenotype_prediction_raw: np.ndarray
+    theta: np.ndarray
+    residual: np.ndarray
+    nuisance_fixed_score: np.ndarray
+    fixed_snp_score: np.ndarray
+    background_blup: np.ndarray
+    background_components: tuple[np.ndarray, ...]
+    genetic_score: np.ndarray
+    phenotype_prediction: np.ndarray
     pcg_rel_res: float
     pcg_iters: int
 
@@ -40,13 +40,13 @@ class SparseBranchPrediction:
 class SparsePathPrediction:
     """Vectorized predictions for a coefficient path at one fixed covariance."""
 
-    residual_standardized: np.ndarray
-    dual_raw_objective_scale: np.ndarray
-    nuisance_fixed_score_raw: np.ndarray
-    fixed_snp_score_raw: np.ndarray
-    background_blup_raw: np.ndarray
-    genetic_score_raw: np.ndarray
-    phenotype_prediction_raw: np.ndarray
+    residual: np.ndarray
+    dual: np.ndarray
+    nuisance_fixed_score: np.ndarray
+    fixed_snp_score: np.ndarray
+    background_blup: np.ndarray
+    genetic_score: np.ndarray
+    phenotype_prediction: np.ndarray
     pcg_rel_res: float
     pcg_iters: int
 
@@ -67,20 +67,19 @@ def predict_sparse_branch(
     name: str,
     fitter,
     test_fitter,
-    y_train_raw: np.ndarray,
+    y_train: np.ndarray,
     train_covar: np.ndarray | None,
     test_covar: np.ndarray | None,
     train_active_geno: np.ndarray,
     test_active_geno: np.ndarray,
-    beta_cov_raw: np.ndarray,
-    beta_active_raw: np.ndarray,
-    theta_standardized: np.ndarray,
-    phenotype_scale: float,
+    beta_cov: np.ndarray,
+    beta_active: np.ndarray,
+    theta: np.ndarray,
     pcg_tol: float,
     max_pcg_iters: int,
 ) -> SparseBranchPrediction:
     """Predict with one branch's own mean, residual and covariance estimate."""
-    y = np.asarray(y_train_raw, dtype=np.float64).reshape(-1)
+    y = np.asarray(y_train, dtype=np.float64).reshape(-1)
     n_train = int(y.size)
     if not fitter.streamers or int(fitter.streamers[0].n) != n_train:
         raise ValueError("Training phenotype and genotype row counts do not match.")
@@ -100,39 +99,35 @@ def predict_sparse_branch(
     if z_train.shape[1] != z_test.shape[1]:
         raise ValueError("Training and prediction active-genotype widths do not match.")
 
-    beta_cov = np.asarray(beta_cov_raw, dtype=np.float64).reshape(-1)
-    beta_active = np.asarray(beta_active_raw, dtype=np.float64).reshape(-1)
+    beta_cov = np.asarray(beta_cov, dtype=np.float64).reshape(-1)
+    beta_active = np.asarray(beta_active, dtype=np.float64).reshape(-1)
     if beta_cov.size != c_train.shape[1] or beta_active.size != z_train.shape[1]:
         raise ValueError("Branch coefficient and design widths do not match.")
-    theta = np.asarray(theta_standardized, dtype=np.float64).reshape(-1)
-    scale = float(phenotype_scale)
-    if not np.isfinite(scale) or scale <= 0.0:
-        raise ValueError("phenotype_scale must be positive and finite.")
+    theta = np.asarray(theta, dtype=np.float64).reshape(-1)
     if (
         not np.all(np.isfinite(theta))
         or np.any(theta[:-1] < 0.0)
         or theta[-1] <= 0.0
     ):
         raise ValueError(
-            "theta_standardized requires nonnegative genetic and positive "
+            "theta requires nonnegative genetic and positive "
             "residual components."
         )
 
     ops = fitter._assemble_reml_operators()
     if theta.size != len(ops.K_mvs) + 1:
         raise ValueError(
-            "theta_standardized length mismatch: expected "
+            "theta length mismatch: expected "
             f"{len(ops.K_mvs) + 1}, got {theta.size}."
-        )
-    residual_raw = y - c_train @ beta_cov - z_train @ beta_active
-    residual_standardized = residual_raw / scale
+    )
+    residual = y - c_train @ beta_cov - z_train @ beta_active
     theta_dev = jnp.asarray(theta, dtype=jnp.float32)
     fitter._ensure_projected_core_precond_ready(
         ops, var_components_init=theta_dev
     )
     hv = fitter._make_hv(ops, theta_dev[:-1], theta_dev[-1])
     precond = fitter._make_effect_precond(ops, theta_dev[:-1], theta_dev[-1])
-    rhs = jnp.asarray(residual_standardized[:, None], dtype=jnp.float32)
+    rhs = jnp.asarray(residual[:, None], dtype=jnp.float32)
     x0 = precond(rhs) if precond is not None else jnp.zeros_like(rhs)
     sol, rel_res, iters = pcg_solve(
         hv,
@@ -150,10 +145,10 @@ def predict_sparse_branch(
         )
     dual = sol[:, 0]
     snp_effects = fitter._estimate_snp_effects(dual, theta_dev[:-1])
-    fixed_raw = np.concatenate([beta_cov, beta_active])
+    fixed = np.concatenate([beta_cov, beta_active])
     zeros_train = jnp.zeros((n_train,), dtype=jnp.float32)
     effects = EffectEstimates(
-        fixed_effects=jnp.asarray(fixed_raw / scale, dtype=jnp.float32),
+        fixed_effects=jnp.asarray(fixed, dtype=jnp.float32),
         random_effect=zeros_train,
         random_effect_components=tuple(
             zeros_train for _ in range(len(ops.K_mvs))
@@ -162,7 +157,7 @@ def predict_sparse_branch(
         pcg_rel_res=rel,
         pcg_iters=int(iters),
         y_mean=0.0,
-        y_scale=scale,
+        y_scale=1.0,
     )
     test_design = np.concatenate([c_test, z_test], axis=1)
     predictions = fitter.predict(
@@ -174,34 +169,34 @@ def predict_sparse_branch(
             else None
         ),
     )
-    nuisance_raw = c_test @ beta_cov
-    fixed_snp_raw = z_test @ beta_active
-    background_raw = scale * np.asarray(
+    nuisance = c_test @ beta_cov
+    fixed_snp = z_test @ beta_active
+    background = np.asarray(
         jax.device_get(predictions.random_effect), dtype=np.float64
     )
-    component_raw = tuple(
-        scale * np.asarray(jax.device_get(component), dtype=np.float64)
+    components = tuple(
+        np.asarray(jax.device_get(component), dtype=np.float64)
         for component in predictions.random_effect_components
     )
-    genetic_raw = fixed_snp_raw + background_raw
-    phenotype_raw = nuisance_raw + genetic_raw
-    returned_raw = np.asarray(
+    genetic = fixed_snp + background
+    phenotype = nuisance + genetic
+    returned = np.asarray(
         jax.device_get(predictions.y_pred), dtype=np.float64
     )
-    if not np.allclose(returned_raw, phenotype_raw, rtol=5e-5, atol=5e-5):
+    if not np.allclose(returned, phenotype, rtol=5e-5, atol=5e-5):
         raise RuntimeError(
             f"{name} prediction scale decomposition is inconsistent."
         )
     return SparseBranchPrediction(
         name=str(name),
-        theta_standardized=theta.copy(),
-        residual_standardized=residual_standardized,
-        nuisance_fixed_score_raw=nuisance_raw,
-        fixed_snp_score_raw=fixed_snp_raw,
-        background_blup_raw=background_raw,
-        background_components_raw=component_raw,
-        genetic_score_raw=genetic_raw,
-        phenotype_prediction_raw=phenotype_raw,
+        theta=theta.copy(),
+        residual=residual,
+        nuisance_fixed_score=nuisance,
+        fixed_snp_score=fixed_snp,
+        background_blup=background,
+        background_components=components,
+        genetic_score=genetic,
+        phenotype_prediction=phenotype,
         pcg_rel_res=rel,
         pcg_iters=int(iters),
     )
@@ -251,15 +246,14 @@ def predict_sparse_path_partitioned(
     *,
     fitter,
     test_fitter,
-    y_train_raw: np.ndarray,
+    y_train: np.ndarray,
     train_covar: np.ndarray | None,
     test_covar: np.ndarray | None,
     train_candidate_geno: np.ndarray,
     test_candidate_geno: np.ndarray,
-    beta_cov_path_raw: np.ndarray,
-    beta_candidate_path_raw: np.ndarray,
-    theta_standardized: np.ndarray,
-    phenotype_scale: float,
+    beta_cov_path: np.ndarray,
+    beta_candidate_path: np.ndarray,
+    theta: np.ndarray,
     pcg_tol: float,
     max_pcg_iters: int,
 ) -> SparsePathPrediction:
@@ -281,7 +275,7 @@ def predict_sparse_path_partitioned(
         train_streamer, test_streamer
     )
 
-    y = np.asarray(y_train_raw, dtype=np.float64).reshape(-1)
+    y = np.asarray(y_train, dtype=np.float64).reshape(-1)
     n_train = int(y.size)
     n_test = int(test_streamer.n)
     c_train = _as_design(train_covar, n_rows=n_train, name="train_covar")
@@ -302,35 +296,31 @@ def predict_sparse_path_partitioned(
         raise ValueError("Training and validation candidate widths do not match.")
 
     beta_cov_path = _as_coefficient_path(
-        beta_cov_path_raw,
+        beta_cov_path,
         n_columns=c_train.shape[1],
-        name="beta_cov_path_raw",
+        name="beta_cov_path",
     )
     beta_candidate_path = _as_coefficient_path(
-        beta_candidate_path_raw,
+        beta_candidate_path,
         n_columns=z_train.shape[1],
-        name="beta_candidate_path_raw",
+        name="beta_candidate_path",
     )
     if beta_cov_path.shape[0] != beta_candidate_path.shape[0]:
         raise ValueError("Covariate and candidate coefficient paths differ in length.")
     n_path = int(beta_candidate_path.shape[0])
 
-    theta = np.asarray(theta_standardized, dtype=np.float64).reshape(-1)
-    scale = float(phenotype_scale)
-    if not np.isfinite(scale) or scale <= 0.0:
-        raise ValueError("phenotype_scale must be positive and finite.")
+    theta = np.asarray(theta, dtype=np.float64).reshape(-1)
     if (
         theta.shape != (int(train_streamer.n_components) + 1,)
         or not np.all(np.isfinite(theta))
         or np.any(theta[:-1] < 0.0)
         or theta[-1] <= 0.0
     ):
-        raise ValueError("theta_standardized is incompatible with the partition.")
+        raise ValueError("theta is incompatible with the partition.")
 
     nuisance_train = c_train @ beta_cov_path.T
     fixed_train = z_train @ beta_candidate_path.T
-    residual_raw = y[:, None] - nuisance_train - fixed_train
-    residual_standardized = residual_raw / scale
+    residual = y[:, None] - nuisance_train - fixed_train
 
     ops = fitter._assemble_reml_operators()
     theta_dev = jnp.asarray(theta, dtype=jnp.float32)
@@ -341,9 +331,9 @@ def predict_sparse_path_partitioned(
     precond = fitter._make_effect_precond(
         ops, theta_dev[:-1], theta_dev[-1]
     )
-    rhs = jnp.asarray(residual_standardized, dtype=jnp.float32)
+    rhs = jnp.asarray(residual, dtype=jnp.float32)
     x0 = precond(rhs) if precond is not None else jnp.zeros_like(rhs)
-    dual_standardized, rel_res, iters = pcg_solve(
+    dual, rel_res, iters = pcg_solve(
         hv,
         rhs,
         M=precond,
@@ -360,7 +350,7 @@ def predict_sparse_path_partitioned(
 
     xt_dual = np.asarray(
         jax.device_get(
-            train_streamer.xtv(dual_standardized, normalize=False)
+            train_streamer.xtv(dual, normalize=False)
         ),
         dtype=np.float32,
     )
@@ -400,44 +390,38 @@ def predict_sparse_path_partitioned(
         pop_block=test_streamer._pop_cached,
         missing_val=int(test_streamer._missing_val),
     )
-    background_raw = scale * np.column_stack(
+    background = np.column_stack(
         [
             np.asarray(jax.device_get(values), dtype=np.float64)
             for values in path_predictions
         ]
     )
-    if background_raw.shape != (n_test, n_path):
+    if background.shape != (n_test, n_path):
         raise RuntimeError("Sparse path background prediction shape mismatch.")
 
-    nuisance_raw = c_test @ beta_cov_path.T
-    fixed_raw = z_test @ beta_candidate_path.T
-    genetic_raw = fixed_raw + background_raw
-    phenotype_raw = nuisance_raw + genetic_raw
+    nuisance = c_test @ beta_cov_path.T
+    fixed = z_test @ beta_candidate_path.T
+    genetic = fixed + background
+    phenotype = nuisance + genetic
     arrays = (
-        residual_standardized,
-        nuisance_raw,
-        fixed_raw,
-        background_raw,
-        genetic_raw,
-        phenotype_raw,
+        residual,
+        nuisance,
+        fixed,
+        background,
+        genetic,
+        phenotype,
     )
     if any(not np.all(np.isfinite(values)) for values in arrays):
         raise RuntimeError("Sparse path prediction contains non-finite values.")
 
     return SparsePathPrediction(
-        residual_standardized=residual_standardized,
-        # The Lasso objective uses H_std^-1 applied to the raw-scale residual.
-        dual_raw_objective_scale=(
-            scale
-            * np.asarray(
-                jax.device_get(dual_standardized), dtype=np.float64
-            )
-        ),
-        nuisance_fixed_score_raw=nuisance_raw,
-        fixed_snp_score_raw=fixed_raw,
-        background_blup_raw=background_raw,
-        genetic_score_raw=genetic_raw,
-        phenotype_prediction_raw=phenotype_raw,
+        residual=residual,
+        dual=np.asarray(jax.device_get(dual), dtype=np.float64),
+        nuisance_fixed_score=nuisance,
+        fixed_snp_score=fixed,
+        background_blup=background,
+        genetic_score=genetic,
+        phenotype_prediction=phenotype,
         pcg_rel_res=rel,
         pcg_iters=int(iters),
     )
@@ -494,11 +478,11 @@ def write_sparse_prediction_outputs(
     if not available:
         raise ValueError("At least one valid sparse prediction branch is required.")
     suffixes = (
-        "fixed_snp_score_raw",
-        "background_blup_raw",
-        "genetic_score_raw",
-        "nuisance_fixed_score_raw",
-        "phenotype_prediction_raw",
+        "fixed_snp_score",
+        "background_blup",
+        "genetic_score",
+        "nuisance_fixed_score",
+        "phenotype_prediction",
     )
     arrays: list[np.ndarray] = []
     columns = ["sample_index", "iid"]
@@ -506,11 +490,11 @@ def write_sparse_prediction_outputs(
         columns.extend(f"{prefix}_{suffix}" for suffix in suffixes)
         arrays.extend(
             (
-                branch.fixed_snp_score_raw,
-                branch.background_blup_raw,
-                branch.genetic_score_raw,
-                branch.nuisance_fixed_score_raw,
-                branch.phenotype_prediction_raw,
+                branch.fixed_snp_score,
+                branch.background_blup,
+                branch.genetic_score,
+                branch.nuisance_fixed_score,
+                branch.phenotype_prediction,
             )
         )
     if any(np.asarray(arr).size != n for arr in arrays):
