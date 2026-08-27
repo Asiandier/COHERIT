@@ -15,6 +15,8 @@ where C is unpenalized covariates and Z is penalized SNP matrix.
 
 Performance notes:
 - The CD inner loop is Numba-JIT compiled (>50× faster than pure Python).
+- Gram matrices are kept column-major because coordinate updates scan columns.
+- Complete coefficient paths reuse one batched Gram product for external starts.
 - SPD solves are delegated to pipeline_common.solve_spd.
 """
 
@@ -169,6 +171,78 @@ def _cd_active_epoch(Q: np.ndarray, q: np.ndarray, diag: np.ndarray,
     return max_delta
 
 
+@njit(cache=True, nogil=True)
+def _cd_active_full_qb_epoch(
+    Q: np.ndarray,
+    q: np.ndarray,
+    diag: np.ndarray,
+    beta: np.ndarray,
+    Qb: np.ndarray,
+    lam: float,
+    active: np.ndarray,
+) -> float:
+    """Active-coordinate sweep that keeps every entry of ``Qb`` current.
+
+    Once the active set is moderately dense, scanning complete column-major
+    Gram columns is faster than gathering the active rows of those columns.
+    Keeping inactive Qb entries current also removes the dense reconstruction
+    otherwise required before the next full sweep.
+    """
+    k = beta.shape[0]
+    max_delta = 0.0
+    for idx in range(active.shape[0]):
+        j = active[idx]
+        q_j_tilde = q[j] - (Qb[j] - diag[j] * beta[j])
+        if q_j_tilde > lam:
+            beta_new = (q_j_tilde - lam) / diag[j]
+        elif q_j_tilde < -lam:
+            beta_new = (q_j_tilde + lam) / diag[j]
+        else:
+            beta_new = 0.0
+        delta = beta_new - beta[j]
+        if delta != 0.0:
+            beta[j] = beta_new
+            for i in range(k):
+                Qb[i] += Q[i, j] * delta
+            ad = abs(delta)
+            if ad > max_delta:
+                max_delta = ad
+    return max_delta
+
+
+@njit(cache=True, nogil=True)
+def _score_kkt_errors(
+    q: np.ndarray,
+    Qb: np.ndarray,
+    beta: np.ndarray,
+    lam: float,
+) -> tuple[bool, float, float]:
+    """Single-pass, allocation-free active/inactive KKT errors."""
+    max_active_error = 0.0
+    max_inactive_excess = 0.0
+    for index in range(beta.size):
+        q_value = q[index]
+        Qb_value = Qb[index]
+        beta_value = beta[index]
+        if not (
+            np.isfinite(q_value)
+            and np.isfinite(Qb_value)
+            and np.isfinite(beta_value)
+        ):
+            return False, np.inf, np.inf
+        score = q_value - Qb_value
+        if beta_value != 0.0:
+            sign = 1.0 if beta_value > 0.0 else -1.0
+            error = abs(score - lam * sign)
+            if error > max_active_error:
+                max_active_error = error
+        else:
+            excess = abs(score) - lam
+            if excess > max_inactive_excess:
+                max_inactive_excess = excess
+    return True, max_active_error, max(max_inactive_excess, 0.0)
+
+
 def _score_kkt_diagnostics(
     *,
     q: np.ndarray,
@@ -184,40 +258,27 @@ def _score_kkt_diagnostics(
         float(abs_tol),
         float(rel_tol) * max(1.0, abs(lam_f)),
     )
-    score = np.asarray(q, dtype=np.float64) - np.asarray(
-        Qb,
-        dtype=np.float64,
-    )
+    q_arr = np.asarray(q, dtype=np.float64)
+    Qb_arr = np.asarray(Qb, dtype=np.float64)
     beta_arr = np.asarray(beta, dtype=np.float64)
     if (
-        score.shape != beta_arr.shape
-        or not np.all(np.isfinite(score))
-        or not np.all(np.isfinite(beta_arr))
+        q_arr.ndim != 1
+        or Qb_arr.shape != q_arr.shape
+        or beta_arr.shape != q_arr.shape
         or not np.isfinite(lam_f)
         or lam_f < 0.0
     ):
         return False, tolerance, float("inf"), float("inf")
 
-    active = beta_arr != 0.0
-    max_active_error = (
-        float(
-            np.max(
-                np.abs(
-                    score[active]
-                    - lam_f * np.sign(beta_arr[active])
-                )
-            )
-        )
-        if np.any(active)
-        else 0.0
-    )
-    max_inactive_excess = (
-        float(max(np.max(np.abs(score[~active])) - lam_f, 0.0))
-        if np.any(~active)
-        else 0.0
+    finite, max_active_error, max_inactive_excess = _score_kkt_errors(
+        q_arr,
+        Qb_arr,
+        beta_arr,
+        lam_f,
     )
     passed = bool(
-        max_active_error <= tolerance
+        finite
+        and max_active_error <= tolerance
         and max_inactive_excess <= tolerance
     )
     return passed, tolerance, max_active_error, max_inactive_excess
@@ -248,7 +309,11 @@ def solve_lasso_cd_gram(
     is not a convergence condition because its scale depends on the Gram
     diagonal and column correlation.
     """
-    Q = np.ascontiguousarray(Q, dtype=np.float64)
+    # Coordinate updates repeatedly scan Q[:, j].  Keeping the Gram matrix in
+    # Fortran order makes those column reads contiguous.  ``asfortranarray`` is
+    # a no-op when solve_lasso_path has already prepared the shared matrix, so
+    # the complete lambda path pays for at most one layout conversion.
+    Q = np.asfortranarray(Q, dtype=np.float64)
     q = np.ascontiguousarray(q.reshape(-1), dtype=np.float64)
     k = q.size
 
@@ -291,9 +356,11 @@ def solve_lasso_cd_gram(
     ):
         raise ValueError("KKT tolerances must be nonnegative.")
     # Active-set strategy: alternate cheaper active-only sweeps with periodic
-    # full sweeps; every completed full sweep receives an exact KKT check.
+    # full sweeps.  A cheap incremental-score check filters which full sweeps
+    # need the decisive exact-matvec KKT certificate.
     active_set_period = max(int(active_set_period), 1)
     it = 0
+    active = np.empty((0,), dtype=np.int64)
 
     for it_idx in range(1, max_iter + 1):
         it = it_idx
@@ -305,9 +372,9 @@ def solve_lasso_cd_gram(
                 qb_full_stale = False
             max_delta = _cd_epoch(Q, q, diag, beta, Qb, lam)
             completed_full_sweep = True
+            active = np.flatnonzero(beta != 0.0).astype(np.int64)
         else:
             # Active-set sweep
-            active = np.flatnonzero(beta != 0.0).astype(np.int64)
             if active.size == 0:
                 # All zero — check full sweep to see if any should activate
                 if qb_full_stale:
@@ -315,6 +382,15 @@ def solve_lasso_cd_gram(
                     qb_full_stale = False
                 max_delta = _cd_epoch(Q, q, diag, beta, Qb, lam)
                 completed_full_sweep = True
+                active = np.flatnonzero(beta != 0.0).astype(np.int64)
+            elif not qb_full_stale and 4 * active.size >= k:
+                # At roughly one-quarter density, contiguous full-column Qb
+                # updates become cheaper than gathered active-row updates on
+                # the publication-scale Gram matrices.  This is purely a
+                # memory-layout choice; the coordinate sequence is unchanged.
+                max_delta = _cd_active_full_qb_epoch(
+                    Q, q, diag, beta, Qb, lam, active
+                )
             else:
                 max_delta = _cd_active_epoch(Q, q, diag, beta, Qb, lam, active)
                 if max_delta > 0.0:
@@ -327,17 +403,17 @@ def solve_lasso_cd_gram(
             if qb_full_stale:
                 Qb = Q @ beta
                 qb_full_stale = False
-            _cd_epoch(Q, q, diag, beta, Qb, lam)
+            max_delta = _cd_epoch(Q, q, diag, beta, Qb, lam)
             it += 1
             completed_full_sweep = True
+            active = np.flatnonzero(beta != 0.0).astype(np.int64)
 
         if completed_full_sweep:
-            # Rebuild Qb before every full-sweep certificate.  Incremental
-            # updates are fast, but their accumulated roundoff must not decide
-            # KKT optimality at publication-scale Gram magnitudes.
-            Qb = Q @ beta
-            qb_full_stale = False
-            kkt_passed, _, _, _ = _score_kkt_diagnostics(
+            # Use the incrementally maintained score as a cheap filter.  Only
+            # a point that may be converged pays for the exact dense matvec;
+            # accumulated roundoff is therefore never allowed to decide the
+            # final score-KKT certificate.
+            provisional_kkt, _, _, _ = _score_kkt_diagnostics(
                 q=q,
                 Qb=Qb,
                 beta=beta,
@@ -345,23 +421,36 @@ def solve_lasso_cd_gram(
                 abs_tol=kkt_abs,
                 rel_tol=kkt_rel,
             )
-            if kkt_passed:
-                converged = True
-                break
+            if provisional_kkt or max_delta <= tol:
+                Qb = Q @ beta
+                qb_full_stale = False
+                kkt_passed, _, _, _ = _score_kkt_diagnostics(
+                    q=q,
+                    Qb=Qb,
+                    beta=beta,
+                    lam=float(lam),
+                    abs_tol=kkt_abs,
+                    rel_tol=kkt_rel,
+                )
+                if kkt_passed:
+                    converged = True
+                    break
 
-    # ``max_iter`` may end immediately after an active-only sweep.  Rebuild
-    # the exact score and apply the same decisive certificate once more; do
-    # not report a KKT solution as failed merely because no periodic full
-    # sweep remained in the iteration budget.
-    Qb = Q @ beta
-    converged, _, _, _ = _score_kkt_diagnostics(
-        q=q,
-        Qb=Qb,
-        beta=beta,
-        lam=float(lam),
-        abs_tol=kkt_abs,
-        rel_tol=kkt_rel,
-    )
+    if not converged:
+        # ``max_iter`` may end immediately after an active-only sweep.  Rebuild
+        # the exact score and apply the same decisive certificate once more;
+        # do not report a KKT solution as failed merely because no filtered
+        # exact check remained in the iteration budget.
+        Qb = Q @ beta
+        qb_full_stale = False
+        converged, _, _, _ = _score_kkt_diagnostics(
+            q=q,
+            Qb=Qb,
+            beta=beta,
+            lam=float(lam),
+            abs_tol=kkt_abs,
+            rel_tol=kkt_rel,
+        )
     return beta, Qb, it, converged
 
 
@@ -391,7 +480,7 @@ def solve_lasso_path(
             determines convergence and acceptance.
     """
     q = np.asarray(q, dtype=np.float64).reshape(-1)
-    Q = np.asarray(Q, dtype=np.float64)
+    Q = np.asfortranarray(Q, dtype=np.float64)
     if Q.shape != (q.size, q.size):
         raise ValueError("Q/q shape mismatch.")
 
@@ -424,6 +513,7 @@ def solve_lasso_path(
         path_role = "frozen_ratio_target_only"
 
     external_beta_path = None
+    external_Qb_path = None
     if beta_path0 is not None:
         external_beta_path = np.asarray(beta_path0, dtype=np.float64)
         expected_shape = (int(lam_seq.size), int(q.size))
@@ -434,6 +524,12 @@ def solve_lasso_path(
             )
         if not np.all(np.isfinite(external_beta_path)):
             raise ValueError("beta_path0 must contain only finite values.")
+        # One level-3 BLAS operation is substantially cheaper than one Python-
+        # dispatched matrix-vector product for every lambda row.
+        external_Qb_path = np.ascontiguousarray(
+            (Q @ external_beta_path.T).T,
+            dtype=np.float64,
+        )
 
     rss0 = float(yHy)
     beta_warm = np.zeros_like(q)
@@ -449,9 +545,13 @@ def solve_lasso_path(
         # on a newly enlarged candidate set.
         beta_start = beta_warm
         Qb_start = Qb_warm
-        if external_beta_path is not None and i > 0:
+        if (
+            external_beta_path is not None
+            and external_Qb_path is not None
+            and i > 0
+        ):
             external_beta = external_beta_path[i]
-            external_Qb = Q @ external_beta
+            external_Qb = external_Qb_path[i]
             sequential_kkt = _score_kkt_diagnostics(
                 q=q,
                 Qb=Qb_warm,
@@ -474,18 +574,27 @@ def solve_lasso_path(
                 beta_start = external_beta
                 Qb_start = external_Qb
                 external_warm_rows_used += 1
-        beta, Qb, n_iter, converged = solve_lasso_cd_gram(
-            Q,
-            q,
-            float(lam),
-            beta0=beta_start,
-            _Qb0=Qb_start,
-            max_iter=cfg.max_cd_iter,
-            tol=cfg.cd_tol,
-            active_set_period=cfg.active_set_period,
-            kkt_abs_tol=cfg.kkt_abs_tol,
-            kkt_rel_tol=cfg.kkt_rel_tol,
-        )
+        if i == 0:
+            # By construction lambda_max=max(abs(q)), so the exact first path
+            # solution is beta=0.  Avoid entering coordinate descent merely to
+            # rediscover that deterministic KKT point.
+            beta = np.zeros_like(q)
+            Qb = np.zeros_like(q)
+            n_iter = 0
+            converged = True
+        else:
+            beta, Qb, n_iter, converged = solve_lasso_cd_gram(
+                Q,
+                q,
+                float(lam),
+                beta0=beta_start,
+                _Qb0=Qb_start,
+                max_iter=cfg.max_cd_iter,
+                tol=cfg.cd_tol,
+                active_set_period=cfg.active_set_period,
+                kkt_abs_tol=cfg.kkt_abs_tol,
+                kkt_rel_tol=cfg.kkt_rel_tol,
+            )
         beta_warm = beta
         Qb_warm = Qb
 
@@ -711,15 +820,12 @@ def fit_weighted_lasso_with_covariates(
     if covar is not None and covar.size > 0:
         if GCC is None or GCZ is None or gCy is None:
             raise RuntimeError("Internal error: covariate normal equations were not built.")
-        beta_cov_path = np.stack(
-            [
-                _solve_factorized_system(
-                    gcc_factor,
-                    gCy - GCZ @ beta_path_row,
-                )
-                for beta_path_row in beta_snp_path
-            ],
-            axis=0,
+        beta_cov_path = np.ascontiguousarray(
+            _solve_factorized_system(
+                gcc_factor,
+                gCy[:, None] - GCZ @ beta_snp_path.T,
+            ).T,
+            dtype=np.float64,
         )
     else:
         beta_cov_path = np.empty(

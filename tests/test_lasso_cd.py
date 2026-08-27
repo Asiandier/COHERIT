@@ -37,6 +37,37 @@ def _random_spd(k: int, seed: int = 0) -> np.ndarray:
 
 
 class TestSolveLassoCdGram:
+    def test_dense_active_kernel_matches_restricted_coordinate_updates(self):
+        Q = np.asfortranarray(_random_spd(12, seed=31))
+        q = np.linspace(-1.2, 1.4, 12)
+        diag = np.diag(Q).copy()
+        beta = np.linspace(-0.1, 0.1, 12)
+        active = np.asarray([0, 2, 3, 6, 8, 9, 11], dtype=np.int64)
+        Qb = Q @ beta
+
+        beta_restricted = beta.copy()
+        Qb_restricted = Qb.copy()
+        _LASSO._cd_active_epoch(
+            Q,
+            q,
+            diag,
+            beta_restricted,
+            Qb_restricted,
+            0.35,
+            active,
+        )
+        beta_dense = beta.copy()
+        Qb_dense = Qb.copy()
+        _LASSO._cd_active_full_qb_epoch(
+            Q, q, diag, beta_dense, Qb_dense, 0.35, active
+        )
+
+        np.testing.assert_allclose(beta_dense, beta_restricted, atol=1e-12)
+        np.testing.assert_allclose(
+            Qb_dense[active], Qb_restricted[active], atol=1e-12
+        )
+        np.testing.assert_allclose(Qb_dense, Q @ beta_dense, atol=1e-12)
+
     def test_lambda_zero_matches_ols_solution(self):
         Q = _random_spd(6, seed=1)
         q = np.array([1.2, -0.4, 0.7, 2.1, -1.5, 0.3], dtype=np.float64)
@@ -167,6 +198,7 @@ class TestLambdaPath:
         assert out["selected_index"] is None
         assert out["selected_lam_ratio"] is None
         assert out["beta_path"].shape == (len(path), q.size)
+        assert path[0]["cd_iter"] == 0
 
     def test_external_path_warm_start_preserves_solution_and_reduces_cd_work(self):
         k = 24
@@ -210,6 +242,82 @@ class TestLambdaPath:
                 cfg=LassoPathConfig(n_lambda=5),
                 beta_path0=np.zeros((4, 3)),
             )
+
+    def test_expanded_basis_path_warm_start_preserves_solution_and_cd_work(self):
+        rng = np.random.default_rng(44)
+        k = 48
+        old_k = 32
+        block_size = 8
+        Q = np.eye(k)
+        for start in range(0, k, block_size):
+            stop = start + block_size
+            Q[start:stop, start:stop] = (
+                0.2 * np.eye(block_size) + 0.8
+            )
+        q = rng.normal(size=k)
+        q[old_k:] *= 0.1
+        cfg = LassoPathConfig(
+            n_lambda=20,
+            lam_min_ratio=0.05,
+            max_cd_iter=10000,
+            cd_tol=1e-10,
+            kkt_abs_tol=1e-8,
+            kkt_rel_tol=1e-8,
+        )
+        old = solve_lasso_path(
+            Q=Q[:old_k, :old_k], q=q[:old_k], yHy=100.0, cfg=cfg
+        )
+        mapped_path = np.zeros((cfg.n_lambda, k), dtype=np.float64)
+        mapped_path[:, :old_k] = old["beta_path"]
+
+        cold = solve_lasso_path(Q=Q, q=q, yHy=100.0, cfg=cfg)
+        warm = solve_lasso_path(
+            Q=Q,
+            q=q,
+            yHy=100.0,
+            cfg=cfg,
+            beta_path0=mapped_path,
+        )
+
+        np.testing.assert_allclose(
+            warm["beta_path"], cold["beta_path"], rtol=1e-6, atol=1e-7
+        )
+        assert warm["external_beta_path_warm_start_rows_used"] > 0
+        assert sum(row["cd_iter"] for row in warm["path"]) < sum(
+            row["cd_iter"] for row in cold["path"]
+        )
+
+    def test_path_passes_one_column_major_gram_to_all_cd_solves(
+        self, monkeypatch
+    ):
+        observed_layouts = []
+        observed_gram_ids = []
+        original_solver = _LASSO.solve_lasso_cd_gram
+
+        def _record_layout(Q, *args, **kwargs):
+            observed_gram_ids.append(id(Q))
+            observed_layouts.append(
+                (bool(Q.flags.f_contiguous), bool(Q.flags.owndata))
+            )
+            return original_solver(Q, *args, **kwargs)
+
+        monkeypatch.setattr(_LASSO, "solve_lasso_cd_gram", _record_layout)
+        solve_lasso_path(
+            Q=np.asarray([[1.0, 0.2], [0.2, 1.0]]),
+            q=np.asarray([1.0, -0.5]),
+            yHy=4.0,
+            cfg=LassoPathConfig(
+                n_lambda=4,
+                lam_min_ratio=0.2,
+                max_cd_iter=5000,
+                cd_tol=1e-10,
+            ),
+        )
+
+        assert len(observed_layouts) == 3
+        assert all(is_fortran for is_fortran, _ in observed_layouts)
+        assert len(set(observed_gram_ids)) == 1
+        assert len({owns_data for _, owns_data in observed_layouts}) == 1
 
     def test_fixed_ratio_selection_solves_only_max_and_exact_target(self):
         Q = _random_spd(5, seed=12)
@@ -382,6 +490,42 @@ class TestFitWeightedLassoWithCovariates:
 
         assert float(np.max(np.abs(out["beta_snp"]))) < 1e-12
         assert out["beta_cov"].size == 0
+
+    def test_batched_covariate_path_matches_rowwise_normal_equations(self):
+        rng = np.random.RandomState(81)
+        n, p_c, p_z = 90, 3, 7
+        C = rng.randn(n, p_c)
+        Z = rng.randn(n, p_z)
+        y = rng.randn(n)
+        ridge = 1e-8
+        out = fit_weighted_lasso_with_covariates(
+            y=y,
+            covar=C,
+            geno=Z,
+            Hinv_y=y,
+            Hinv_covar=C,
+            Hinv_geno=Z,
+            cfg=LassoPathConfig(
+                n_lambda=9,
+                lam_min_ratio=0.1,
+                max_cd_iter=5000,
+                cd_tol=1e-10,
+            ),
+            ridge=ridge,
+        )
+
+        GCC = C.T @ C + ridge * np.eye(p_c)
+        GCZ = C.T @ Z
+        gCy = C.T @ y
+        expected = np.stack(
+            [
+                np.linalg.solve(GCC, gCy - GCZ @ beta)
+                for beta in out["beta_snp_path"]
+            ]
+        )
+        np.testing.assert_allclose(
+            out["beta_cov_path"], expected, rtol=1e-10, atol=1e-10
+        )
 
     def test_float64_hinv_inputs_match_direct_weighted_system(self):
         rng = np.random.RandomState(10)

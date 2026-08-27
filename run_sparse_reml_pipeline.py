@@ -8,8 +8,11 @@ Performance notes (vs. previous version):
     down to the active support.
   • Small KKT-violation batches receive an adaptive near-threshold buffer,
     avoiding repeated complete-path solves for one-digit follow-up violations.
-  • Same-basis coefficient paths are reused only when their per-lambda KKT
+  • Coefficient paths are remapped across every candidate expansion that
+    retains the old basis; each lambda uses the remapped row only when its KKT
     residual improves on the ordinary descending-lambda warm start.
+  • Column-major Gram storage, density-adaptive Qβ updates, and filtered exact
+    KKT matvecs accelerate coordinate descent without changing its certificate.
   • Warm-start dictionary: maps SNP index → previous PCG solution column.
     When the candidate set overlaps between iterations (common), the warm
     starts for those columns are reused — dramatically reducing PCG iterations
@@ -2257,23 +2260,23 @@ def _remap_lasso_beta_path(
     return mapped, int(common.size)
 
 
-def _allow_expanded_lasso_path_warm_start(
+def _allow_monotone_lasso_path_warm_start(
     *,
     previous_size: int,
     current_size: int,
     common_size: int,
 ) -> bool:
-    """Reuse a mapped path only for an unchanged or very slightly grown basis."""
+    """Reuse a mapped path whenever the old marker basis is fully retained.
+
+    The mapped coefficients are only initial values.  ``solve_lasso_path``
+    compares them with the ordinary descending-lambda start row by row and
+    still requires the same complete score-KKT certificate, so candidate-set
+    growth does not need an arbitrary size cutoff.
+    """
     previous = int(previous_size)
     current = int(current_size)
     common = int(common_size)
-    if previous < 1 or current < previous or common != previous:
-        return False
-    growth = current - previous
-    if growth == 0:
-        return True
-    small_growth_limit = max(16, int(np.ceil(0.02 * float(previous))))
-    return growth <= small_growth_limit
+    return bool(previous >= 1 and current >= previous and common == previous)
 
 
 def _buffered_kkt_expansion_indices(
@@ -3557,8 +3560,15 @@ def main() -> None:
         "buffered_kkt_expansion": True,
         "kkt_small_overflow_absorption": True,
         "lasso_path_coefficient_warm_start": True,
-        "lasso_path_tiny_basis_growth_warm_start": True,
+        "lasso_path_monotone_basis_warm_start": True,
+        "lasso_column_major_gram": True,
+        "lasso_density_adaptive_qb_updates": True,
+        "lasso_filtered_exact_kkt_matvec": True,
+        "lasso_batched_external_path_products": True,
+        "lasso_batched_covariate_path_solves": True,
         "lasso_path_solves": 0,
+        "lasso_path_solve_seconds": 0.0,
+        "lasso_validation_selection_seconds": 0.0,
         "lasso_cd_iterations": 0,
         "lasso_path_warm_start_rows_used": 0,
         "outer_start_candidate_columns_reused": 0,
@@ -3902,12 +3912,11 @@ def main() -> None:
                 previous_beta_path=warm_lasso_beta_path,
                 candidate=candidate,
             )
-            # Meaningful basis expansions retain the ordinary descending-
-            # lambda warm start, which was empirically faster in strong LD.
-            # Tiny tail expansions are different: remapping the complete old
-            # path avoids resolving ~2,000 unchanged coordinates for a handful
-            # of late KKT markers.
-            if not _allow_expanded_lasso_path_warm_start(
+            # A candidate expansion retains every old column.  Remap the prior
+            # complete path into that enlarged basis; the solver chooses the
+            # better initial point independently at each lambda and preserves
+            # the same complete score-KKT acceptance rule.
+            if not _allow_monotone_lasso_path_warm_start(
                 previous_size=int(warm_lasso_candidate.size),
                 current_size=int(candidate.size),
                 common_size=warm_lasso_columns,
@@ -3915,6 +3924,9 @@ def main() -> None:
                 beta_snp_path0 = None
                 warm_lasso_columns = 0
 
+            lasso_path_started = time.perf_counter()
+            lasso_path_solve_seconds = float("nan")
+            validation_selection_seconds = 0.0
             try:
                 try:
                     lasso = fit_weighted_lasso_with_covariates(
@@ -3949,7 +3961,13 @@ def main() -> None:
                         cfg=path_cfg,
                         ridge=args.lasso_ridge,
                     )
+                lasso_path_solve_seconds = float(
+                    time.perf_counter() - lasso_path_started
+                )
                 sparse_path_performance["lasso_path_solves"] += 1
+                sparse_path_performance["lasso_path_solve_seconds"] += (
+                    lasso_path_solve_seconds
+                )
                 sparse_path_performance["lasso_cd_iterations"] += int(
                     sum(int(row["cd_iter"]) for row in lasso["path"])
                 )
@@ -3967,6 +3985,7 @@ def main() -> None:
                         raise RuntimeError(
                             "Iterative validation selection context is unavailable."
                         )
+                    validation_started = time.perf_counter()
                     lasso, validation_record = (
                         _select_lasso_by_validation_prediction(
                             args=args,
@@ -3982,6 +4001,12 @@ def main() -> None:
                             validation_outcome=validation_outcome,
                         )
                     )
+                    validation_selection_seconds = float(
+                        time.perf_counter() - validation_started
+                    )
+                    sparse_path_performance[
+                        "lasso_validation_selection_seconds"
+                    ] += validation_selection_seconds
                     trace_record = {
                         "outer": int(outer),
                         "stage": (
@@ -4004,6 +4029,10 @@ def main() -> None:
                             lasso[
                                 "external_beta_path_warm_start_rows_used"
                             ]
+                        ),
+                        "lasso_path_solve_seconds": lasso_path_solve_seconds,
+                        "validation_selection_seconds": (
+                            validation_selection_seconds
                         ),
                         "theta_standardized": np.asarray(
                             theta, dtype=np.float64
@@ -4238,6 +4267,10 @@ def main() -> None:
                             "external_beta_path_warm_start_rows_used"
                         ]
                     ),
+                    "lasso_path_solve_seconds": lasso_path_solve_seconds,
+                    "validation_selection_seconds": (
+                        validation_selection_seconds
+                    ),
                     "decision": action,
                     "path_pcg_tol": path_pcg_tol,
                     "candidate_pcg_reported_res": float(np.asarray(res_all)),
@@ -4249,7 +4282,8 @@ def main() -> None:
             logger.info(
                 "[outer %s kkt %s] cand=%s active=%s lam=%.3e "
                 "max_outside=%.3e threshold=%.3e violators=%s "
-                "add=%s buffer=%s warm_cols=%s decision=%s",
+                "add=%s buffer=%s warm_cols=%s path_sec=%.1f "
+                "validation_sec=%.1f decision=%s",
                 outer,
                 kkt_round,
                 int(candidate.size),
@@ -4261,6 +4295,8 @@ def main() -> None:
                 int(expansion["n_strict_added"]),
                 int(expansion["n_buffered_added"]),
                 int(warm_lasso_columns),
+                lasso_path_solve_seconds,
+                validation_selection_seconds,
                 action,
             )
 

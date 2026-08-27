@@ -527,21 +527,26 @@ def test_kkt_expansion_budget_absorbs_only_small_overflow():
     assert SPARSE._kkt_expansion_budget(3, 2) == 2
 
 
-def test_lasso_path_warm_start_is_reused_only_for_tiny_basis_growth():
-    assert SPARSE._allow_expanded_lasso_path_warm_start(
+def test_lasso_path_warm_start_is_reused_for_any_monotone_basis_growth():
+    assert SPARSE._allow_monotone_lasso_path_warm_start(
         previous_size=2015,
         current_size=2031,
         common_size=2015,
     )
-    assert not SPARSE._allow_expanded_lasso_path_warm_start(
+    assert SPARSE._allow_monotone_lasso_path_warm_start(
         previous_size=1759,
         current_size=2015,
         common_size=1759,
     )
-    assert not SPARSE._allow_expanded_lasso_path_warm_start(
+    assert not SPARSE._allow_monotone_lasso_path_warm_start(
         previous_size=2015,
         current_size=2031,
         common_size=2000,
+    )
+    assert not SPARSE._allow_monotone_lasso_path_warm_start(
+        previous_size=2031,
+        current_size=2015,
+        common_size=2015,
     )
 
 
