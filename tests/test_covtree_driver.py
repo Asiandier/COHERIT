@@ -162,6 +162,90 @@ def test_heritability_accuracy_is_evaluation_only():
     np.testing.assert_allclose(result["absolute_h2_error"], 0.14)
 
 
+def test_h2_stability_requires_three_layers_and_rejects_one_step_false_plateau():
+    one_layer = [{"K": 1, "h2": 0.989849}]
+    two_layers = [*one_layer, {"K": 4, "h2": 0.989612}]
+    corrected = [*two_layers, {"K": 7, "h2": 0.719185}]
+
+    assert not DRIVER.h2_stability_diagnostic(
+        one_layer, tolerance=0.01
+    )["reached"]
+    assert not DRIVER.h2_stability_diagnostic(
+        two_layers, tolerance=0.01
+    )["reached"]
+    diagnostic = DRIVER.h2_stability_diagnostic(corrected, tolerance=0.01)
+    assert diagnostic["K"] == [1, 4, 7]
+    assert diagnostic["range"] > 0.25
+    assert diagnostic["reached"] is False
+
+
+def test_h2_stability_uses_range_to_distinguish_plateau_from_slow_drift():
+    stable = [
+        {"K": 13, "h2": 0.705240},
+        {"K": 16, "h2": 0.706850},
+        {"K": 19, "h2": 0.707934},
+    ]
+    drifting = [
+        {"K": 13, "h2": 0.700},
+        {"K": 16, "h2": 0.709},
+        {"K": 19, "h2": 0.718},
+    ]
+
+    stable_diagnostic = DRIVER.h2_stability_diagnostic(stable, tolerance=0.01)
+    drifting_diagnostic = DRIVER.h2_stability_diagnostic(
+        drifting, tolerance=0.01
+    )
+
+    np.testing.assert_allclose(stable_diagnostic["range"], 0.002694)
+    assert stable_diagnostic["reached"] is True
+    np.testing.assert_allclose(drifting_diagnostic["range"], 0.018)
+    assert drifting_diagnostic["reached"] is False
+
+
+def test_h2_plateau_selects_simplest_layer_for_final_refit():
+    layers = [
+        {"K": 13, "h2": 0.705240},
+        {"K": 16, "h2": 0.706850},
+        {"K": 19, "h2": 0.707934},
+    ]
+    for index in range(len(layers)):
+        layers[index]["h2_stability"] = DRIVER.h2_stability_diagnostic(
+            layers[: index + 1], tolerance=0.01
+        )
+
+    selected, reason = DRIVER.final_refit_layer(
+        layers, stop_reason="h2_stability_plateau"
+    )
+    terminal, terminal_reason = DRIVER.final_refit_layer(
+        layers, stop_reason="max_score_not_significant"
+    )
+
+    assert selected["K"] == 13
+    assert reason == "smallest_K_in_terminal_h2_plateau"
+    assert terminal["K"] == 19
+    assert terminal_reason == "terminal_fitted_layer"
+
+
+def test_h2_plateau_has_priority_over_covariance_score_stop_reason():
+    plateau = {"reached": True}
+    not_stable = {"reached": False}
+    nonsignificant = {
+        "accepted": False,
+        "stopping_reason": "max_score_not_significant",
+    }
+    significant = {"accepted": True}
+
+    assert (
+        DRIVER.covtree_data_stop_reason(nonsignificant, plateau)
+        == "h2_stability_plateau"
+    )
+    assert (
+        DRIVER.covtree_data_stop_reason(nonsignificant, not_stable)
+        == "max_score_not_significant"
+    )
+    assert DRIVER.covtree_data_stop_reason(significant, not_stable) is None
+
+
 def test_driver_exposes_no_prediction_guardrail_options():
     args = DRIVER.parse_args(
         [
@@ -185,6 +269,7 @@ def test_driver_exposes_no_prediction_guardrail_options():
     assert args.true_h2 == 0.7
     assert args.max_k == 1024
     assert args.max_splits is None
+    assert args.h2_stability_tol == 0.01
 
 
 def test_run_config_reconstructs_complete_selection_contract(tmp_path):
@@ -373,12 +458,15 @@ def test_natural_stop_automatically_runs_warm_final_refit(tmp_path, monkeypatch)
     )
 
     result = json.loads((out_dir / "covtree_result.json").read_text())
-    assert result["schema_version"] == 3
+    assert result["schema_version"] == 4
     assert result["selected_h2"] == 0.4
     assert result["final_h2"] == 0.42
     np.testing.assert_allclose(result["final_absolute_h2_error"], 0.28)
     assert result["final_refit"]["theta_warm_started_from_selection"] is True
     assert result["final_refit"]["training_data"] == "training_plus_validation"
+    assert result["h2_stability"]["reached"] is False
+    assert result["configuration"]["h2_stability_window"] == 3
+    assert result["configuration"]["h2_stability_tolerance"] == 0.01
     assert DRIVER._flag_value(captured, "--pheno-txt") == str(fit_pheno)
     assert DRIVER._flag_value(captured, "--keep-path") == str(fit_keep)
     assert "--sparsity-validation-pheno-txt" not in captured

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Heritability-first CovTree loop around fixed-K validation-lambda COHERIT.
 
-Covariance-score evidence alone decides whether a GRM split is fitted and
-retained.  Validation prediction remains inside each fixed-K fit to select the
-Lasso lambda, but it never accepts, rejects, or rolls back a CovTree layer.
+Covariance-score evidence selects each proposed GRM split.  After a fitted
+layer, a three-layer h2 plateau can stop further splitting and choose the
+smallest K in that practically equivalent window for final refitting.
+Validation prediction remains inside each fixed-K fit to select the Lasso
+lambda, but it never selects K.
 """
 from __future__ import annotations
 
@@ -22,6 +24,7 @@ import numpy as np
 
 
 REPO_ROOT = Path(__file__).resolve().parent
+H2_STABILITY_WINDOW = 3
 
 
 def _now() -> str:
@@ -133,6 +136,98 @@ def heritability_accuracy(
         "signed_h2_bias": signed_bias,
         "absolute_h2_error": abs(signed_bias),
     }
+
+
+def h2_stability_diagnostic(
+    layers: Sequence[dict[str, object]],
+    *,
+    tolerance: float,
+) -> dict[str, object]:
+    """Detect a practical h2 plateau without using simulation truth.
+
+    A single small parent-to-child change is unsafe: an early split can expose
+    heterogeneity that only changes total h2 after a later split.  We therefore
+    require the latest three converged fixed-K estimates to lie inside one
+    absolute-h2 band.  Using the range also prevents two small changes in the
+    same direction from being mistaken for a plateau.
+    """
+    tol = float(tolerance)
+    if not math.isfinite(tol) or not 0.0 < tol < 1.0:
+        raise ValueError("h2 stability tolerance must lie in (0, 1).")
+
+    estimates: list[tuple[int, float]] = []
+    for layer in layers:
+        k = int(layer["K"])
+        h2 = float(layer["h2"])
+        if k < 1 or not math.isfinite(h2) or not 0.0 <= h2 <= 1.0:
+            raise ValueError("CovTree layers contain an invalid K or h2 estimate.")
+        if estimates and k <= estimates[-1][0]:
+            raise ValueError("CovTree K values must increase strictly across layers.")
+        estimates.append((k, h2))
+
+    window = estimates[-H2_STABILITY_WINDOW:]
+    enough_history = len(window) == H2_STABILITY_WINDOW
+    h2_values = [value for _, value in window]
+    h2_range = (
+        float(max(h2_values) - min(h2_values))
+        if enough_history
+        else None
+    )
+    reached = bool(
+        enough_history
+        and h2_range is not None
+        and (
+            h2_range <= tol
+            or math.isclose(h2_range, tol, rel_tol=1e-12, abs_tol=1e-15)
+        )
+    )
+    return {
+        "criterion": "latest_three_h2_range_at_most_tolerance",
+        "window_size": H2_STABILITY_WINDOW,
+        "tolerance": tol,
+        "n_available_layers": len(estimates),
+        "enough_history": enough_history,
+        "K": [k for k, _ in window],
+        "h2": h2_values,
+        "range": h2_range,
+        "reached": reached,
+    }
+
+
+def final_refit_layer(
+    layers: Sequence[dict[str, object]],
+    *,
+    stop_reason: str,
+) -> tuple[dict[str, object], str]:
+    """Choose the simplest practically equivalent layer at an h2 plateau."""
+    if not layers:
+        raise ValueError("CovTree final selection requires at least one layer.")
+    if stop_reason != "h2_stability_plateau":
+        return layers[-1], "terminal_fitted_layer"
+
+    diagnostic = layers[-1].get("h2_stability")
+    if not isinstance(diagnostic, dict) or not bool(diagnostic.get("reached")):
+        raise ValueError("h2 plateau stopping lacks a reached stability diagnostic.")
+    window_k = diagnostic.get("K")
+    if not isinstance(window_k, list) or len(window_k) != H2_STABILITY_WINDOW:
+        raise ValueError("h2 plateau diagnostic has a malformed K window.")
+    target_k = int(window_k[0])
+    matches = [layer for layer in layers if int(layer["K"]) == target_k]
+    if len(matches) != 1:
+        raise ValueError("h2 plateau start does not identify exactly one fitted layer.")
+    return matches[0], "smallest_K_in_terminal_h2_plateau"
+
+
+def covtree_data_stop_reason(
+    diagnostic: dict[str, object],
+    h2_stability: dict[str, object],
+) -> str | None:
+    """Apply target-estimator stability before covariance fit diagnostics."""
+    if bool(h2_stability.get("reached", False)):
+        return "h2_stability_plateau"
+    if not bool(diagnostic.get("accepted", False)):
+        return str(diagnostic.get("stopping_reason") or "score_not_accepted")
+    return None
 
 
 _VALUE_FLAGS_TO_REPLACE = {
@@ -279,6 +374,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--bootstrap-draws", type=int, default=199)
     parser.add_argument("--bootstrap-seed", type=int, default=20260827)
     parser.add_argument("--score-alpha", type=float, default=0.05)
+    parser.add_argument(
+        "--h2-stability-tol",
+        type=float,
+        default=0.01,
+        help=(
+            "Stop before another split when the latest three converged "
+            "fixed-K h2 estimates have max-minus-min no larger than this "
+            "absolute tolerance."
+        ),
+    )
     parser.add_argument("--rank-rtol", type=float, default=1e-7)
     parser.add_argument("--min-child-markers", type=int, default=16)
     parser.add_argument(
@@ -435,6 +540,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.score_alpha
     ) < 1.0:
         raise ValueError("score_alpha must lie in (0, 1).")
+    if not math.isfinite(float(args.h2_stability_tol)) or not 0.0 < float(
+        args.h2_stability_tol
+    ) < 1.0:
+        raise ValueError("h2_stability_tol must lie in (0, 1).")
     if args.true_h2 is not None and (
         not math.isfinite(float(args.true_h2))
         or not 0.0 <= float(args.true_h2) <= 1.0
@@ -535,6 +644,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             "elapsed_sec": float(initial_summary["elapsed_sec"]),
         }
     ]
+    layers[0]["h2_stability"] = h2_stability_diagnostic(
+        layers,
+        tolerance=float(args.h2_stability_tol),
+    )
     current_diagnostic = initial_diagnostic
     initial_state_metadata = initial_summary.get("sparse_state_out")
     current_sparse_state = (
@@ -547,8 +660,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     step = 0
     while True:
-        if not bool(current_diagnostic.get("accepted", False)):
-            stop_reason = current_diagnostic.get("stopping_reason") or "score_not_accepted"
+        data_stop_reason = covtree_data_stop_reason(
+            current_diagnostic,
+            layers[-1]["h2_stability"],
+        )
+        if data_stop_reason is not None:
+            stop_reason = data_stop_reason
             break
         next_k = int(current_diagnostic["next_k"])
         if next_k > int(args.max_k):
@@ -654,6 +771,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             "next_split_adjusted_p": diagnostic.get("max_score_adjusted_p"),
         }
         layers.append(record)
+        record["h2_stability"] = h2_stability_diagnostic(
+            layers,
+            tolerance=float(args.h2_stability_tol),
+        )
         _atomic_json(layer_dir / "layer_result.json", record)
         print(
             "[covtree-h2] K=%s h2=%.8f absolute_error=%s "
@@ -674,7 +795,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         current_sparse_state = sparse_state_out
 
     accepted_layers = [layer for layer in layers if bool(layer["accepted"])]
-    selected = accepted_layers[-1]
+    terminal_layer = accepted_layers[-1]
+    selected, selection_reason = final_refit_layer(
+        accepted_layers,
+        stop_reason=str(stop_reason),
+    )
+    for layer in accepted_layers:
+        layer["selected_for_final_refit"] = layer is selected
     selected_summary_path = Path(str(selected["summary"])).expanduser().resolve(
         strict=True
     )
@@ -768,17 +895,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         if key != "true_h2"
     }
     result = {
-        "schema_version": 3,
-        "algorithm": "coherit_covtree_heritability_first_v3",
+        "schema_version": 4,
+        "algorithm": "coherit_covtree_heritability_first_v4",
         "case_id": args.case_id,
         "status": "complete",
         "created_at": _now(),
         "stop_reason": stop_reason,
+        "selection_reason": selection_reason,
+        "last_evaluated_step": int(terminal_layer["step"]),
+        "last_evaluated_K": int(terminal_layer["K"]),
+        "last_evaluated_h2": float(terminal_layer["h2"]),
         "selected_step": int(selected["step"]),
         "selected_K": int(selected["K"]),
         "selected_h2": float(selected["h2"]),
         **heritability_accuracy(float(selected["h2"]), args.true_h2),
         "selected_summary": selected["summary"],
+        "h2_stability": terminal_layer["h2_stability"],
+        "selected_h2_stability": selected["h2_stability"],
         "layers": layers,
         "final_h2": final_h2,
         **final_top_level_accuracy,
@@ -805,9 +938,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
             "score_alpha": float(args.score_alpha),
             "bootstrap_draws": int(args.bootstrap_draws),
+            "h2_stability_window": H2_STABILITY_WINDOW,
+            "h2_stability_tolerance": float(args.h2_stability_tol),
+            "h2_stability_model_choice": (
+                "smallest_K_in_terminal_stability_window"
+            ),
             "lambda_selection": "validation_r2_inside_each_fixed_K_inner_fit",
             "split_selection": "covariance_contrast_parametric_max_bootstrap",
-            "layer_acceptance": "layer_wise_max_bootstrap_p_only",
+            "layer_acceptance": (
+                "layer_wise_max_bootstrap_p_and_no_three_layer_h2_plateau"
+            ),
             "prediction_role": "lambda_selection_and_audit_only_not_K_selection",
             "final_refit": (
                 "automatic_train_plus_validation_with_frozen_partition_"
