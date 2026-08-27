@@ -52,7 +52,13 @@ def test_covtree_candidates_are_genotype_only_deterministic_and_complete():
         min_child_markers=2,
     )
 
-    assert rejected == []
+    assert {
+        (item["split_kind"], item["reason"].split(":", 1)[0])
+        for item in rejected
+    } == {
+        ("ld4_tree", "recursive_feature_split_failed"),
+        ("maf4_tree", "recursive_feature_split_failed"),
+    }
     assert [candidate.split_kind for candidate in first] == [
         "ld2",
         "maf2",
@@ -123,30 +129,25 @@ def test_selective_split_and_warm_start_replace_only_one_parent():
     assert updated[-1].name == first_split[-1].name
 
 
-def test_recursive_depth_three_candidate_can_replace_parent():
+def test_recursive_four_way_candidate_can_replace_parent():
     components = ADAPTIVE.single_component(16)
     candidates, _ = COVTREE.generate_covtree_candidates(
         components,
         ld_score=np.expm1(np.arange(16, dtype=np.float64) / 4.0),
         heterozygosity=np.asarray(([0.1, 0.4] * 8), dtype=np.float64),
         min_child_markers=1,
-        max_univariate_depth=3,
     )
 
-    candidate = next(item for item in candidates if item.split_kind == "ld8_tree")
+    candidate = next(item for item in candidates if item.split_kind == "ld4_tree")
     updated = COVTREE.replace_parent(components, candidate)
 
-    assert len(updated) == 8
-    assert [component.variant_indices.size for component in updated] == [2] * 8
+    assert len(updated) == 4
+    assert [component.variant_indices.size for component in updated] == [4] * 4
     assert [component.annotation["child_label"] for component in updated] == [
-        "lll",
-        "llh",
-        "lhl",
-        "lhh",
-        "hll",
-        "hlh",
-        "hhl",
-        "hhh",
+        "ll",
+        "lh",
+        "hl",
+        "hh",
     ]
 
 
@@ -160,29 +161,27 @@ def test_trace_orthogonal_contrasts_have_full_expected_rank():
     np.testing.assert_allclose(contrasts.T @ contrasts, np.eye(3), atol=1e-10)
 
 
-def test_bootstrap_conditional_score_selects_strong_candidate():
+def test_bootstrap_max_score_selects_strong_candidate():
     rng = np.random.default_rng(19)
     bootstrap_scores = rng.multivariate_normal(
-        np.zeros(3),
+        np.zeros(2),
         np.asarray(
             [
-                [1.0, 0.4, 0.1],
-                [0.4, 1.0, 0.0],
-                [0.1, 0.0, 1.0],
+                [1.0, 0.1],
+                [0.1, 1.0],
             ]
         ),
         size=2000,
     ).T
-    trace = np.asarray([10.0, 12.0, 14.0])
+    trace = np.asarray([12.0, 14.0])
     bootstrap_quadratics = trace[:, None] + 2.0 * bootstrap_scores
-    observed_scores = np.asarray([0.1, 5.0, 0.2])
+    observed_scores = np.asarray([5.0, 0.2])
     observed_quadratics = trace + 2.0 * observed_scores
 
-    result = COVTREE.bootstrap_conditional_statistics(
+    result = COVTREE.bootstrap_max_score_statistics(
         observed_quadratics=observed_quadratics,
         bootstrap_quadratics=bootstrap_quadratics,
-        nuisance_count=1,
-        candidate_slices=[(1, 2), (2, 3)],
+        candidate_slices=[(0, 1), (1, 2)],
     )
 
     assert result["best_candidate_index"] == 0

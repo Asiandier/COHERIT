@@ -56,9 +56,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--alpha", type=float, default=0.05)
     parser.add_argument("--rank-rtol", type=float, default=1e-7)
     parser.add_argument("--min-child-markers", type=int, default=16)
-    parser.add_argument("--max-univariate-depth", type=int, default=2)
-    parser.add_argument("--parent-theta-abs-min", type=float, default=1e-6)
-    parser.add_argument("--parent-theta-rel-min", type=float, default=1e-4)
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args(argv)
 
@@ -320,9 +317,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         replay_args = argparse.Namespace(
             covtree_ld_score=str(Path(args.ld_score).expanduser().resolve(strict=True)),
             covtree_min_child_markers=int(args.min_child_markers),
-            covtree_max_univariate_depth=int(args.max_univariate_depth),
-            covtree_parent_theta_abs_min=float(args.parent_theta_abs_min),
-            covtree_parent_theta_rel_min=float(args.parent_theta_rel_min),
             covtree_bootstrap_draws=int(args.bootstrap_draws),
             covtree_bootstrap_seed=int(args.bootstrap_seed),
             covtree_alpha=float(args.alpha),

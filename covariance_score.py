@@ -10,7 +10,7 @@ import numpy as np
 
 from .covtree import (
     CovTreeCandidate,
-    bootstrap_conditional_statistics,
+    bootstrap_max_score_statistics,
     trace_orthogonal_contrasts,
 )
 from .geno_stream import _ensure_on_device
@@ -307,17 +307,11 @@ def evaluate_covtree_candidates(
     significance = float(alpha)
     if not np.isfinite(significance) or not 0.0 < significance < 1.0:
         raise ValueError("alpha must lie in (0, 1).")
-
     candidate_definitions, relative_slices, candidate_metadata = (
         _candidate_contrast_definitions(
             streamer, grm_index, candidates
         )
     )
-    nuisance_count = len(ops.K_mvs) + 1
-    candidate_slices = [
-        (nuisance_count + start, nuisance_count + stop)
-        for start, stop in relative_slices
-    ]
 
     bootstrap_residual = sample_partitioned_null_residuals(
         streamer,
@@ -371,26 +365,12 @@ def evaluate_covtree_candidates(
         "projected_information_diagonal": projected_information.astype(np.float32),
     }
     valid = np.asarray(streamer._inv_sds_host, dtype=np.float64) > 0.0
-    atom_count = nuisance_count + sum(
+    atom_count = sum(
         int(definition["contrasts"].shape[1])
         for definition in candidate_definitions
     )
     quadratics = np.empty((atom_count, projected.shape[1]), dtype=np.float64)
-    for component_index in range(grm_index.n_grm):
-        start = int(grm_index.offsets[component_index])
-        stop = int(grm_index.offsets[component_index + 1])
-        component_valid = valid[start:stop]
-        effective = int(np.count_nonzero(component_valid))
-        if effective <= 0:
-            raise RuntimeError("CovTree nuisance component has no effective markers.")
-        values = marker_projection[start:stop][component_valid]
-        quadratics[component_index] = np.einsum(
-            "ij,ij->j", values, values, dtype=np.float64, optimize=True
-        ) / float(effective)
-    quadratics[grm_index.n_grm] = np.einsum(
-        "ij,ij->j", projected, projected, dtype=np.float64, optimize=True
-    )
-    atom_cursor = nuisance_count
+    atom_cursor = 0
     for definition in candidate_definitions:
         child_quadratics = []
         for indices, effective in zip(
@@ -415,11 +395,10 @@ def evaluate_covtree_candidates(
         quadratics[atom_cursor:stop] = contrast_quadratics
         atom_cursor = stop
 
-    inference = bootstrap_conditional_statistics(
+    inference = bootstrap_max_score_statistics(
         observed_quadratics=quadratics[:, 0],
         bootstrap_quadratics=quadratics[:, 1:],
-        nuisance_count=nuisance_count,
-        candidate_slices=candidate_slices,
+        candidate_slices=relative_slices,
         rank_rtol=float(rank_rtol),
     )
     for metadata, result in zip(
@@ -436,7 +415,7 @@ def evaluate_covtree_candidates(
     )
     selected = candidates[int(best_index)] if accepted else None
     summary = {
-        "method": "nuisance_adjusted_reml_score_parametric_max_bootstrap",
+        "method": "covariance_contrast_parametric_max_bootstrap",
         "bootstrap_generation": "streamed_gaussian_from_fitted_partitioned_covariance",
         "trace_estimator": "parametric_bootstrap_mean_quadratic",
         "information_estimator": "parametric_bootstrap_score_covariance",
@@ -453,18 +432,10 @@ def evaluate_covtree_candidates(
         ],
         "bootstrap_draws": int(bootstrap_draws),
         "rank_rtol": float(rank_rtol),
-        "nuisance_atom_count": nuisance_count,
         "candidate_count": len(candidates),
-        "candidate_contrast_count": int(atom_count - nuisance_count),
+        "candidate_contrast_count": int(atom_count),
         "quadratic_backend": "single_Xt_Pe_pass_then_marker_group_reduction",
         "candidates": candidate_metadata,
-        "nuisance_information": inference["nuisance_information"],
-        "nuisance_information_eigenvalues": inference[
-            "nuisance_information_eigenvalues"
-        ],
-        "nuisance_information_rank": inference["nuisance_information_rank"],
-        "nuisance_expected_rank": inference["nuisance_expected_rank"],
-        "nuisance_observed_scores": inference["observed_scores"][:nuisance_count],
         "pcg": projector.solve_diagnostics,
     }
     return summary, selected, marker_scores

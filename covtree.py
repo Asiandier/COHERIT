@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from typing import Sequence
 
 import numpy as np
-from scipy.stats import chi2
 
 from .adaptive_partition import (
     AdaptiveComponent,
@@ -34,16 +33,15 @@ def _intersect_sorted(left: np.ndarray, right: np.ndarray) -> np.ndarray:
     return np.intersect1d(left, right, assume_unique=True)
 
 
-def _recursive_feature_leaves(
+def _four_way_feature_leaves(
     parent_indices: np.ndarray,
     feature: np.ndarray,
     *,
-    depth: int,
     min_child_markers: int,
     feature_name: str,
 ) -> tuple[np.ndarray, ...]:
     leaves = [np.asarray(parent_indices, dtype=np.int64)]
-    for _ in range(int(depth)):
+    for _ in range(2):
         next_leaves: list[np.ndarray] = []
         for leaf in leaves:
             leaf_values = np.asarray(feature[leaf], dtype=np.float64)
@@ -69,25 +67,21 @@ def generate_covtree_candidates(
     ld_score: np.ndarray,
     heterozygosity: np.ndarray,
     min_child_markers: int = 2,
-    max_univariate_depth: int = 1,
 ) -> tuple[list[CovTreeCandidate], list[dict[str, object]]]:
-    """Generate recursive LD/MAF and LD-by-MAF candidates in each parent.
+    """Generate LD/MAF two-way and four-way candidates in each parent.
 
     The cuts use exact deterministic one-dimensional two-means on
     ``log1p(LD score)`` and ``log(2p(1-p))``.  Phenotype values never enter
-    candidate construction.  Depth one yields LD-2 and MAF-2; larger depths
-    recursively bisect every leaf and yield 4, 8, ... children.
+    candidate construction.  Each parent proposes LD-2, MAF-2, recursive
+    LD-4, recursive MAF-4, and LD-by-MAF-4 whenever those partitions exist.
     """
     ld = np.asarray(ld_score, dtype=np.float64).reshape(-1)
     het = np.asarray(heterozygosity, dtype=np.float64).reshape(-1)
     minimum = int(min_child_markers)
-    maximum_depth = int(max_univariate_depth)
     if ld.shape != het.shape or ld.size == 0:
         raise ValueError("ld_score and heterozygosity must have matching lengths.")
     if minimum < 1:
         raise ValueError("min_child_markers must be >= 1.")
-    if maximum_depth < 1 or maximum_depth > 10:
-        raise ValueError("max_univariate_depth must lie in 1..10.")
     if not np.all(np.isfinite(ld)) or np.any(ld < 0.0):
         raise ValueError("ld_score must be finite and nonnegative.")
     if not np.all(np.isfinite(het)) or np.any(het <= 0.0):
@@ -171,38 +165,34 @@ def generate_covtree_candidates(
                     diagnostics={**common, **feature_diag},
                 )
             )
-            for depth in range(2, maximum_depth + 1):
-                try:
-                    feature_children = _recursive_feature_leaves(
-                        parent_indices,
-                        feature_values,
-                        depth=depth,
-                        min_child_markers=minimum,
-                        feature_name=feature_name,
-                    )
-                except (ValueError, IndexError) as error:
-                    rejected.append(
-                        {
-                            "parent_index": int(parent_index),
-                            "parent_name": parent.name,
-                            "split_kind": f"{feature_name}{2**depth}_tree",
-                            "reason": f"recursive_feature_split_failed:{error}",
-                        }
-                    )
-                    break
+            try:
+                feature_children = _four_way_feature_leaves(
+                    parent_indices,
+                    feature_values,
+                    min_child_markers=minimum,
+                    feature_name=feature_name,
+                )
+            except (ValueError, IndexError) as error:
+                rejected.append(
+                    {
+                        "parent_index": int(parent_index),
+                        "parent_name": parent.name,
+                        "split_kind": f"{feature_name}4_tree",
+                        "reason": f"recursive_feature_split_failed:{error}",
+                    }
+                )
+            else:
                 candidates.append(
                     CovTreeCandidate(
-                        name=(
-                            f"p{parent_index:04d}__{feature_name}{2**depth}_tree"
-                        ),
+                        name=f"p{parent_index:04d}__{feature_name}4_tree",
                         parent_index=int(parent_index),
                         parent_name=parent.name,
-                        split_kind=f"{feature_name}{2**depth}_tree",
+                        split_kind=f"{feature_name}4_tree",
                         children=feature_children,
                         diagnostics={
                             **common,
                             "recursive_feature": feature_name,
-                            "recursive_depth": int(depth),
+                            "recursive_depth": 2,
                             "cut_method": "recursive_exact_1d_two_means",
                         },
                     )
@@ -382,28 +372,27 @@ def selective_covariance_warm_start(
     )
 
 
-def bootstrap_conditional_statistics(
+def bootstrap_max_score_statistics(
     *,
     observed_quadratics: np.ndarray,
     bootstrap_quadratics: np.ndarray,
-    nuisance_count: int,
     candidate_slices: Sequence[tuple[int, int]],
     rank_rtol: float = 1e-7,
 ) -> dict[str, object]:
-    """Compute efficient score tests and a layer-wise max-score bootstrap.
+    """Compute covariance-contrast scores and a layer-wise max bootstrap.
 
-    Quadratics are ``(P e)' A (P e)`` for nuisance atoms followed by all
-    candidate contrast atoms.  Their bootstrap means estimate ``tr(PA)``;
-    their bootstrap covariance estimates the expected score information.
+    Quadratics are ``(P e)' A (P e)`` for all candidate contrast atoms.
+    Their bootstrap means estimate ``tr(PA)`` and their bootstrap covariance
+    estimates the score information.  The bootstrap distribution of the
+    largest candidate statistic accounts for searching all splits in a layer.
     """
     observed = np.asarray(observed_quadratics, dtype=np.float64).reshape(-1)
     boot = np.asarray(bootstrap_quadratics, dtype=np.float64)
-    nuisance = int(nuisance_count)
     rtol = float(rank_rtol)
     if boot.ndim != 2 or boot.shape[0] != observed.size or boot.shape[1] < 3:
         raise ValueError("bootstrap_quadratics must have shape (n_atoms, B>=3).")
-    if nuisance < 1 or nuisance >= observed.size:
-        raise ValueError("nuisance_count must leave at least one candidate atom.")
+    if observed.size == 0:
+        raise ValueError("At least one candidate contrast atom is required.")
     if not np.all(np.isfinite(observed)) or not np.all(np.isfinite(boot)):
         raise ValueError("quadratics must be finite.")
     if not np.isfinite(rtol) or rtol <= 0.0:
@@ -412,75 +401,57 @@ def bootstrap_conditional_statistics(
     trace = np.mean(boot, axis=1)
     observed_score = 0.5 * (observed - trace)
     bootstrap_score = 0.5 * (boot - trace[:, None])
-    information = np.cov(bootstrap_score, bias=False)
-    information = 0.5 * (information + information.T)
-    eta = np.arange(nuisance, dtype=np.int64)
-    info_eta = information[np.ix_(eta, eta)]
-    nuisance_eigenvalues = np.linalg.eigvalsh(info_eta)
-    nuisance_scale = max(
-        float(np.max(np.abs(nuisance_eigenvalues))), np.finfo(float).tiny
-    )
-    nuisance_rank = int(
-        np.count_nonzero(nuisance_eigenvalues > rtol * nuisance_scale)
-    )
-    pinv_eta = np.linalg.pinv(info_eta, rcond=rtol, hermitian=True)
 
     candidate_results: list[dict[str, object]] = []
     bootstrap_statistics: list[np.ndarray] = []
     for start, stop in candidate_slices:
-        if start < nuisance or stop <= start or stop > observed.size:
+        if start < 0 or stop <= start or stop > observed.size:
             raise ValueError("candidate_slices contain an invalid atom range.")
         d = np.arange(int(start), int(stop), dtype=np.int64)
-        info_dd = information[np.ix_(d, d)]
-        info_deta = information[np.ix_(d, eta)]
-        adjustment = info_deta @ pinv_eta
-        conditional = info_dd - adjustment @ information[np.ix_(eta, d)]
-        conditional = 0.5 * (conditional + conditional.T)
-        eigenvalues = np.linalg.eigvalsh(conditional)
-        scale = max(float(np.max(np.abs(eigenvalues))), np.finfo(float).tiny)
-        rank = int(np.count_nonzero(eigenvalues > rtol * scale))
-        expected_rank = int(stop - start)
-        efficient_observed = observed_score[d] - adjustment @ observed_score[eta]
-        efficient_bootstrap = (
-            bootstrap_score[d] - adjustment @ bootstrap_score[eta]
+        candidate_bootstrap_score = bootstrap_score[d]
+        candidate_information = np.cov(candidate_bootstrap_score, bias=False)
+        if candidate_information.ndim == 0:
+            candidate_information = candidate_information.reshape(1, 1)
+        candidate_information = 0.5 * (
+            candidate_information + candidate_information.T
         )
-        if rank > 0:
-            inverse = np.linalg.pinv(conditional, rcond=rtol, hermitian=True)
-            statistic = float(efficient_observed @ inverse @ efficient_observed)
-            statistic_boot = np.einsum(
+        expected_rank = int(stop - start)
+        eigenvalues = np.linalg.eigvalsh(candidate_information)
+        scale = max(
+            float(np.max(np.abs(eigenvalues))), np.finfo(float).tiny
+        )
+        rank = int(np.count_nonzero(eigenvalues > rtol * scale))
+        rank_sufficient = rank == expected_rank
+        if rank_sufficient:
+            inverse = np.linalg.pinv(
+                candidate_information, rcond=rtol, hermitian=True
+            )
+            statistic = float(observed_score[d] @ inverse @ observed_score[d])
+            statistic_bootstrap = np.einsum(
                 "ib,ij,jb->b",
-                efficient_bootstrap,
+                candidate_bootstrap_score,
                 inverse,
-                efficient_bootstrap,
+                candidate_bootstrap_score,
                 optimize=True,
             )
-            statistic_boot = np.maximum(statistic_boot, 0.0)
-            naive_p = float(chi2.sf(statistic, rank))
-            empirical_p = float(
-                (1 + np.count_nonzero(statistic_boot >= statistic))
-                / (boot.shape[1] + 1)
-            )
+            statistic_bootstrap = np.maximum(statistic_bootstrap, 0.0)
         else:
             statistic = float("nan")
-            statistic_boot = np.full(boot.shape[1], np.nan)
-            naive_p = float("nan")
-            empirical_p = float("nan")
+            statistic_bootstrap = np.full(boot.shape[1], np.nan)
         candidate_results.append(
             {
                 "atom_start": int(start),
                 "atom_stop": int(stop),
                 "expected_rank": expected_rank,
                 "rank": rank,
-                "rank_sufficient": bool(rank == expected_rank),
-                "conditional_information": conditional.tolist(),
-                "conditional_information_eigenvalues": eigenvalues.tolist(),
-                "efficient_score": efficient_observed.tolist(),
+                "rank_sufficient": rank_sufficient,
+                "information": candidate_information.tolist(),
+                "information_eigenvalues": eigenvalues.tolist(),
+                "score": observed_score[d].tolist(),
                 "statistic": statistic,
-                "naive_chi_square_p": naive_p,
-                "candidate_bootstrap_p": empirical_p,
             }
         )
-        bootstrap_statistics.append(statistic_boot)
+        bootstrap_statistics.append(statistic_bootstrap)
 
     eligible = [
         index
@@ -488,7 +459,9 @@ def bootstrap_conditional_statistics(
         if result["rank_sufficient"] and np.isfinite(result["statistic"])
     ]
     if eligible:
-        best_index = max(eligible, key=lambda index: candidate_results[index]["statistic"])
+        best_index = max(
+            eligible, key=lambda index: candidate_results[index]["statistic"]
+        )
         max_bootstrap = np.max(
             np.stack([bootstrap_statistics[index] for index in eligible], axis=0),
             axis=0,
@@ -507,10 +480,6 @@ def bootstrap_conditional_statistics(
     return {
         "trace_estimates": trace.tolist(),
         "observed_scores": observed_score.tolist(),
-        "nuisance_information": info_eta.tolist(),
-        "nuisance_information_eigenvalues": nuisance_eigenvalues.tolist(),
-        "nuisance_information_rank": nuisance_rank,
-        "nuisance_expected_rank": nuisance,
         "candidates": candidate_results,
         "best_candidate_index": best_index,
         "max_score_adjusted_p": adjusted_p,
@@ -522,7 +491,7 @@ def bootstrap_conditional_statistics(
 
 __all__ = [
     "CovTreeCandidate",
-    "bootstrap_conditional_statistics",
+    "bootstrap_max_score_statistics",
     "generate_covtree_candidates",
     "replace_parent",
     "selective_covariance_warm_start",

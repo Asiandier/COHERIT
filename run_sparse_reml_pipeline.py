@@ -905,7 +905,7 @@ def parse_args() -> argparse.Namespace:
         "--covtree-diagnostic-out",
         default="",
         help=(
-            "Optional JSON output for nuisance-adjusted REML covariance split "
+            "Optional JSON output for REML covariance-contrast split "
             "tests under the converged fixed-K model."
         ),
     )
@@ -927,9 +927,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--covtree-alpha", type=float, default=0.05)
     p.add_argument("--covtree-rank-rtol", type=float, default=1e-7)
     p.add_argument("--covtree-min-child-markers", type=int, default=16)
-    p.add_argument("--covtree-max-univariate-depth", type=int, default=2)
-    p.add_argument("--covtree-parent-theta-abs-min", type=float, default=1e-6)
-    p.add_argument("--covtree-parent-theta-rel-min", type=float, default=1e-4)
     p.add_argument("--pheno-txt", default=env("PHENO_TXT", ""))
     p.add_argument("--covar-txt", default=env("COVAR_TXT", ""))
     p.add_argument(
@@ -3989,37 +3986,12 @@ def _run_covtree_diagnostic(
         ld_score=ld_score,
         heterozygosity=heterozygosity,
         min_child_markers=int(args.covtree_min_child_markers),
-        max_univariate_depth=int(
-            getattr(args, "covtree_max_univariate_depth", 2)
-        ),
     )
     theta_values = np.asarray(theta, dtype=np.float64).reshape(-1)
-    parent_threshold = max(
-        float(args.covtree_parent_theta_abs_min),
-        float(args.covtree_parent_theta_rel_min)
-        * max(float(np.sum(theta_values[:-1])), np.finfo(float).tiny),
-    )
     eligible_candidates = []
-    bootstrap_rank_capacity = max(
-        int(args.covtree_bootstrap_draws) - 1 - (len(components) + 1),
-        0,
-    )
     for candidate in candidates:
         parent_theta = float(theta_values[candidate.parent_index])
-        if candidate.degrees_of_freedom > bootstrap_rank_capacity:
-            candidate_rejections.append(
-                {
-                    "parent_index": int(candidate.parent_index),
-                    "parent_name": candidate.parent_name,
-                    "split_kind": candidate.split_kind,
-                    "reason": "insufficient_bootstrap_information_rank_capacity",
-                    "candidate_degrees_of_freedom": int(
-                        candidate.degrees_of_freedom
-                    ),
-                    "bootstrap_rank_capacity": bootstrap_rank_capacity,
-                }
-            )
-        elif parent_theta <= parent_threshold:
+        if parent_theta <= 0.0:
             candidate_rejections.append(
                 {
                     "parent_index": int(candidate.parent_index),
@@ -4027,7 +3999,6 @@ def _run_covtree_diagnostic(
                     "split_kind": candidate.split_kind,
                     "reason": "parent_variance_at_boundary",
                     "parent_theta": parent_theta,
-                    "threshold": parent_threshold,
                 }
             )
         else:
@@ -4086,7 +4057,7 @@ def _run_covtree_diagnostic(
             )
     else:
         inference = {
-            "method": "nuisance_adjusted_reml_score_parametric_max_bootstrap",
+            "method": "covariance_contrast_parametric_max_bootstrap",
             "accepted": False,
             "best_candidate_index": None,
             "selected_candidate_index": None,
@@ -4155,8 +4126,7 @@ def _run_covtree_diagnostic(
             "phenotype_independent": True,
         },
         "candidate_rejections": candidate_rejections,
-        "parent_theta_boundary_threshold": parent_threshold,
-        "bootstrap_rank_capacity": bootstrap_rank_capacity,
+        "parent_variance_eligibility": "strictly_positive",
         "heterozygosity_floor": heterozygosity_floor,
         "heterozygosity_floored_count": int(
             np.count_nonzero(heterozygosity_floored)
@@ -4294,19 +4264,10 @@ def main() -> None:
             raise SystemExit("covtree-bootstrap-draws must be >= 19.")
         if int(args.covtree_min_child_markers) < 1:
             raise SystemExit("covtree-min-child-markers must be >= 1.")
-        if not 1 <= int(args.covtree_max_univariate_depth) <= 10:
-            raise SystemExit("covtree-max-univariate-depth must lie in 1..10.")
-        for name in (
-            "covtree_rank_rtol",
-            "covtree_parent_theta_abs_min",
-            "covtree_parent_theta_rel_min",
+        if (
+            not np.isfinite(float(args.covtree_rank_rtol))
+            or float(args.covtree_rank_rtol) <= 0.0
         ):
-            value = float(getattr(args, name))
-            if not np.isfinite(value) or value < 0.0:
-                raise SystemExit(
-                    f"{name.replace('_', '-')} must be finite and nonnegative."
-                )
-        if float(args.covtree_rank_rtol) <= 0.0:
             raise SystemExit("covtree-rank-rtol must be > 0.")
         if (
             not np.isfinite(float(args.covtree_alpha))

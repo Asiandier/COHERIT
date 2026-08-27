@@ -154,18 +154,27 @@ _VALUE_FLAGS_TO_REPLACE = {
     "--covtree-alpha",
     "--covtree-rank-rtol",
     "--covtree-min-child-markers",
-    "--covtree-max-univariate-depth",
-    "--covtree-parent-theta-abs-min",
-    "--covtree-parent-theta-rel-min",
+}
+
+_FINAL_REFIT_VALUE_FLAGS_TO_REPLACE = {
+    "--pheno-txt",
+    "--keep-path",
+    "--prediction-bed-prefix",
+    "--prediction-covar-txt",
+    "--prediction-keep-path",
+    "--sparsity-validation-pheno-txt",
+    "--lasso-fixed-lam-ratio",
 }
 
 
-def _base_pipeline_arguments(arguments: Sequence[str]) -> list[str]:
+def _without_value_flags(
+    arguments: Sequence[str], flags: set[str]
+) -> list[str]:
     cleaned: list[str] = []
     index = 0
     while index < len(arguments):
         value = str(arguments[index])
-        if value in _VALUE_FLAGS_TO_REPLACE:
+        if value in flags:
             if index + 1 >= len(arguments):
                 raise ValueError(f"Pipeline flag lacks a value: {value}")
             index += 2
@@ -173,6 +182,18 @@ def _base_pipeline_arguments(arguments: Sequence[str]) -> list[str]:
         cleaned.append(value)
         index += 1
     return cleaned
+
+
+def _base_pipeline_arguments(arguments: Sequence[str]) -> list[str]:
+    return _without_value_flags(arguments, _VALUE_FLAGS_TO_REPLACE)
+
+
+def _final_refit_pipeline_arguments(arguments: Sequence[str]) -> list[str]:
+    """Retain runtime/model options but remove all selection-sample inputs."""
+    return _without_value_flags(
+        _base_pipeline_arguments(arguments),
+        _FINAL_REFIT_VALUE_FLAGS_TO_REPLACE,
+    )
 
 
 def _flag_value(arguments: Sequence[str], flag: str) -> str:
@@ -224,6 +245,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "was recorded."
         ),
     )
+    parser.add_argument(
+        "--fit-pheno-txt",
+        help=(
+            "Combined training+validation phenotype for the automatic final "
+            "refit. Inferred from --pipeline-run-config when available."
+        ),
+    )
+    parser.add_argument(
+        "--fit-keep",
+        help=(
+            "Combined training+validation keep file for the automatic final "
+            "refit. Inferred from --pipeline-run-config when available."
+        ),
+    )
     parser.add_argument("--ld-score", required=True)
     parser.add_argument("--out-dir", required=True)
     parser.add_argument(
@@ -246,9 +281,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--score-alpha", type=float, default=0.05)
     parser.add_argument("--rank-rtol", type=float, default=1e-7)
     parser.add_argument("--min-child-markers", type=int, default=16)
-    parser.add_argument("--max-univariate-depth", type=int, default=2)
-    parser.add_argument("--parent-theta-abs-min", type=float, default=1e-6)
-    parser.add_argument("--parent-theta-rel-min", type=float, default=1e-4)
     parser.add_argument(
         "--sparse-pipeline",
         default=str(REPO_ROOT / "run_sparse_reml_pipeline.py"),
@@ -333,6 +365,62 @@ def _selection_arguments_from_run_config(path: Path) -> list[str]:
     return arguments
 
 
+def _final_refit_inputs_from_run_config(path: Path) -> tuple[str, str]:
+    config = _read_json(path)
+    inputs = config.get("inputs")
+    if not isinstance(inputs, dict):
+        raise ValueError("run_config.json lacks an inputs object.")
+    required = ("fit_pheno_txt", "fit_keep")
+    missing = [key for key in required if not inputs.get(key)]
+    if missing:
+        raise ValueError(
+            "run_config.json lacks automatic final-refit inputs: "
+            + ", ".join(missing)
+        )
+    return str(inputs["fit_pheno_txt"]), str(inputs["fit_keep"])
+
+
+def _final_refit_command(
+    *,
+    python_bin: Path,
+    sparse_pipeline: Path,
+    original_arguments: Sequence[str],
+    component_spec: Path,
+    fit_phenotype: Path,
+    fit_keep: Path,
+    prefix: Path,
+    fixed_lam_ratio: float,
+    theta_init: Sequence[float],
+    verbose: bool,
+) -> list[str]:
+    ratio = float(fixed_lam_ratio)
+    theta = np.asarray(theta_init, dtype=np.float64).reshape(-1)
+    if not math.isfinite(ratio) or not 0.0 < ratio <= 1.0:
+        raise ValueError("Final-refit lambda ratio must lie in (0, 1].")
+    if theta.size < 2 or not np.all(np.isfinite(theta)):
+        raise ValueError("Final-refit warm-start theta is malformed.")
+    command = [
+        str(python_bin),
+        str(sparse_pipeline),
+        *_final_refit_pipeline_arguments(original_arguments),
+        "--component-spec",
+        str(component_spec),
+        "--pheno-txt",
+        str(fit_phenotype),
+        "--keep-path",
+        str(fit_keep),
+        "--out-prefix",
+        str(prefix),
+        "--lasso-fixed-lam-ratio",
+        format(ratio, ".17g"),
+        "--variance-components-init",
+        json.dumps(theta.tolist(), separators=(",", ":")),
+    ]
+    if verbose and "--verbose" not in command:
+        command.append("--verbose")
+    return command
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     if int(args.max_k) < 1:
@@ -343,8 +431,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError("bootstrap_draws must be at least 19.")
     if int(args.min_child_markers) < 1:
         raise ValueError("min_child_markers must be positive.")
-    if not 1 <= int(args.max_univariate_depth) <= 10:
-        raise ValueError("max_univariate_depth must lie in 1..10.")
     if not math.isfinite(float(args.score_alpha)) or not 0.0 < float(
         args.score_alpha
     ) < 1.0:
@@ -356,10 +442,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError("true_h2 must lie in [0, 1].")
     if not math.isfinite(float(args.rank_rtol)) or float(args.rank_rtol) <= 0.0:
         raise ValueError("rank_rtol must be finite and positive.")
-    for name in ("parent_theta_abs_min", "parent_theta_rel_min"):
-        value = float(getattr(args, name))
-        if not math.isfinite(value) or value < 0.0:
-            raise ValueError(f"{name} must be finite and nonnegative.")
     initial_dir = Path(args.initial_fit_dir).expanduser().resolve(strict=True)
     initial_summary_path = initial_dir / "coherit.summary.json"
     initial_prediction_path = initial_dir / "coherit.sparse_prediction.tsv"
@@ -379,10 +461,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     if result_path.exists():
         raise FileExistsError(f"Refusing to overwrite completed result: {result_path}")
 
-    if args.pipeline_run_config:
+    run_config_path = (
+        Path(args.pipeline_run_config).expanduser().resolve(strict=True)
+        if args.pipeline_run_config
+        else None
+    )
+    fit_phenotype_value = args.fit_pheno_txt
+    fit_keep_value = args.fit_keep
+    if run_config_path is not None:
         original_arguments = _selection_arguments_from_run_config(
-            Path(args.pipeline_run_config).expanduser().resolve(strict=True)
+            run_config_path
         )
+        inferred_fit_phenotype, inferred_fit_keep = (
+            _final_refit_inputs_from_run_config(run_config_path)
+        )
+        fit_phenotype_value = fit_phenotype_value or inferred_fit_phenotype
+        fit_keep_value = fit_keep_value or inferred_fit_keep
     else:
         trajectory_path = (
             Path(args.pipeline_trajectory).expanduser().resolve(strict=True)
@@ -395,6 +489,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         original_arguments = trajectory.get("pipeline_args")
         if not isinstance(original_arguments, list):
             raise ValueError("Initial h2_trajectory.json lacks pipeline_args.")
+    if not fit_phenotype_value or not fit_keep_value:
+        raise ValueError(
+            "Automatic final refit requires --fit-pheno-txt and --fit-keep, "
+            "or a --pipeline-run-config containing both inputs."
+        )
+    fit_phenotype = Path(fit_phenotype_value).expanduser().resolve(strict=True)
+    fit_keep = Path(fit_keep_value).expanduser().resolve(strict=True)
+    python_bin = Path(args.python_bin).expanduser().resolve(strict=True)
+    sparse_pipeline = Path(args.sparse_pipeline).expanduser().resolve(strict=True)
     validation_phenotype = Path(
         _flag_value(original_arguments, "--sparsity-validation-pheno-txt")
     ).expanduser().resolve(strict=True)
@@ -471,8 +574,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         split_out = layer_dir / "accepted_split.npz"
         sparse_state_out = layer_dir / "sparse_state.npz"
         command = [
-            str(Path(args.python_bin).expanduser().resolve(strict=True)),
-            str(Path(args.sparse_pipeline).expanduser().resolve(strict=True)),
+            str(python_bin),
+            str(sparse_pipeline),
             *base_arguments,
             "--component-spec",
             str(component_spec),
@@ -502,12 +605,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             str(float(args.rank_rtol)),
             "--covtree-min-child-markers",
             str(int(args.min_child_markers)),
-            "--covtree-max-univariate-depth",
-            str(int(args.max_univariate_depth)),
-            "--covtree-parent-theta-abs-min",
-            str(float(args.parent_theta_abs_min)),
-            "--covtree-parent-theta-rel-min",
-            str(float(args.parent_theta_rel_min)),
         ]
         if current_sparse_state is not None:
             command.extend(["--sparse-state-in", str(current_sparse_state)])
@@ -578,9 +675,101 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     accepted_layers = [layer for layer in layers if bool(layer["accepted"])]
     selected = accepted_layers[-1]
+    selected_summary_path = Path(str(selected["summary"])).expanduser().resolve(
+        strict=True
+    )
+    selected_summary = _read_json(selected_summary_path)
+    selected_k = int(selected["K"])
+    selected_lam_ratio = float(selected_summary["lasso_selected_lam_ratio"])
+    selected_theta = np.asarray(
+        selected_summary["var_components_lasso_ml"], dtype=np.float64
+    )
+    if selected_theta.shape != (selected_k + 1,):
+        raise ValueError("Selected layer has a malformed covariance warm start.")
+    selected_component_spec = Path(
+        str(selected_summary["component_spec"])
+    ).expanduser().resolve(strict=True)
+
+    final_dir = out_dir / f"final_refit_K{selected_k}"
+    final_dir.mkdir(parents=True, exist_ok=True)
+    final_prefix = final_dir / "coherit"
+    final_summary_path = Path(str(final_prefix) + ".summary.json")
+    if not final_summary_path.is_file():
+        partial_outputs = list(final_dir.glob("coherit.*"))
+        if partial_outputs:
+            raise RuntimeError(
+                f"Incomplete automatic final-refit outputs exist; inspect {final_dir}."
+            )
+        final_command = _final_refit_command(
+            python_bin=python_bin,
+            sparse_pipeline=sparse_pipeline,
+            original_arguments=original_arguments,
+            component_spec=selected_component_spec,
+            fit_phenotype=fit_phenotype,
+            fit_keep=fit_keep,
+            prefix=final_prefix,
+            fixed_lam_ratio=selected_lam_ratio,
+            theta_init=selected_theta,
+            verbose=bool(args.verbose),
+        )
+        print(
+            "[covtree-final] fitting training+validation with frozen "
+            f"K={selected_k}, lambda ratio={selected_lam_ratio:.8g}, "
+            "and selection-theta warm start",
+            flush=True,
+        )
+        _run(final_command, final_dir / "runner.log")
+
+    final_summary = _read_json(final_summary_path)
+    if int(final_summary.get("sparse_output_schema_version", -1)) != 7:
+        raise RuntimeError("Automatic final refit used an incompatible output schema.")
+    if int(final_summary["n_grms"]) != selected_k:
+        raise RuntimeError("Automatic final refit returned an unexpected K.")
+    for field in (
+        "lasso_branch_valid",
+        "alpha_theta_pair_usable",
+        "lasso_ml_outer_converged",
+        "all_requested_estimators_valid",
+    ):
+        if not bool(final_summary.get(field, False)):
+            raise RuntimeError(f"Automatic final refit failed validity check: {field}.")
+    if str(final_summary.get("lambda_selection_method")) != "fixed_lam_ratio":
+        raise RuntimeError("Automatic final refit did not freeze lambda ratio.")
+    if str(final_summary.get("lasso_path_role")) != "frozen_ratio_target_only":
+        raise RuntimeError("Automatic final refit did not solve only the frozen ratio.")
+    if int(final_summary.get("lasso_path_points_solved", -1)) not in {1, 2}:
+        raise RuntimeError("Automatic final refit solved an unexpected Lasso path.")
+    if bool(final_summary.get("validation_selection_inside_outer_loop", True)):
+        raise RuntimeError("Automatic final refit unexpectedly reselected lambda.")
+    returned_ratio = float(final_summary["lasso_selected_lam_ratio"])
+    if not math.isclose(
+        returned_ratio, selected_lam_ratio, rel_tol=1e-12, abs_tol=1e-12
+    ):
+        raise RuntimeError("Automatic final refit changed the selected lambda ratio.")
+    initial_theta = np.asarray(
+        final_summary.get("variance_components_initial"), dtype=np.float64
+    )
+    if initial_theta.shape != selected_theta.shape or not np.allclose(
+        initial_theta, selected_theta, rtol=0.0, atol=1e-12
+    ):
+        raise RuntimeError("Automatic final refit did not use selection theta warm start.")
+    if str(final_summary.get("variance_components_init_source")) != "command_line_json":
+        raise RuntimeError("Automatic final refit did not record an explicit warm start.")
+    if int(final_summary["n_samples"]) <= int(selected_summary["n_samples"]):
+        raise RuntimeError(
+            "Automatic final refit did not increase from training to "
+            "training+validation samples."
+        )
+    final_h2 = float(final_summary["h2_chive_guarded"])
+    final_accuracy = heritability_accuracy(final_h2, args.true_h2)
+    final_top_level_accuracy = {
+        f"final_{key}": value
+        for key, value in final_accuracy.items()
+        if key != "true_h2"
+    }
     result = {
-        "schema_version": 2,
-        "algorithm": "coherit_covtree_heritability_first_v2",
+        "schema_version": 3,
+        "algorithm": "coherit_covtree_heritability_first_v3",
         "case_id": args.case_id,
         "status": "complete",
         "created_at": _now(),
@@ -591,6 +780,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         **heritability_accuracy(float(selected["h2"]), args.true_h2),
         "selected_summary": selected["summary"],
         "layers": layers,
+        "final_h2": final_h2,
+        **final_top_level_accuracy,
+        "final_refit": {
+            "status": "complete",
+            "training_samples": int(final_summary["n_samples"]),
+            "training_data": "training_plus_validation",
+            "partition_frozen_before_refit": True,
+            "component_spec": str(selected_component_spec),
+            "lambda_ratio_frozen_before_refit": True,
+            "fixed_lam_ratio": selected_lam_ratio,
+            "lambda_selection_method": "fixed_lam_ratio",
+            "theta_warm_started_from_selection": True,
+            "theta_source_summary": str(selected_summary_path),
+            "h2": final_h2,
+            **final_accuracy,
+            "support_size": int(final_summary["support_size"]),
+            "summary": str(final_summary_path),
+        },
         "configuration": {
             "max_k": int(args.max_k),
             "max_splits": (
@@ -598,11 +805,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
             "score_alpha": float(args.score_alpha),
             "bootstrap_draws": int(args.bootstrap_draws),
-            "max_univariate_depth": int(args.max_univariate_depth),
             "lambda_selection": "validation_r2_inside_each_fixed_K_inner_fit",
-            "split_selection": "nuisance_adjusted_reml_max_score_bootstrap",
-            "layer_acceptance": "parent_covariance_score_only",
+            "split_selection": "covariance_contrast_parametric_max_bootstrap",
+            "layer_acceptance": "layer_wise_max_bootstrap_p_only",
             "prediction_role": "lambda_selection_and_audit_only_not_K_selection",
+            "final_refit": (
+                "automatic_train_plus_validation_with_frozen_partition_"
+                "frozen_lambda_ratio_and_selection_theta_warm_start"
+            ),
             "true_h2_role": "evaluation_only_not_model_selection",
         },
     }
