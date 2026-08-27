@@ -31,6 +31,22 @@ logger = logging.getLogger(__name__)
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fit-dir", required=True)
+    parser.add_argument(
+        "--pipeline-trajectory",
+        default="",
+        help=(
+            "Optional h2_trajectory.json containing the original sparse "
+            "pipeline arguments. By default FIT_DIR/h2_trajectory.json is used."
+        ),
+    )
+    parser.add_argument(
+        "--run-config",
+        default="",
+        help=(
+            "Fixed-K validation-lambda run_config.json used to reconstruct the "
+            "selection-fit inputs when no h2 trajectory exists."
+        ),
+    )
     parser.add_argument("--ld-score", required=True)
     parser.add_argument("--diagnostic-out", required=True)
     parser.add_argument("--marker-score-out", required=True)
@@ -55,14 +71,93 @@ def _load_json(path: Path) -> dict:
     return value
 
 
-def _completed_fit_paths(fit_dir: Path) -> tuple[Path, Path, Path]:
+def _completed_fit_paths(fit_dir: Path) -> tuple[Path, Path]:
     summary = fit_dir / "coherit.summary.json"
     selected = fit_dir / "coherit.selected_snps.tsv"
-    trajectory = fit_dir / "h2_trajectory.json"
-    for path in (summary, selected, trajectory):
+    for path in (summary, selected):
         if not path.is_file():
             raise FileNotFoundError(path)
-    return summary, selected, trajectory
+    return summary, selected
+
+
+def _pipeline_arguments_from_run_config(path: Path) -> list[str]:
+    """Reconstruct the selection fit's model inputs from its driver audit."""
+    config = _load_json(path)
+    inputs = config.get("inputs")
+    runtime = config.get("runtime")
+    if not isinstance(inputs, dict) or not isinstance(runtime, dict):
+        raise ValueError("run_config.json lacks inputs/runtime objects.")
+
+    required_inputs = {
+        "bed_prefix",
+        "component_spec_snapshot",
+        "train_pheno_txt",
+        "train_keep",
+    }
+    missing = sorted(
+        key for key in required_inputs if not inputs.get(key)
+    )
+    if missing:
+        raise ValueError(
+            "run_config.json lacks required selection inputs: "
+            + ", ".join(missing)
+        )
+
+    arguments = [
+        "--bed-prefix",
+        str(inputs["bed_prefix"]),
+        "--component-spec",
+        str(inputs["component_spec_snapshot"]),
+        "--pheno-txt",
+        str(inputs["train_pheno_txt"]),
+        "--keep-path",
+        str(inputs["train_keep"]),
+    ]
+    if inputs.get("covar_txt"):
+        arguments.extend(["--covar-txt", str(inputs["covar_txt"])])
+
+    runtime_flags = {
+        "device": "--device",
+        "gpu_budget_gib": "--gpu-budget-gib",
+        "cpu_threads": "--cpu-threads",
+        "screen_topk": "--screen-topk",
+        "candidate_k": "--candidate-k",
+        "kkt_add_topk": "--kkt-add-topk",
+        "kkt_max_rounds": "--kkt-max-rounds",
+    }
+    for key, flag in runtime_flags.items():
+        value = runtime.get(key)
+        if value is not None:
+            arguments.extend([flag, str(value)])
+    return arguments
+
+
+def _original_pipeline_arguments(
+    *,
+    fit_dir: Path,
+    pipeline_trajectory: str,
+    run_config: str,
+) -> list[str]:
+    trajectory_path = (
+        Path(pipeline_trajectory).expanduser().resolve(strict=True)
+        if pipeline_trajectory
+        else fit_dir / "h2_trajectory.json"
+    )
+    if trajectory_path.is_file():
+        trajectory = _load_json(trajectory_path)
+        pipeline_args = trajectory.get("pipeline_args")
+        if not isinstance(pipeline_args, list) or not all(
+            isinstance(value, str) for value in pipeline_args
+        ):
+            raise ValueError("h2_trajectory.json lacks the original pipeline_args.")
+        return list(pipeline_args)
+    if run_config:
+        return _pipeline_arguments_from_run_config(
+            Path(run_config).expanduser().resolve(strict=True)
+        )
+    raise FileNotFoundError(
+        f"No pipeline trajectory found at {trajectory_path}; supply --run-config."
+    )
 
 
 def _parse_pipeline_args(arguments: Sequence[str]) -> argparse.Namespace:
@@ -191,14 +286,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(message)s",
     )
     fit_dir = Path(args.fit_dir).expanduser().resolve(strict=True)
-    summary_path, selected_path, trajectory_path = _completed_fit_paths(fit_dir)
+    summary_path, selected_path = _completed_fit_paths(fit_dir)
     completed = _load_json(summary_path)
-    trajectory = _load_json(trajectory_path)
-    pipeline_args = trajectory.get("pipeline_args")
-    if not isinstance(pipeline_args, list) or not all(
-        isinstance(value, str) for value in pipeline_args
-    ):
-        raise ValueError("h2_trajectory.json lacks the original pipeline_args.")
+    pipeline_args = _original_pipeline_arguments(
+        fit_dir=fit_dir,
+        pipeline_trajectory=str(args.pipeline_trajectory),
+        run_config=str(args.run_config),
+    )
     original = _parse_pipeline_args(pipeline_args)
     original.verbose = bool(args.verbose)
 

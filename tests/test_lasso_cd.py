@@ -178,6 +178,29 @@ class TestLambdaPath:
         np.testing.assert_allclose(seq[0], 10.0)
         np.testing.assert_allclose(seq[-1], 1.0)
 
+    def test_lambda_sequence_preserves_exact_requested_endpoints(self):
+        seq = make_lambda_sequence(0.1, 1e-3, 80)
+
+        assert seq[0] == 0.1
+        assert seq[0] / 0.1 == 1.0
+        assert seq[-1] == 0.1 * 1e-3
+        assert seq[-1] / 0.1 == 1e-3
+
+    def test_lambda_sequence_does_not_silently_clamp_small_ratio(self):
+        seq = make_lambda_sequence(2.0, 1e-8, 3)
+
+        assert seq[-1] == 2e-8
+
+    @pytest.mark.parametrize(
+        ("lam_max", "lam_min_ratio", "n_lambda"),
+        [(-1.0, 0.1, 5), (1.0, 0.0, 5), (1.0, 1.1, 5), (1.0, 0.1, 0)],
+    )
+    def test_lambda_sequence_rejects_invalid_grid(
+        self, lam_max, lam_min_ratio, n_lambda
+    ):
+        with pytest.raises(ValueError):
+            make_lambda_sequence(lam_max, lam_min_ratio, n_lambda)
+
     def test_complete_path_defers_selection_to_validation(self):
         Q = _random_spd(5, seed=5)
         q = np.array([1.0, -0.8, 0.6, 0.0, 0.2], dtype=np.float64)
@@ -199,6 +222,22 @@ class TestLambdaPath:
         assert out["selected_lam_ratio"] is None
         assert out["beta_path"].shape == (len(path), q.size)
         assert path[0]["cd_iter"] == 0
+
+    def test_complete_path_reports_exact_requested_ratio_endpoints(self):
+        out = solve_lasso_path(
+            Q=np.eye(2),
+            q=np.asarray([0.1, -0.03]),
+            yHy=2.0,
+            cfg=LassoPathConfig(
+                n_lambda=20,
+                lam_min_ratio=1e-3,
+                max_cd_iter=5000,
+                cd_tol=1e-10,
+            ),
+        )
+
+        assert out["path"][0]["lam_ratio"] == 1.0
+        assert out["path"][-1]["lam_ratio"] == 1e-3
 
     def test_external_path_warm_start_preserves_solution_and_reduces_cd_work(self):
         k = 24

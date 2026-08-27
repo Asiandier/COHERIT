@@ -430,6 +430,13 @@ def test_sparse_pipeline_defaults_to_iterative_validation_contract(monkeypatch):
         SPARSE.parse_args()
 
 
+def test_fixed_lambda_ratio_canonicalizes_lambda_max_endpoint():
+    assert SPARSE._canonical_fixed_lam_ratio(1.0) == 1.0
+    assert SPARSE._canonical_fixed_lam_ratio(0.9999999999999998) == 1.0
+    assert SPARSE._canonical_fixed_lam_ratio(1.0000000000000002) == 1.0
+    assert SPARSE._canonical_fixed_lam_ratio(0.999999) == pytest.approx(0.999999)
+
+
 def test_sparse_pipeline_has_no_max_active_cap(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["gpu-reml-sparse"])
     args = SPARSE.parse_args()

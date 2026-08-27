@@ -97,12 +97,36 @@ def _solve_factorized_system(system: _FactorizedLinearSystem, rhs: np.ndarray) -
 
 
 def make_lambda_sequence(lam_max: float, lam_min_ratio: float, n_lambda: int) -> np.ndarray:
-    lam_max = max(float(lam_max), 0.0)
-    n_lambda = max(int(n_lambda), 1)
-    if lam_max <= 0.0:
+    lam_max = float(lam_max)
+    lam_min_ratio = float(lam_min_ratio)
+    n_lambda = int(n_lambda)
+    if not math.isfinite(lam_max) or lam_max < 0.0:
+        raise ValueError("lam_max must be finite and nonnegative.")
+    if (
+        not math.isfinite(lam_min_ratio)
+        or not 0.0 < lam_min_ratio <= 1.0
+    ):
+        raise ValueError("lam_min_ratio must lie in (0, 1].")
+    if n_lambda < 1:
+        raise ValueError("n_lambda must be >= 1.")
+    if lam_max == 0.0:
         return np.array([0.0], dtype=np.float64)
-    lam_min = max(lam_max * float(lam_min_ratio), lam_max * 1e-6)
-    return np.exp(np.linspace(np.log(lam_max), np.log(lam_min), n_lambda)).astype(np.float64)
+    if n_lambda == 1:
+        return np.array([lam_max], dtype=np.float64)
+
+    lam_min = lam_max * lam_min_ratio
+    if lam_min == 0.0:
+        raise ValueError("lam_max * lam_min_ratio underflows to zero.")
+    # Construct the grid relative to lambda_max, then pin both endpoints.
+    # exp(log(lambda_max)) is not generally bit-identical to lambda_max; the
+    # former implementation could therefore report a first ratio slightly
+    # above one while treating that point as the exact lambda-max zero model.
+    sequence = lam_max * np.exp(
+        np.linspace(0.0, math.log(lam_min_ratio), n_lambda)
+    )
+    sequence[0] = lam_max
+    sequence[-1] = lam_min
+    return sequence.astype(np.float64, copy=False)
 
 
 # ---------------------------------------------------------------------------
@@ -497,6 +521,13 @@ def solve_lasso_path(
     lam_max = float(np.max(np.abs(q))) if q.size > 0 else 0.0
     if fixed_lam_ratio is None:
         lam_seq = make_lambda_sequence(lam_max, cfg.lam_min_ratio, cfg.n_lambda)
+        if lam_max > 0.0:
+            lam_ratio_seq = lam_seq / lam_max
+            lam_ratio_seq[0] = 1.0
+            if lam_ratio_seq.size > 1:
+                lam_ratio_seq[-1] = float(cfg.lam_min_ratio)
+        else:
+            lam_ratio_seq = np.ones(lam_seq.size, dtype=np.float64)
         path_role = "complete_validation_grid"
     else:
         # The final train+validation refit has already frozen the ratio.  Its
@@ -509,6 +540,18 @@ def solve_lasso_path(
             np.asarray([lam_max], dtype=np.float64)
             if lam_max <= 0.0 or float(fixed_lam_ratio) == 1.0
             else np.asarray([lam_max, target_lam], dtype=np.float64)
+        )
+        lam_ratio_seq = (
+            np.asarray(
+                [
+                    float(fixed_lam_ratio)
+                    if lam_max <= 0.0
+                    else 1.0
+                ],
+                dtype=np.float64,
+            )
+            if lam_seq.size == 1
+            else np.asarray([1.0, float(fixed_lam_ratio)], dtype=np.float64)
         )
         path_role = "frozen_ratio_target_only"
 
@@ -538,7 +581,7 @@ def solve_lasso_path(
     beta_path: list[np.ndarray] = []
     external_warm_rows_used = 0
 
-    for i, lam in enumerate(lam_seq):
+    for i, (lam, lam_ratio) in enumerate(zip(lam_seq, lam_ratio_seq)):
         # lambda_max has the exact all-zero solution.  For lower path points,
         # a same-ratio solution mapped from the preceding candidate/outer fit
         # is normally much closer than restarting from the adjacent solution
@@ -616,9 +659,7 @@ def solve_lasso_path(
         path.append(
             {
                 "lam": float(lam),
-                "lam_ratio": (
-                    float(lam / lam_max) if lam_max > 0.0 else 1.0
-                ),
+                "lam_ratio": float(lam_ratio),
                 "k": k,
                 "rss": rss,
                 "cd_iter": int(n_iter),

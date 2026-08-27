@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Outer COHERIT-CovTree loop around the fixed-K validation-lambda pipeline."""
+"""Heritability-first CovTree loop around fixed-K validation-lambda COHERIT.
+
+Covariance-score evidence alone decides whether a GRM split is fitted and
+retained.  Validation prediction remains inside each fixed-K fit to select the
+Lasso lambda, but it never accepts, rejects, or rolls back a CovTree layer.
+"""
 from __future__ import annotations
 
 import argparse
@@ -100,47 +105,20 @@ def prediction_metrics(
     }
 
 
-def paired_prediction_guardrail(
-    *,
-    previous_prediction_path: Path,
-    current_prediction_path: Path,
-    phenotype_path: Path,
-    bootstrap_draws: int,
-    seed: int,
-    alpha: float,
-) -> dict[str, object]:
-    """Reject only when paired validation squared error clearly increases."""
-    previous_iids, previous = _read_prediction(previous_prediction_path)
-    current_iids, current = _read_prediction(current_prediction_path)
-    if previous_iids != current_iids:
-        raise ValueError("Paired prediction guardrail requires identical IID order.")
-    phenotype = _read_phenotype(phenotype_path)
-    if set(previous_iids) != set(phenotype):
-        raise ValueError("Guardrail phenotype and prediction IID sets differ.")
-    outcome = np.asarray([phenotype[iid] for iid in previous_iids], dtype=np.float64)
-    paired_difference = np.square(outcome - current) - np.square(outcome - previous)
-    draws = int(bootstrap_draws)
-    if draws < 100:
-        raise ValueError("prediction guardrail bootstrap_draws must be >= 100.")
-    rng = np.random.default_rng(int(seed))
-    bootstrap_mean = np.empty(draws, dtype=np.float64)
-    n_samples = paired_difference.size
-    for start in range(0, draws, 256):
-        stop = min(start + 256, draws)
-        sample = rng.integers(0, n_samples, size=(stop - start, n_samples))
-        bootstrap_mean[start:stop] = np.mean(paired_difference[sample], axis=1)
-    lower, upper = np.quantile(
-        bootstrap_mean, [0.5 * float(alpha), 1.0 - 0.5 * float(alpha)]
-    )
-    observed = float(np.mean(paired_difference))
+def heritability_accuracy(
+    estimate: float,
+    true_h2: float | None,
+) -> dict[str, float]:
+    """Return evaluation-only h2 errors; truth never enters model selection."""
+    if true_h2 is None:
+        return {}
+    estimate_f = float(estimate)
+    truth_f = float(true_h2)
+    signed_bias = estimate_f - truth_f
     return {
-        "metric": "paired_validation_squared_error_current_minus_previous",
-        "observed_mean_difference": observed,
-        "confidence_level": float(1.0 - alpha),
-        "confidence_interval": [float(lower), float(upper)],
-        "bootstrap_draws": draws,
-        "seed": int(seed),
-        "material_degradation_supported": bool(lower > 0.0),
+        "true_h2": truth_f,
+        "signed_h2_bias": signed_bias,
+        "absolute_h2_error": abs(signed_bias),
     }
 
 
@@ -217,10 +195,39 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--case-id", required=True)
     parser.add_argument("--initial-fit-dir", required=True)
     parser.add_argument("--initial-diagnostic", required=True)
+    parser.add_argument(
+        "--pipeline-trajectory",
+        help=(
+            "Optional h2_trajectory.json supplying the original fixed-K "
+            "pipeline arguments. This permits continuation from an existing "
+            "CovTree layer whose directory does not contain that audit file."
+        ),
+    )
+    parser.add_argument(
+        "--pipeline-run-config",
+        help=(
+            "Optional fixed-K validation-lambda run_config.json used to "
+            "reconstruct the original selection command when no trajectory "
+            "was recorded."
+        ),
+    )
     parser.add_argument("--ld-score", required=True)
     parser.add_argument("--out-dir", required=True)
+    parser.add_argument(
+        "--true-h2",
+        type=float,
+        help="Simulation truth used only to report bias, never to select K.",
+    )
     parser.add_argument("--max-k", type=int, default=1024)
-    parser.add_argument("--max-splits", type=int, default=10)
+    parser.add_argument(
+        "--max-splits",
+        type=int,
+        help=(
+            "Optional independent split-layer safety cap. By default there "
+            "is no layer-count cap: covariance-score stopping or --max-k "
+            "terminates the tree."
+        ),
+    )
     parser.add_argument("--bootstrap-draws", type=int, default=199)
     parser.add_argument("--bootstrap-seed", type=int, default=20260827)
     parser.add_argument("--score-alpha", type=float, default=0.05)
@@ -229,8 +236,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-univariate-depth", type=int, default=2)
     parser.add_argument("--parent-theta-abs-min", type=float, default=1e-6)
     parser.add_argument("--parent-theta-rel-min", type=float, default=1e-4)
-    parser.add_argument("--guardrail-bootstrap-draws", type=int, default=2000)
-    parser.add_argument("--guardrail-alpha", type=float, default=0.05)
     parser.add_argument(
         "--sparse-pipeline",
         default=str(REPO_ROOT / "run_sparse_reml_pipeline.py"),
@@ -240,24 +245,102 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _selection_arguments_from_run_config(path: Path) -> list[str]:
+    config = _read_json(path)
+    inputs = config.get("inputs")
+    runtime = config.get("runtime")
+    algorithm = config.get("algorithm")
+    if not all(isinstance(value, dict) for value in (inputs, runtime, algorithm)):
+        raise ValueError("run_config.json lacks inputs/runtime/algorithm objects.")
+    required = {
+        "bed_prefix",
+        "component_spec_snapshot",
+        "train_pheno_txt",
+        "train_keep",
+        "validation_pheno_txt",
+        "validation_keep",
+    }
+    missing = sorted(key for key in required if not inputs.get(key))
+    if missing:
+        raise ValueError(
+            "run_config.json lacks required selection inputs: "
+            + ", ".join(missing)
+        )
+
+    bed_prefix = str(inputs["bed_prefix"])
+    arguments = [
+        "--bed-prefix",
+        bed_prefix,
+        "--prediction-bed-prefix",
+        bed_prefix,
+        "--component-spec",
+        str(inputs["component_spec_snapshot"]),
+        "--pheno-txt",
+        str(inputs["train_pheno_txt"]),
+        "--keep-path",
+        str(inputs["train_keep"]),
+        "--prediction-keep-path",
+        str(inputs["validation_keep"]),
+        "--sparsity-validation-pheno-txt",
+        str(inputs["validation_pheno_txt"]),
+    ]
+    if inputs.get("covar_txt"):
+        covariates = str(inputs["covar_txt"])
+        arguments.extend(
+            [
+                "--covar-txt",
+                covariates,
+                "--prediction-covar-txt",
+                covariates,
+            ]
+        )
+
+    runtime_flags = {
+        "device": "--device",
+        "gpu_budget_gib": "--gpu-budget-gib",
+        "cpu_threads": "--cpu-threads",
+        "screen_topk": "--screen-topk",
+        "candidate_k": "--candidate-k",
+        "kkt_add_topk": "--kkt-add-topk",
+        "kkt_max_rounds": "--kkt-max-rounds",
+    }
+    for key, flag in runtime_flags.items():
+        value = runtime.get(key)
+        if value is not None:
+            arguments.extend([flag, str(value)])
+    algorithm_flags = {
+        "lam_min_ratio": "--lasso-lam-min-ratio",
+        "n_lambda": "--lasso-n-lambda",
+        "lasso_cd_max_iter": "--lasso-cd-max-iter",
+    }
+    for key, flag in algorithm_flags.items():
+        value = algorithm.get(key)
+        if value is not None:
+            arguments.extend([flag, str(value)])
+    return arguments
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     if int(args.max_k) < 1:
         raise ValueError("max_k must be positive.")
-    if int(args.max_splits) < 0:
+    if args.max_splits is not None and int(args.max_splits) < 0:
         raise ValueError("max_splits must be nonnegative.")
     if int(args.bootstrap_draws) < 19:
         raise ValueError("bootstrap_draws must be at least 19.")
-    if int(args.guardrail_bootstrap_draws) < 100:
-        raise ValueError("guardrail_bootstrap_draws must be at least 100.")
     if int(args.min_child_markers) < 1:
         raise ValueError("min_child_markers must be positive.")
     if not 1 <= int(args.max_univariate_depth) <= 10:
         raise ValueError("max_univariate_depth must lie in 1..10.")
-    for name in ("score_alpha", "guardrail_alpha"):
-        value = float(getattr(args, name))
-        if not math.isfinite(value) or not 0.0 < value < 1.0:
-            raise ValueError(f"{name} must lie in (0, 1).")
+    if not math.isfinite(float(args.score_alpha)) or not 0.0 < float(
+        args.score_alpha
+    ) < 1.0:
+        raise ValueError("score_alpha must lie in (0, 1).")
+    if args.true_h2 is not None and (
+        not math.isfinite(float(args.true_h2))
+        or not 0.0 <= float(args.true_h2) <= 1.0
+    ):
+        raise ValueError("true_h2 must lie in [0, 1].")
     if not math.isfinite(float(args.rank_rtol)) or float(args.rank_rtol) <= 0.0:
         raise ValueError("rank_rtol must be finite and positive.")
     for name in ("parent_theta_abs_min", "parent_theta_rel_min"):
@@ -267,8 +350,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     initial_dir = Path(args.initial_fit_dir).expanduser().resolve(strict=True)
     initial_summary_path = initial_dir / "coherit.summary.json"
     initial_prediction_path = initial_dir / "coherit.sparse_prediction.tsv"
-    trajectory_path = initial_dir / "h2_trajectory.json"
-    for path in (initial_summary_path, initial_prediction_path, trajectory_path):
+    if args.pipeline_trajectory and args.pipeline_run_config:
+        raise ValueError(
+            "Supply at most one of --pipeline-trajectory and "
+            "--pipeline-run-config."
+        )
+    for path in (initial_summary_path, initial_prediction_path):
         if not path.is_file():
             raise FileNotFoundError(path)
     initial_diagnostic_path = Path(args.initial_diagnostic).expanduser().resolve(strict=True)
@@ -279,10 +366,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     if result_path.exists():
         raise FileExistsError(f"Refusing to overwrite completed result: {result_path}")
 
-    trajectory = _read_json(trajectory_path)
-    original_arguments = trajectory.get("pipeline_args")
-    if not isinstance(original_arguments, list):
-        raise ValueError("Initial h2_trajectory.json lacks pipeline_args.")
+    if args.pipeline_run_config:
+        original_arguments = _selection_arguments_from_run_config(
+            Path(args.pipeline_run_config).expanduser().resolve(strict=True)
+        )
+    else:
+        trajectory_path = (
+            Path(args.pipeline_trajectory).expanduser().resolve(strict=True)
+            if args.pipeline_trajectory
+            else initial_dir / "h2_trajectory.json"
+        )
+        if not trajectory_path.is_file():
+            raise FileNotFoundError(trajectory_path)
+        trajectory = _read_json(trajectory_path)
+        original_arguments = trajectory.get("pipeline_args")
+        if not isinstance(original_arguments, list):
+            raise ValueError("Initial h2_trajectory.json lacks pipeline_args.")
     validation_phenotype = Path(
         _flag_value(original_arguments, "--sparsity-validation-pheno-txt")
     ).expanduser().resolve(strict=True)
@@ -295,6 +394,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError("Initial CovTree diagnostic and fixed-K fit disagree on K.")
     initial_metrics = prediction_metrics(initial_prediction_path, validation_phenotype)
 
+    initial_h2 = float(initial_summary["h2_chive_guarded"])
     layers: list[dict[str, object]] = [
         {
             "step": 0,
@@ -305,14 +405,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             "diagnostic": str(initial_diagnostic_path),
             "prediction": str(initial_prediction_path),
             "validation": initial_metrics,
-            "h2": float(initial_summary["h2_chive_guarded"]),
+            "acceptance_reason": "initial_fitted_model",
+            "h2": initial_h2,
+            **heritability_accuracy(initial_h2, args.true_h2),
             "theta": initial_summary["var_components_lasso_ml"],
             "support_size": int(initial_summary["support_size"]),
             "elapsed_sec": float(initial_summary["elapsed_sec"]),
         }
     ]
     current_diagnostic = initial_diagnostic
-    current_prediction_path = initial_prediction_path
     initial_state_metadata = initial_summary.get("sparse_state_out")
     current_sparse_state = (
         Path(str(initial_state_metadata["path"])).expanduser().resolve(strict=True)
@@ -322,7 +423,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     stop_reason = None
 
-    for step in range(1, int(args.max_splits) + 1):
+    step = 0
+    while True:
         if not bool(current_diagnostic.get("accepted", False)):
             stop_reason = current_diagnostic.get("stopping_reason") or "score_not_accepted"
             break
@@ -330,6 +432,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         if next_k > int(args.max_k):
             stop_reason = "max_k_safety_cap"
             break
+        if args.max_splits is not None and step >= int(args.max_splits):
+            stop_reason = "max_splits_safety_cap"
+            break
+        step += 1
         component_spec_value = current_diagnostic.get("selected_split_spec")
         warm_start = current_diagnostic.get("covariance_preserving_warm_start")
         if not component_spec_value or not isinstance(warm_start, list):
@@ -401,26 +507,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         if int(summary["n_grms"]) != next_k:
             raise RuntimeError("Fixed-K layer returned an unexpected component count.")
         metrics = prediction_metrics(prediction_path, validation_phenotype)
-        guardrail = paired_prediction_guardrail(
-            previous_prediction_path=current_prediction_path,
-            current_prediction_path=prediction_path,
-            phenotype_path=validation_phenotype,
-            bootstrap_draws=int(args.guardrail_bootstrap_draws),
-            seed=int(args.bootstrap_seed) + 10000 + step,
-            alpha=float(args.guardrail_alpha),
-        )
-        layer_accepted = not bool(guardrail["material_degradation_supported"])
+        layer_h2 = float(summary["h2_chive_guarded"])
         record = {
             "step": step,
             "K": next_k,
-            "accepted": layer_accepted,
+            # Reaching this fit proves that the preceding fixed-K diagnostic
+            # selected its split by adjusted covariance-score evidence.  Once
+            # fitted, prediction cannot roll the layer back.
+            "accepted": True,
+            "acceptance_reason": "parent_covariance_score_selected_split",
             "fit_dir": str(layer_dir),
             "summary": str(summary_path),
             "diagnostic": str(diagnostic_out),
             "prediction": str(prediction_path),
             "validation": metrics,
-            "prediction_guardrail": guardrail,
-            "h2": float(summary["h2_chive_guarded"]),
+            "prediction_role": "lambda_selection_and_audit_only",
+            "h2": layer_h2,
+            **heritability_accuracy(layer_h2, args.true_h2),
             "theta": summary["var_components_lasso_ml"],
             "support_size": int(summary["support_size"]),
             "elapsed_sec": float(summary["elapsed_sec"]),
@@ -431,29 +534,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         layers.append(record)
         _atomic_json(layer_dir / "layer_result.json", record)
         print(
-            "[covtree] K=%s h2=%.8f validation_R2=%.8f guardrail_degraded=%s"
+            "[covtree-h2] K=%s h2=%.8f absolute_error=%s "
+            "next_split_score_accepted=%s"
             % (
                 next_k,
                 float(record["h2"]),
-                float(metrics["correlation_squared"]),
-                not layer_accepted,
+                (
+                    "%.8f" % float(record["absolute_h2_error"])
+                    if "absolute_h2_error" in record
+                    else "not_available"
+                ),
+                bool(diagnostic.get("accepted", False)),
             ),
             flush=True,
         )
-        if not layer_accepted:
-            stop_reason = "paired_prediction_guardrail_rejected_split"
-            break
         current_diagnostic = diagnostic
-        current_prediction_path = prediction_path
         current_sparse_state = sparse_state_out
-    else:
-        stop_reason = "max_splits"
 
     accepted_layers = [layer for layer in layers if bool(layer["accepted"])]
     selected = accepted_layers[-1]
     result = {
-        "schema_version": 1,
-        "algorithm": "coherit_covtree_validation_lambda_v1",
+        "schema_version": 2,
+        "algorithm": "coherit_covtree_heritability_first_v2",
         "case_id": args.case_id,
         "status": "complete",
         "created_at": _now(),
@@ -461,17 +563,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         "selected_step": int(selected["step"]),
         "selected_K": int(selected["K"]),
         "selected_h2": float(selected["h2"]),
+        **heritability_accuracy(float(selected["h2"]), args.true_h2),
         "selected_summary": selected["summary"],
         "layers": layers,
         "configuration": {
             "max_k": int(args.max_k),
-            "max_splits": int(args.max_splits),
+            "max_splits": (
+                int(args.max_splits) if args.max_splits is not None else None
+            ),
             "score_alpha": float(args.score_alpha),
             "bootstrap_draws": int(args.bootstrap_draws),
             "max_univariate_depth": int(args.max_univariate_depth),
             "lambda_selection": "validation_r2_inside_each_fixed_K_inner_fit",
             "split_selection": "nuisance_adjusted_reml_max_score_bootstrap",
-            "prediction_role": "paired_noninferiority_guardrail_only",
+            "layer_acceptance": "parent_covariance_score_only",
+            "prediction_role": "lambda_selection_and_audit_only_not_K_selection",
+            "true_h2_role": "evaluation_only_not_model_selection",
         },
     }
     _atomic_json(result_path, result)

@@ -1115,6 +1115,14 @@ def _max_rel_change(new_v: np.ndarray, old_v: np.ndarray) -> float:
     return float(np.max(np.abs(new_v - old_v) / denom))
 
 
+def _canonical_fixed_lam_ratio(value: float, *, atol: float = 1e-12) -> float:
+    """Preserve the exact lambda-max endpoint across JSON round trips."""
+    ratio = float(value)
+    if abs(ratio - 1.0) <= float(atol):
+        return 1.0
+    return ratio
+
+
 def _variance_components_converged(
     new_v: np.ndarray,
     old_v: np.ndarray,
@@ -3117,6 +3125,9 @@ def main() -> None:
             "Conditional marker-score emission requires validation-lambda selection."
         )
     if fixed_ratio_refit:
+        args.lasso_fixed_lam_ratio = _canonical_fixed_lam_ratio(
+            float(args.lasso_fixed_lam_ratio)
+        )
         if (
             not np.isfinite(float(args.lasso_fixed_lam_ratio))
             or not 0.0 < float(args.lasso_fixed_lam_ratio) <= 1.0
