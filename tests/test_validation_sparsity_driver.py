@@ -42,7 +42,6 @@ def test_driver_defaults_to_expanded_untruncated_path(tmp_path):
     assert args.n_lambda == 80
     assert args.lasso_cd_max_iter == 10000
     assert args.validation_early_stopping_lag == 5
-    assert args.component_spec == ""
 
 
 def test_driver_accepts_only_certified_early_stopped_validation_prefix(tmp_path):
@@ -55,6 +54,7 @@ def test_driver_accepts_only_certified_early_stopped_validation_prefix(tmp_path)
             "standard_deviation": 1.0,
         },
         "n_grms": 1,
+        "sparse_grm_mode": "single_whole_genome_grm",
         "lasso_branch_valid": True,
         "sparse_prediction": {"status": "emitted"},
         "lambda_selection_method": "validation_r2",
@@ -85,42 +85,16 @@ def test_driver_accepts_only_certified_early_stopped_validation_prefix(tmp_path)
         )
 
 
-def test_fixed_k_mode_accepts_and_validates_user_partition(tmp_path):
-    component_spec = tmp_path / "fixed_k2.npz"
-    np.savez(
-        component_spec,
-        arr_0=np.asarray([0, 2, 4], dtype=np.int64),
-        arr_1=np.asarray([1, 3, 5], dtype=np.int64),
-    )
-
-    args = DRIVER.parse_args(
-        [
-            *_required_args(tmp_path),
-            "--component-spec",
-            str(component_spec),
-        ]
-    )
-    components = DRIVER._load_fixed_components(
-        component_spec,
-        n_variants=6,
-    )
-
-    assert args.component_spec == str(component_spec)
-    assert len(components) == 2
-    assert DRIVER._same_component_membership(component_spec, components)
-
-
 def test_sparse_commands_isolate_validation_and_final_test_stages(tmp_path):
     args = DRIVER.parse_args(_required_args(tmp_path))
     args.python_bin = tmp_path / "python"
     args.sparse_pipeline = tmp_path / "pipeline.py"
     args.bed_prefix = tmp_path / "geno"
     args.covar_txt = tmp_path / "covar"
-    component = tmp_path / "component.npz"
+    warm_state = tmp_path / "lasso_warm_state.npz"
 
     selection = DRIVER._sparse_command(
         args=args,
-        component_spec=component,
         phenotype=tmp_path / "train.pheno",
         keep=tmp_path / "train.keep",
         prediction_keep=tmp_path / "validation.keep",
@@ -129,10 +103,11 @@ def test_sparse_commands_isolate_validation_and_final_test_stages(tmp_path):
         selection_output=tmp_path / "validation.json",
         fixed_lam_ratio=None,
         theta_init=None,
+        warm_state_in=None,
+        warm_state_out=warm_state,
     )
     final = DRIVER._sparse_command(
         args=args,
-        component_spec=component,
         phenotype=tmp_path / "fit.pheno",
         keep=tmp_path / "fit.keep",
         prediction_keep=tmp_path / "test.keep",
@@ -141,6 +116,8 @@ def test_sparse_commands_isolate_validation_and_final_test_stages(tmp_path):
         selection_output=None,
         fixed_lam_ratio=0.025,
         theta_init=np.asarray([0.2, 0.8]),
+        warm_state_in=warm_state,
+        warm_state_out=None,
     )
 
     assert "--sparsity-validation-pheno-txt" in selection
@@ -151,17 +128,23 @@ def test_sparse_commands_isolate_validation_and_final_test_stages(tmp_path):
     ] == "5"
     assert str(tmp_path / "validation.pheno") in selection
     assert str(tmp_path / "test.keep") not in selection
+    assert selection[selection.index("--lasso-warm-state-out") + 1] == str(
+        warm_state
+    )
+    assert "--component-spec" not in selection
     assert "--lasso-selection-mode" not in final
     assert float(
         final[final.index("--lasso-fixed-lam-ratio") + 1]
     ) == pytest.approx(0.025)
     assert "--sparsity-validation-pheno-txt" not in final
     assert str(tmp_path / "validation.pheno") not in final
+    assert final[final.index("--lasso-warm-state-in") + 1] == str(
+        warm_state
+    )
 
     with pytest.raises(ValueError, match="explicit lambda stage"):
         DRIVER._sparse_command(
             args=args,
-            component_spec=component,
             phenotype=tmp_path / "fit.pheno",
             keep=tmp_path / "fit.keep",
             prediction_keep=tmp_path / "test.keep",
@@ -170,6 +153,8 @@ def test_sparse_commands_isolate_validation_and_final_test_stages(tmp_path):
             selection_output=None,
             fixed_lam_ratio=None,
             theta_init=None,
+            warm_state_in=None,
+            warm_state_out=None,
         )
 
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fit a fixed-K COHERIT partition with validation-selected sparsity."""
+"""Run single-GRM COHERIT with validation-R2-selected sparsity."""
 
 from __future__ import annotations
 
@@ -24,21 +24,14 @@ PARENT = REPO_ROOT.parent
 if str(PARENT) not in sys.path:
     sys.path.insert(0, str(PARENT))
 PKG_NAME = REPO_ROOT.name
-_partition_mod = importlib.import_module(f"{PKG_NAME}.adaptive_partition")
 _selection_mod = importlib.import_module(f"{PKG_NAME}.sparsity_selection")
-_component_mod = importlib.import_module(f"{PKG_NAME}.component_spec")
 _lasso_mod = importlib.import_module(f"{PKG_NAME}.lasso_cd")
 
-AdaptiveComponent = _partition_mod.AdaptiveComponent
-single_component = _partition_mod.single_component
-validate_partition = _partition_mod.validate_partition
-write_component_spec = _partition_mod.write_component_spec
 evaluate_prediction_path = _selection_mod.evaluate_prediction_path
 read_phenotype_aligned = _selection_mod.read_phenotype_aligned
-load_component_specs = _component_mod.load_component_specs
 
 
-SPARSE_PATH_MODE = "fixed_k_validation_lambda"
+SPARSE_PATH_MODE = "single_grm_validation_r2"
 
 
 INPUT_PATH_NAMES = (
@@ -114,49 +107,6 @@ def _validate_bed_prefix(value: str) -> Path:
     return prefix
 
 
-def _count_bim_variants(prefix: Path) -> int:
-    with Path(str(prefix) + ".bim").open(encoding="utf-8") as handle:
-        count = sum(1 for line in handle if line.strip())
-    if count < 1:
-        raise ValueError("BIM file contains no variants.")
-    return int(count)
-
-
-def _load_fixed_components(
-    source: Path | None,
-    *,
-    n_variants: int,
-) -> list[AdaptiveComponent]:
-    """Load and validate a frozen user partition, defaulting to K=1."""
-    if source is None:
-        return single_component(n_variants)
-    specs = load_component_specs(str(source))
-    components = [
-        AdaptiveComponent(
-            name=str(spec.name),
-            variant_indices=np.asarray(spec.variant_indices, dtype=np.int64),
-            annotation=dict(spec.annotation or {}),
-        )
-        for spec in specs
-    ]
-    validate_partition(components, n_variants=int(n_variants))
-    return components
-
-
-def _same_component_membership(
-    path: Path,
-    components: Sequence[AdaptiveComponent],
-) -> bool:
-    observed = load_component_specs(str(path))
-    return len(observed) == len(components) and all(
-        np.array_equal(
-            np.asarray(left.variant_indices, dtype=np.int64),
-            np.asarray(right.variant_indices, dtype=np.int64),
-        )
-        for left, right in zip(observed, components)
-    )
-
-
 def _run_command(command: Sequence[str], log_path: Path) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("w", encoding="utf-8") as log:
@@ -183,7 +133,6 @@ def _run_command(command: Sequence[str], log_path: Path) -> None:
 def _sparse_command(
     *,
     args: argparse.Namespace,
-    component_spec: Path,
     phenotype: Path,
     keep: Path,
     prediction_keep: Path,
@@ -192,20 +141,22 @@ def _sparse_command(
     selection_output: Path | None,
     fixed_lam_ratio: float | None,
     theta_init: np.ndarray | None,
+    warm_state_in: Path | None,
+    warm_state_out: Path | None,
 ) -> list[str]:
     if bool(selection_pheno) != bool(selection_output):
         raise ValueError("Selection phenotype and output must be supplied together.")
     if selection_pheno is not None and fixed_lam_ratio is not None:
         raise ValueError("Selection scan and fixed-ratio refit are distinct stages.")
     if selection_pheno is None and fixed_lam_ratio is None:
-        raise ValueError("Fixed-K sparse command requires an explicit lambda stage.")
+        raise ValueError("Sparse command requires an explicit lambda stage.")
+    if warm_state_in is not None and warm_state_out is not None:
+        raise ValueError("Warm-state input and output are distinct stages.")
     command = [
         str(args.python_bin),
         str(args.sparse_pipeline),
         "--bed-prefix",
         str(args.bed_prefix),
-        "--component-spec",
-        str(component_spec),
         "--pheno-txt",
         str(phenotype),
         "--covar-txt",
@@ -269,6 +220,10 @@ def _sparse_command(
                 ),
             ]
         )
+    if warm_state_in is not None:
+        command.extend(["--lasso-warm-state-in", str(warm_state_in)])
+    if warm_state_out is not None:
+        command.extend(["--lasso-warm-state-out", str(warm_state_out)])
     if args.verbose:
         command.append("--verbose")
     return command
@@ -323,7 +278,6 @@ def _validate_sparse_summary(
     prefix: Path,
     *,
     expected_method: str,
-    expected_k: int = 1,
 ) -> dict[str, Any]:
     summary_path = Path(str(prefix) + ".summary.json")
     summary = _read_json(summary_path)
@@ -332,13 +286,12 @@ def _validate_sparse_summary(
     standardization = summary.get("input_phenotype_standardization")
     if not isinstance(standardization, dict):
         raise ValueError("Sparse summary lacks input-standardization metadata.")
-    if int(expected_k) < 1:
-        raise ValueError("expected_k must be positive.")
-    if int(summary.get("n_grms", -1)) != int(expected_k):
+    if int(summary.get("n_grms", -1)) != 1:
         raise ValueError(
-            "Sparse summary GRM count differs from the expected partition: "
-            f"{summary.get('n_grms')} != {int(expected_k)}."
+            "Sparse summary must contain exactly one whole-genome GRM."
         )
+    if summary.get("sparse_grm_mode") != "single_whole_genome_grm":
+        raise ValueError("Sparse summary does not declare single-GRM mode.")
     if not bool(summary.get("lasso_branch_valid", False)):
         raise ValueError("Sparse layer did not return a valid Lasso branch.")
     if summary.get("sparse_prediction", {}).get("status") != "emitted":
@@ -354,7 +307,7 @@ def _validate_sparse_summary(
                 summary.get("lasso_path_complete", False)
             ):
                 raise ValueError(
-                    "Fixed-K complete validation path has inconsistent counts."
+                    "Single-GRM complete validation path has inconsistent counts."
                 )
         elif role == (
             "early_stopped_kkt_certified_validation_prefix_weighted_basil"
@@ -367,16 +320,18 @@ def _validate_sparse_summary(
                 and int(stopping.get("n_evaluated", -1)) == solved
             ):
                 raise ValueError(
-                    "Fixed-K early-stopped validation prefix lacks a valid "
+                    "Single-GRM early-stopped validation prefix lacks a valid "
                     "stopping certificate."
                 )
         else:
             raise ValueError(
-                "Fixed-K selection did not return a certified validation path."
+                "Single-GRM selection did not return a certified validation path."
             )
     elif expected_method == "fixed_lam_ratio":
         if summary.get("lasso_path_role") != "frozen_ratio_target_only":
-            raise ValueError("Fixed-K refit did not use the optimized target path.")
+            raise ValueError(
+                "Single-GRM refit did not use the optimized target path."
+            )
         if int(summary.get("lasso_path_points_solved", -1)) not in {1, 2}:
             raise ValueError("Frozen-ratio refit must solve only one or two points.")
     else:
@@ -388,13 +343,12 @@ def _existing_comparison(
     path: Path | None,
     *,
     case_id: str,
-    fixed_k: int,
     prediction_r2: float,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = [
         {
             "case_id": case_id,
-            "method": f"coherit_fixed_k{int(fixed_k)}_validation_lambda",
+            "method": "coherit_single_grm_validation_r2",
             "heldout_prediction_r2": float(prediction_r2),
             "iterative_validation_minus_method_r2": 0.0,
         }
@@ -424,14 +378,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--case-id", required=True)
     parser.add_argument("--bed-prefix", required=True)
-    parser.add_argument(
-        "--component-spec",
-        default="",
-        help=(
-            "Frozen fixed-K component partition (.json or .npz). Omit for "
-            "a single whole-genome GRM (K=1)."
-        ),
-    )
     parser.add_argument("--train-pheno-txt", required=True)
     parser.add_argument("--fit-pheno-txt", required=True)
     parser.add_argument("--validation-pheno-txt", required=True)
@@ -485,11 +431,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def _resolve_args(args: argparse.Namespace) -> argparse.Namespace:
     args.bed_prefix = _validate_bed_prefix(args.bed_prefix)
-    args.component_spec = (
-        _resolved_file(str(args.component_spec), "component_spec")
-        if args.component_spec
-        else None
-    )
     for name in (
         "train_pheno_txt",
         "fit_pheno_txt",
@@ -520,41 +461,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _resolve_args(parse_args(argv))
     result_path = args.out_dir / "sparsity_result.json"
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    n_variants = _count_bim_variants(args.bed_prefix)
-    components = _load_fixed_components(
-        args.component_spec,
-        n_variants=n_variants,
-    )
-    fixed_k = len(components)
-    component_spec = args.out_dir / f"component_spec_fixed_K{fixed_k}.npz"
-    if not component_spec.exists():
-        write_component_spec(
-            component_spec,
-            components,
-            provenance={
-                "algorithm": SPARSE_PATH_MODE,
-                "case_id": args.case_id,
-                "fixed_K": int(fixed_k),
-                "n_variants": n_variants,
-                "source_component_spec": (
-                    str(args.component_spec)
-                    if args.component_spec is not None
-                    else None
-                ),
-            },
-        )
-    elif not _same_component_membership(component_spec, components):
-        raise ValueError(
-            f"Existing fixed component snapshot differs: {component_spec}"
-        )
 
     config = {
-        "schema_version": 2,
+        "schema_version": 3,
         "case_id": args.case_id,
         "algorithm": {
-            "name": "fixed_k_validation_lambda_coherit",
+            "name": "single_grm_validation_r2_coherit",
             "sparse_path_mode": SPARSE_PATH_MODE,
-            "fixed_K": int(fixed_k),
+            "K": 1,
+            "grm": "single_whole_genome",
             "selection_metric": "squared_pearson_correlation_total_phenotype_prediction",
             "lam_min_ratio": float(args.lam_min_ratio),
             "n_lambda": int(args.n_lambda),
@@ -572,17 +487,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             "outer_update": "validation_selected_alpha_then_variance_components",
             "selection_samples": "training_to_validation",
             "final_refit": (
-                "freeze_partition_and_selected_lambda_ratio_then_refit_"
-                "train_plus_validation"
+                "freeze_selected_lambda_ratio_then_warm_refit_"
+                "on_train_plus_validation"
             ),
             "final_evaluation": "heldout_test_once_after_selection",
         },
         "inputs": {
-            **{name: str(getattr(args, name)) for name in INPUT_PATH_NAMES},
-            "component_spec_source": (
-                str(args.component_spec) if args.component_spec is not None else None
-            ),
-            "component_spec_snapshot": str(component_spec),
+            name: str(getattr(args, name)) for name in INPUT_PATH_NAMES
         },
         "runtime": {
             "python_bin": str(args.python_bin),
@@ -600,11 +511,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             "sparse_pipeline": _sha256(args.sparse_pipeline),
             "sparsity_selection": _sha256(Path(_selection_mod.__file__).resolve()),
             "lasso_cd": _sha256(Path(_lasso_mod.__file__).resolve()),
-            "component_spec_source": (
-                _sha256(args.component_spec)
-                if args.component_spec is not None
-                else None
-            ),
         },
         "created_at": _now(),
     }
@@ -632,18 +538,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     selection_dir.mkdir(parents=True, exist_ok=True)
     selection_prefix = selection_dir / "coherit"
     selection_output = selection_dir / "validation_path.json"
+    selection_warm_state = selection_dir / "lasso_warm_state.npz"
     selection_summary_path = Path(str(selection_prefix) + ".summary.json")
     if not selection_summary_path.exists():
         partial = list(selection_dir.glob("coherit.*")) + list(
             selection_dir.glob("validation_path*")
         )
+        if selection_warm_state.exists():
+            partial.append(selection_warm_state)
         if partial:
             raise RuntimeError(
                 f"Incomplete selection outputs exist; inspect {selection_dir}."
             )
         command = _sparse_command(
             args=args,
-            component_spec=component_spec,
             phenotype=args.train_pheno_txt,
             keep=args.train_keep,
             prediction_keep=args.validation_keep,
@@ -652,10 +560,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             selection_output=selection_output,
             fixed_lam_ratio=None,
             theta_init=None,
+            warm_state_in=None,
+            warm_state_out=selection_warm_state,
         )
         print(
-            f"[fixed-K validation-lambda] fitting K={fixed_k} with "
-            "validation-selected lambda inside every outer iteration",
+            "[single-GRM validation-R2] selecting lambda inside every "
+            "outer iteration",
             flush=True,
         )
         _run_command(command, selection_dir / "runner.log")
@@ -663,8 +573,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     selection_summary = _validate_sparse_summary(
         selection_prefix,
         expected_method="validation_r2",
-        expected_k=fixed_k,
     )
+    if not selection_warm_state.is_file():
+        raise ValueError("Selection fit did not emit the final-refit warm state.")
     if not bool(selection_summary.get("validation_selection_inside_outer_loop")):
         raise ValueError(
             "Selection fit did not perform validation selection inside the outer loop."
@@ -714,7 +625,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise RuntimeError(f"Incomplete final outputs exist; inspect {final_dir}.")
         command = _sparse_command(
             args=args,
-            component_spec=component_spec,
             phenotype=args.fit_pheno_txt,
             keep=args.fit_keep,
             prediction_keep=args.test_keep,
@@ -726,10 +636,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 selection_summary["var_components_lasso_ml"],
                 dtype=np.float64,
             ),
+            warm_state_in=selection_warm_state,
+            warm_state_out=None,
         )
         print(
-            f"[fixed-K validation-lambda] final refit with frozen K={fixed_k} "
-            f"and lambda/lambda_max={selected_ratio:.8g}",
+            "[single-GRM validation-R2] warm final refit with "
+            f"lambda/lambda_max={selected_ratio:.8g}",
             flush=True,
         )
         _run_command(command, final_dir / "runner.log")
@@ -737,8 +649,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     final_summary = _validate_sparse_summary(
         final_prefix,
         expected_method="fixed_lam_ratio",
-        expected_k=fixed_k,
     )
+    warm_state_summary = final_summary.get("lasso_warm_state_in")
+    if not (
+        isinstance(warm_state_summary, dict)
+        and warm_state_summary.get("status") == "loaded"
+    ):
+        raise ValueError("Final refit did not reuse the selected Lasso state.")
     final_selected_ratio = float(final_summary["lasso_selected_lam_ratio"])
     if not math.isclose(final_selected_ratio, selected_ratio, rel_tol=1e-10, abs_tol=1e-12):
         raise ValueError("Final refit did not use the frozen validation lambda ratio.")
@@ -753,7 +670,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     comparison = _existing_comparison(
         args.existing_prediction_results,
         case_id=args.case_id,
-        fixed_k=fixed_k,
         prediction_r2=float(test_metrics["correlation_squared"]),
     )
     comparison_path = args.out_dir / "prediction_comparison.tsv"
@@ -775,7 +691,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "completed_at": _now(),
         "algorithm": config["algorithm"],
         "sparse_path_mode": SPARSE_PATH_MODE,
-        "fixed_K": int(fixed_k),
+        "K": 1,
         "selection": {
             "training_samples": int(selection_summary["n_samples"]),
             "validation_samples": int(selection_payload["n_validation_samples"]),
@@ -796,8 +712,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         },
         "final_refit": {
             "training_samples": int(final_summary["n_samples"]),
-            "partition_frozen_before_refit": True,
+            "single_grm_fixed_before_refit": True,
             "lambda_ratio_frozen_before_refit": True,
+            "lasso_warm_state_reused": True,
+            "lasso_warm_state": str(selection_warm_state),
             "selected_lam_ratio": final_selected_ratio,
             "lasso_path_role": final_summary.get("lasso_path_role"),
             "lasso_path_points_solved": int(
@@ -812,13 +730,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         },
         "comparison": comparison,
         "comparison_path": str(comparison_path),
-        "component_spec": str(component_spec),
         "run_config": str(config_path),
     }
     _atomic_json(result_path, result)
     print(
-        f"[fixed-K validation-lambda] complete K={fixed_k} "
-        "validation_R2=%.8f "
+        "[single-GRM validation-R2] complete validation_R2=%.8f "
         "test_R2=%.8f support=%s"
         % (
             selected_validation_r2,
@@ -827,7 +743,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
         flush=True,
     )
-    print(f"[fixed-K validation-lambda] result -> {result_path}", flush=True)
+    print(f"[single-GRM validation-R2] result -> {result_path}", flush=True)
     return 0
 
 

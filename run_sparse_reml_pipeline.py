@@ -25,12 +25,11 @@ from __future__ import annotations
 
 import argparse
 import atexit
-import csv
 import dataclasses
 import importlib
-import itertools
 import json
 import logging
+import math
 import os
 import sys
 import time
@@ -47,7 +46,6 @@ _runtime_mod.configure_runtime_env()
 import jax
 import jax.numpy as jnp
 import numpy as np
-import scipy.linalg as sla
 from bed_reader import open_bed
 
 # Highest FP32 accumulation is the robust default; users can explicitly select
@@ -65,14 +63,6 @@ _pcg_mod = importlib.import_module(f"{pkg_name}.pcg")
 _precond_mod = importlib.import_module(f"{pkg_name}.precond")
 _common_mod = importlib.import_module(f"{pkg_name}.pipeline_common")
 _io_utils_mod = importlib.import_module(f"{pkg_name}.io_utils")
-_component_spec_mod = importlib.import_module(f"{pkg_name}.component_spec")
-_adaptive_partition_mod = importlib.import_module(
-    f"{pkg_name}.adaptive_partition"
-)
-_covtree_mod = importlib.import_module(f"{pkg_name}.covtree")
-_covariance_score_mod = importlib.import_module(
-    f"{pkg_name}.covariance_score"
-)
 _sparse_prediction_mod = importlib.import_module(
     f"{pkg_name}.sparse_prediction"
 )
@@ -92,20 +82,9 @@ make_lambda_sequence = _lasso_mod.make_lambda_sequence
 compute_projected_hinv_vector = _lasso_mod.compute_projected_hinv_vector
 fit_weighted_lasso_with_covariates = _lasso_mod.fit_weighted_lasso_with_covariates
 pcg_solve = _pcg_mod.pcg_solve
-load_component_specs = _component_spec_mod.load_component_specs
-AdaptiveComponent = _adaptive_partition_mod.AdaptiveComponent
-write_component_spec = _adaptive_partition_mod.write_component_spec
-generate_covtree_candidates = _covtree_mod.generate_covtree_candidates
-replace_covtree_parent = _covtree_mod.replace_parent
-selective_covariance_warm_start = (
-    _covtree_mod.selective_covariance_warm_start
-)
-evaluate_covtree_candidates = (
-    _covariance_score_mod.evaluate_covtree_candidates
-)
 predict_sparse_branch = _sparse_prediction_mod.predict_sparse_branch
-predict_sparse_path_partitioned = (
-    _sparse_prediction_mod.predict_sparse_path_partitioned
+predict_sparse_path_single_grm = (
+    _sparse_prediction_mod.predict_sparse_path_single_grm
 )
 write_sparse_prediction_outputs = (
     _sparse_prediction_mod.write_sparse_prediction_outputs
@@ -151,491 +130,208 @@ def _bed_count(path: str, attr: str) -> int:
             close()
 
 
-def _load_component_variant_indices(path: str) -> list[np.ndarray]:
-    return [
-        np.asarray(spec.variant_indices, dtype=np.int64).reshape(-1)
-        for spec in load_component_specs(path)
-    ]
-
-
-def _load_ld_score_in_bim_order(path: str, bim_path: str) -> np.ndarray:
-    """Load individual-marker LD scores after proving exact BIM-ID alignment."""
-    values: list[float] = []
-    with open(path, encoding="utf-8", newline="") as score_handle:
-        reader = csv.DictReader(score_handle, delimiter="\t")
-        if not reader.fieldnames or not {"ID", "ld_score"}.issubset(
-            reader.fieldnames
-        ):
-            raise ValueError("CovTree LD-score table must contain ID and ld_score.")
-        with open(bim_path, encoding="utf-8") as bim_handle:
-            sentinel = object()
-            for row_index, pair in enumerate(
-                itertools.zip_longest(reader, bim_handle, fillvalue=sentinel),
-                start=1,
-            ):
-                score_row, bim_line = pair
-                if score_row is sentinel or bim_line is sentinel:
-                    raise ValueError("CovTree LD-score and BIM row counts differ.")
-                fields = str(bim_line).split()
-                if len(fields) < 2 or str(score_row["ID"]) != fields[1]:
-                    raise ValueError(
-                        "CovTree LD-score/BIM order mismatch at row "
-                        f"{row_index}."
-                    )
-                value = float(score_row["ld_score"])
-                if not np.isfinite(value) or value < 0.0:
-                    raise ValueError(
-                        f"Invalid CovTree LD score at row {row_index}."
-                    )
-                values.append(value)
-    result = np.asarray(values, dtype=np.float64)
-    if result.size == 0:
-        raise ValueError("CovTree LD-score table is empty.")
-    return result
-
-
-def _covtree_components_from_spec(path: str) -> list[AdaptiveComponent]:
-    specs = load_component_specs(path)
-    return [
-        AdaptiveComponent(
-            name=str(spec.name),
-            variant_indices=np.asarray(spec.variant_indices, dtype=np.int64),
-            annotation=dict(spec.annotation or {}),
-        )
-        for spec in specs
-    ]
-
-
-def _load_sparse_numerical_state(
+def _load_lasso_warm_state(
     path: str,
     *,
-    grm_index: "MultiGRMIndex",
-    n_samples: int,
-    n_lambda: int,
+    n_markers: int,
+    target_lam_ratio: float,
 ) -> dict[str, object]:
-    """Load a parent sparse state and remap source SNPs to current cache order."""
+    """Load the selected K=1 alpha as a warm start for the final refit."""
+    target_ratio = _canonical_fixed_lam_ratio(float(target_lam_ratio))
     with np.load(path, allow_pickle=False) as payload:
         required = {
-            "source_candidate_indices",
-            "source_support_indices",
-            "beta_snp_path",
-            "screen_solution",
-            "z_solution",
-            "fixed_mean",
+            "lasso_warm_state_schema_version",
+            "marker_indices",
+            "selected_beta_snp",
+            "selected_lam_ratio",
         }
         if not required.issubset(payload.files):
-            raise ValueError("Sparse state artifact is incomplete.")
-        source_candidate = np.asarray(
-            payload["source_candidate_indices"], dtype=np.int64
+            raise ValueError("Lasso warm-state artifact is incomplete.")
+        schema_version = int(
+            np.asarray(payload["lasso_warm_state_schema_version"]).reshape(())
+        )
+        marker_indices = np.asarray(
+            payload["marker_indices"], dtype=np.int64
         ).reshape(-1)
-        source_support = np.asarray(
-            payload["source_support_indices"], dtype=np.int64
+        selected_beta = np.asarray(
+            payload["selected_beta_snp"], dtype=np.float64
         ).reshape(-1)
-        beta_path = np.asarray(payload["beta_snp_path"], dtype=np.float64)
-        screen_solution = np.asarray(payload["screen_solution"], dtype=np.float32)
-        z_solution = np.asarray(payload["z_solution"], dtype=np.float32)
-        fixed_mean = np.asarray(payload["fixed_mean"], dtype=np.float64).reshape(-1)
+        selected_ratio = _canonical_fixed_lam_ratio(
+            float(np.asarray(payload["selected_lam_ratio"]).reshape(()))
+        )
+
+    if schema_version != 1:
+        raise ValueError(
+            f"Unsupported Lasso warm-state schema: {schema_version}."
+        )
     if (
-        np.unique(source_candidate).size != source_candidate.size
-        or np.unique(source_support).size != source_support.size
-        or np.setdiff1d(source_support, source_candidate).size > 0
+        marker_indices.size != selected_beta.size
+        or np.unique(marker_indices).size != marker_indices.size
+        or np.any((marker_indices < 0) | (marker_indices >= int(n_markers)))
+        or not np.all(np.isfinite(selected_beta))
     ):
-        raise ValueError("Sparse state candidate/support source indices are invalid.")
-    if (
-        beta_path.ndim != 2
-        or beta_path.shape[1] != int(source_candidate.size)
-        or not 1 <= beta_path.shape[0] <= int(n_lambda)
+        raise ValueError("Lasso warm-state marker coefficients are invalid.")
+    if not math.isclose(
+        selected_ratio,
+        target_ratio,
+        rel_tol=1e-10,
+        abs_tol=1e-12,
     ):
         raise ValueError(
-            "Sparse state beta path shape mismatch: expected 1.."
-            f"{int(n_lambda)} rows and {int(source_candidate.size)} columns, "
-            f"got {beta_path.shape}."
+            "Lasso warm state does not match the frozen lambda ratio."
         )
-    if z_solution.shape != (int(n_samples), int(source_candidate.size)):
-        raise ValueError("Sparse state Hinv[Z] matrix has the wrong shape.")
-    if screen_solution.ndim != 2 or screen_solution.shape[0] != int(n_samples):
-        raise ValueError("Sparse state screening solution has the wrong shape.")
-    if fixed_mean.shape != (int(n_samples),):
-        raise ValueError("Sparse state fixed mean has the wrong shape.")
-    arrays_to_check = (beta_path, screen_solution, z_solution, fixed_mean)
-    if not all(np.all(np.isfinite(value)) for value in arrays_to_check):
-        raise ValueError("Sparse numerical state contains non-finite values.")
 
-    cache = np.arange(grm_index.m_total, dtype=np.int64)
-    cache_to_source = grm_index.source_variant_indices(cache)
-    source_to_cache = np.empty(grm_index.m_total, dtype=np.int64)
-    source_to_cache[cache_to_source] = cache
-    if np.any(
-        (source_candidate < 0) | (source_candidate >= grm_index.m_total)
-    ):
-        raise ValueError("Sparse state contains an out-of-range source marker.")
-    candidate = source_to_cache[source_candidate]
-    support = source_to_cache[source_support]
+    order = np.argsort(marker_indices)
+    candidate = marker_indices[order]
+    selected_beta = selected_beta[order]
+    beta_path = (
+        selected_beta.reshape(1, -1)
+        if math.isclose(target_ratio, 1.0, rel_tol=0.0, abs_tol=1e-12)
+        else np.vstack([np.zeros_like(selected_beta), selected_beta])
+    )
     return {
         "candidate": candidate,
-        "support": np.sort(support),
+        "support": candidate.copy(),
         "beta_snp_path": beta_path,
-        "screen_solution": jnp.asarray(screen_solution, dtype=jnp.float32),
-        "z_solution": z_solution,
-        "fixed_mean": fixed_mean,
+        "selected_lam_ratio": selected_ratio,
     }
 
 
-def _write_sparse_numerical_state(
+def _write_lasso_warm_state(
     path: str,
     *,
-    grm_index: "MultiGRMIndex",
     candidate: np.ndarray,
     support: np.ndarray,
-    beta_snp_path: np.ndarray,
-    screen_solution,
-    warm_z_dict: dict[int, np.ndarray],
-    fixed_mean: np.ndarray,
+    selected_beta_snp: np.ndarray,
+    selected_lam_ratio: float,
 ) -> dict[str, object]:
-    """Persist the exact state reusable under a covariance-preserving split."""
+    """Persist only marker coordinates and alpha needed by the final refit."""
     candidate_indices = np.asarray(candidate, dtype=np.int64).reshape(-1)
-    support_indices = np.asarray(support, dtype=np.int64).reshape(-1)
-    beta_path = np.asarray(beta_snp_path, dtype=np.float32)
-    screen = np.asarray(jax.device_get(screen_solution), dtype=np.float32)
-    mean = np.asarray(fixed_mean, dtype=np.float32).reshape(-1)
-    if beta_path.ndim != 2 or beta_path.shape[1] != candidate_indices.size:
-        raise ValueError("Cannot emit sparse state: beta path/candidate mismatch.")
-    missing_z = [
-        int(index) for index in candidate_indices if int(index) not in warm_z_dict
-    ]
-    if missing_z:
-        raise ValueError(
-            "Cannot emit sparse state: Hinv[Z] columns are incomplete."
+    support_indices = np.sort(
+        np.asarray(support, dtype=np.int64).reshape(-1)
+    )
+    selected_beta = np.asarray(
+        selected_beta_snp, dtype=np.float64
+    ).reshape(-1)
+    selected_ratio = _canonical_fixed_lam_ratio(
+        float(selected_lam_ratio)
+    )
+    if (
+        selected_beta.shape != candidate_indices.shape
+        or np.unique(candidate_indices).size != candidate_indices.size
+        or np.unique(support_indices).size != support_indices.size
+        or not np.all(np.isfinite(selected_beta))
+    ):
+        raise ValueError("Cannot emit an invalid Lasso warm state.")
+
+    candidate_position = {
+        int(marker): int(position)
+        for position, marker in enumerate(candidate_indices.tolist())
+    }
+    try:
+        support_positions = np.asarray(
+            [candidate_position[int(marker)] for marker in support_indices],
+            dtype=np.int64,
         )
-    z_solution = np.column_stack(
-        [warm_z_dict[int(index)] for index in candidate_indices]
-    ).astype(np.float32, copy=False)
-    source_candidate = grm_index.source_variant_indices(candidate_indices)
-    source_support = grm_index.source_variant_indices(support_indices)
+    except KeyError as exc:
+        raise ValueError(
+            "Lasso warm-state support is not contained in the candidate set."
+        ) from exc
+    support_beta = selected_beta[support_positions]
+
     ensure_parent_dir(path)
     temporary = f"{path}.tmp.{os.getpid()}"
     with open(temporary, "wb") as handle:
         np.savez(
             handle,
-            source_candidate_indices=source_candidate,
-            source_support_indices=source_support,
-            beta_snp_path=beta_path,
-            screen_solution=screen,
-            z_solution=z_solution,
-            fixed_mean=mean,
+            lasso_warm_state_schema_version=np.asarray(1, dtype=np.int64),
+            marker_indices=support_indices,
+            selected_beta_snp=support_beta.astype(np.float32),
+            selected_lam_ratio=np.asarray(selected_ratio, dtype=np.float64),
         )
     os.replace(temporary, path)
     return {
         "status": "emitted",
         "path": os.path.abspath(path),
-        "candidate_size": int(candidate_indices.size),
-        "support_size": int(support_indices.size),
-        "lambda_rows": int(beta_path.shape[0]),
-        "screen_rhs_columns": int(screen.shape[1]),
-        "z_solution_shape": list(z_solution.shape),
-        "coordinate_system": "source_marker_index",
-        "reuse_contract": "covariance_preserving_split_only",
+        "marker_count": int(support_indices.size),
+        "selected_lam_ratio": selected_ratio,
+        "coordinate_system": "single_grm_marker_index",
+        "reuse_contract": "selection_to_final_refit_only",
     }
 
-
-def _normalized_design_is_well_conditioned(
-    design: np.ndarray,
-    *,
-    relative_tol: float,
-) -> bool:
-    """Match the normalized-Gram rank criterion used by REML."""
-    if design.shape[1] == 0:
-        return True
-    norms = np.linalg.norm(design, axis=0)
-    if not np.all(np.isfinite(norms)) or np.any(norms <= 0.0):
-        return False
-    normalized = design / norms
-    gram = normalized.T @ normalized
-    eigvals = np.linalg.eigvalsh(0.5 * (gram + gram.T))
-    return bool(
-        eigvals[0]
-        > float(relative_tol) * max(float(eigvals[-1]), 1.0)
-    )
-
-
-def _merge_independent_fixed_effects(
-    covar: np.ndarray | None,
-    active_geno: np.ndarray,
-    *,
-    relative_tol: float = 1e-7,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Append a numerically independent subset of active SNP fixed effects.
-
-    LASSO may select perfectly linked SNPs. Their fixed-effect columns span the
-    same space, but passing every duplicate to REML makes ``X'V^-1X`` singular.
-    Pivoted QR finds a stable spanning subset while always retaining the base
-    covariates. The returned indices refer to columns of ``active_geno``.
-    """
-    active = np.asarray(active_geno, dtype=np.float64)
-    if active.ndim != 2:
-        raise ValueError("active_geno must be a two-dimensional matrix.")
-    n_samples = int(active.shape[0])
-
-    if covar is None:
-        base = np.empty((n_samples, 0), dtype=np.float64)
-    else:
-        base = np.asarray(covar, dtype=np.float64)
-        if base.ndim != 2 or int(base.shape[0]) != n_samples:
-            raise ValueError("covar and active_geno must have matching rows.")
-    if not np.all(np.isfinite(base)) or not np.all(np.isfinite(active)):
-        raise ValueError("Fixed-effect columns must contain only finite values.")
-    if not _normalized_design_is_well_conditioned(
-        base, relative_tol=relative_tol
-    ):
-        raise ValueError(
-            "covar is rank-deficient or numerically collinear; "
-            "remove redundant fixed-effect columns."
-        )
-
-    active_norms = np.linalg.norm(active, axis=0)
-    eligible = np.flatnonzero(np.isfinite(active_norms) & (active_norms > 0.0))
-    if eligible.size == 0:
-        return np.asarray(base, dtype=np.float32), np.empty((0,), dtype=np.int64)
-
-    active_normalized = active[:, eligible] / active_norms[eligible]
-    if base.shape[1] > 0:
-        base_normalized = base / np.linalg.norm(base, axis=0)
-        q_base, _ = sla.qr(
-            base_normalized,
-            mode="economic",
-            check_finite=False,
-        )
-        active_residual = active_normalized - q_base @ (q_base.T @ active_normalized)
-    else:
-        active_residual = active_normalized
-
-    _, r_active, piv = sla.qr(
-        active_residual,
-        mode="economic",
-        pivoting=True,
-        check_finite=False,
-    )
-    diag = np.abs(np.diag(r_active))
-    if diag.size == 0:
-        selected_order = np.empty((0,), dtype=np.int64)
-    else:
-        qr_tol = np.sqrt(float(relative_tol)) * max(float(diag[0]), 1.0)
-        rank = int(np.count_nonzero(diag > qr_tol))
-        selected_order = eligible[np.asarray(piv[:rank], dtype=np.int64)]
-
-    while selected_order.size > 0:
-        trial = np.concatenate([base, active[:, selected_order]], axis=1)
-        if _normalized_design_is_well_conditioned(
-            trial, relative_tol=relative_tol
-        ):
-            break
-        selected_order = selected_order[:-1]
-
-    selected = np.sort(selected_order)
-    merged = np.concatenate([base, active[:, selected]], axis=1)
-    return np.asarray(merged, dtype=np.float32), selected
-
-
 # ---------------------------------------------------------------------------
-# Multi-GRM helpers
+# ---------------------------------------------------------------------------
+# Single-GRM sparse marker index
 # ---------------------------------------------------------------------------
 
-class MultiGRMIndex:
-    """
-    Maps global SNP indices to (grm_index, local_snp_index) pairs.
+class SingleGRMIndex:
+    """Validated marker access for the one whole-genome sparse GRM."""
 
-    With G GRMs having m_0, m_1, … SNPs, the global index space is
-    [0, m_0) for GRM 0, [m_0, m_0+m_1) for GRM 1, etc.
-    For a component-partitioned single source, this is the streamer's
-    canonical component-concatenated cache order.  Source BIM/PVAR indices are
-    obtained explicitly through :meth:`source_variant_indices`.
-    """
-
-    def __init__(self, streamers, call_plan=(), component_variant_indices=None):
-        self.streamers = streamers
-        self.call_plan = tuple(call_plan)
-        self._partitioned_single_streamer = (
-            component_variant_indices is not None
-            and len(streamers) == 1
-        )
-        self._source_variant_indices = None
-        if self._partitioned_single_streamer:
-            if len(streamers) != 1:
-                raise ValueError(
-                    "Single-source component partitioning requires exactly one streamer."
-                )
-            streamer = streamers[0]
-            if not bool(getattr(streamer, "has_component_partition", False)):
-                raise ValueError(
-                    "component_variant_indices were supplied, but the genotype "
-                    "streamer is not component-partitioned."
-                )
-            requested_groups = [
-                np.asarray(group, dtype=np.int64).reshape(-1)
-                for group in component_variant_indices
-            ]
-            self.n_grm = int(streamer.n_components)
-            component_offsets = np.asarray(
-                streamer._component_snp_offsets, dtype=np.int64
-            ).reshape(-1)
-            if component_offsets.shape != (self.n_grm + 1,):
-                raise ValueError("Invalid component offsets in partitioned streamer.")
-            self.m_per_grm = np.diff(component_offsets)
-            cache_to_source = np.asarray(
-                streamer._cache_to_source_variant_indices, dtype=np.int64
-            ).reshape(-1)
-            if cache_to_source.size != int(streamer.m):
-                raise ValueError(
-                    "Partitioned streamer's cache-to-source SNP map has the wrong length."
-                )
-            if len(requested_groups) != self.n_grm:
-                raise ValueError(
-                    "Component count mismatch between component spec and genotype streamer."
-                )
-            for component_idx, requested in enumerate(requested_groups):
-                start = int(component_offsets[component_idx])
-                stop = int(component_offsets[component_idx + 1])
-                actual = cache_to_source[start:stop]
-                # The streamer canonicalizes each component to increasing
-                # source order.  Validate the requested membership, then use
-                # that canonical map as the sole coordinate source for sparse
-                # output, BIM/PVAR lookup and prediction auditing.
-                expected = np.unique(requested)
-                if not np.array_equal(actual, expected):
-                    raise ValueError(
-                        "Component SNP mapping mismatch between component spec "
-                        f"and genotype streamer for component {component_idx}."
-                    )
-            self._source_variant_indices = cache_to_source.copy()
-        else:
-            self.n_grm = len(streamers)
-            self.m_per_grm = np.array([st.m for st in streamers], dtype=np.int64)
-        self.offsets = np.zeros(self.n_grm + 1, dtype=np.int64)
-        np.cumsum(self.m_per_grm, out=self.offsets[1:])
-        self.m_total = int(self.offsets[-1])
-
-    def _validated_global_indices(self, global_idx: np.ndarray) -> np.ndarray:
-        gidx = np.asarray(global_idx, dtype=np.int64)
-        if gidx.ndim != 1:
-            raise ValueError("global_idx must be one-dimensional.")
-        if np.any((gidx < 0) | (gidx >= self.m_total)):
-            raise IndexError(
-                f"Global SNP indices must lie in [0, {self.m_total})."
+    def __init__(self, streamers):
+        if len(streamers) != 1:
+            raise ValueError(
+                "The sparse pipeline supports exactly one whole-genome GRM."
             )
-        return gidx
+        self.streamer = streamers[0]
+        if bool(getattr(self.streamer, "has_component_partition", False)):
+            raise ValueError(
+                "Component-partitioned genotype streams are not supported "
+                "by the single-GRM sparse pipeline."
+            )
+        if int(getattr(self.streamer, "n_components", 1)) != 1:
+            raise ValueError(
+                "The sparse genotype stream must expose exactly one component."
+            )
+        self.n_grm = 1
+        self.m_total = int(self.streamer.m)
+        self.m_per_grm = np.asarray([self.m_total], dtype=np.int64)
+        self.offsets = np.asarray([0, self.m_total], dtype=np.int64)
+
+    def _validated_indices(self, marker_idx: np.ndarray) -> np.ndarray:
+        idx = np.asarray(marker_idx, dtype=np.int64)
+        if idx.ndim != 1:
+            raise ValueError("Marker indices must be one-dimensional.")
+        if np.any((idx < 0) | (idx >= self.m_total)):
+            raise IndexError(
+                f"Marker indices must lie in [0, {self.m_total})."
+            )
+        return idx
 
     def global_to_local(
-        self, global_idx: np.ndarray
+        self, marker_idx: np.ndarray
     ) -> list[tuple[int, np.ndarray, np.ndarray]]:
-        """
-        Convert global SNP indices to per-GRM groups.
-
-        Returns list of (grm_idx, local_indices, positions_in_input) tuples,
-        where positions_in_input are the positions in the original global_idx
-        array so results can be assembled back.
-        """
-        gidx = self._validated_global_indices(global_idx)
-        grm_ids = np.searchsorted(self.offsets[1:], gidx, side="right")
-        grm_ids = np.clip(grm_ids, 0, self.n_grm - 1)
-        groups: list[tuple[int, np.ndarray, np.ndarray]] = []
-        for g in range(self.n_grm):
-            mask = grm_ids == g
-            if not np.any(mask):
-                continue
-            positions = np.flatnonzero(mask)
-            local = gidx[positions] - int(self.offsets[g])
-            groups.append((g, local, positions))
-        return groups
+        idx = self._validated_indices(marker_idx)
+        if idx.size == 0:
+            return []
+        return [
+            (
+                0,
+                idx.copy(),
+                np.arange(idx.size, dtype=np.int64),
+            )
+        ]
 
     def xtv_all(self, u_jax: jnp.ndarray, normalize: bool = False) -> np.ndarray:
-        """
-        Compute X^T u across all GRMs, returning a global (m_total,) score.
-        """
-        if self._partitioned_single_streamer:
-            return np.asarray(
-                self.streamers[0].xtv(u_jax, normalize=normalize),
-                dtype=np.float64,
-            )
-        if self.n_grm > 1 and self.call_plan:
-            from .kv_impl import xtv_impl_multi_streamed_concat
-
-            for st in self.streamers:
-                st._prepare_kv_pass()
-            return np.asarray(
-                xtv_impl_multi_streamed_concat(
-                    u_jax,
-                    self.streamers,
-                    self.call_plan,
-                    missing_val=int(self.streamers[0]._missing_val),
-                    normalize=normalize,
-                ),
-                dtype=np.float64,
-            )
-
-        scores = None
-        for g, st in enumerate(self.streamers):
-            off = int(self.offsets[g])
-            block = np.asarray(
-                st.xtv(u_jax, normalize=normalize), dtype=np.float64
-            )
-            if scores is None:
-                scores = np.zeros(
-                    (self.m_total, *block.shape[1:]),
-                    dtype=np.float64,
-                )
-            scores[off : off + st.m, ...] = block
-        if scores is None:
-            raise RuntimeError("xtv_all requires at least one genotype streamer.")
-        return scores
+        return np.asarray(
+            self.streamer.xtv(u_jax, normalize=normalize),
+            dtype=np.float64,
+        )
 
     def extract_standardized_columns(
-        self, global_idx: np.ndarray
+        self, marker_idx: np.ndarray
     ) -> np.ndarray:
-        """
-        Extract standardized genotype columns for global SNP indices.
-        Dispatches to the correct streamer for each GRM and assembles
-        columns in the original order.
-        """
-        gidx = self._validated_global_indices(global_idx)
-        if self._partitioned_single_streamer:
-            return self.streamers[0].extract_standardized_columns(gidx)
-        n = self.streamers[0].n
-        out = np.empty((n, gidx.size), dtype=np.float32)
-        for g, local, positions in self.global_to_local(gidx):
-            cols = self.streamers[g].extract_standardized_columns(local)
-            out[:, positions] = cols
-        return out
+        return self.streamer.extract_standardized_columns(
+            self._validated_indices(marker_idx)
+        )
 
-    def source_variant_indices(self, global_idx: np.ndarray) -> np.ndarray:
-        gidx = self._validated_global_indices(global_idx)
-        if self._source_variant_indices is None:
-            return gidx.copy()
-        return np.asarray(self._source_variant_indices[gidx], dtype=np.int64)
+    def source_variant_indices(self, marker_idx: np.ndarray) -> np.ndarray:
+        return self._validated_indices(marker_idx).copy()
 
     def lookup_bim_rows(
-        self, bed_prefixes: list[str], global_idx: np.ndarray
+        self, bed_prefix: str, marker_idx: np.ndarray
     ) -> dict[int, tuple[str, str, str, str, str, str]]:
-        """
-        Look up BIM info for global SNP indices, dispatching to the
-        correct .bim file for each GRM.
-        """
-        result: dict[int, tuple[str, str, str, str, str, str]] = {}
-        if self._partitioned_single_streamer:
-            source_idx = self.source_variant_indices(global_idx)
-            source_rows = _lookup_bim_rows(bed_prefixes[0] + ".bim", source_idx)
-            for global_snp, src_idx in zip(global_idx.tolist(), source_idx.tolist()):
-                if int(src_idx) in source_rows:
-                    result[int(global_snp)] = source_rows[int(src_idx)]
-            return result
-        for g, local, positions in self.global_to_local(global_idx):
-            bim_path = bed_prefixes[g] + ".bim"
-            local_rows = _lookup_bim_rows(bim_path, local)
-            for pos, loc_idx in zip(positions, local):
-                global_snp = int(global_idx[pos])
-                if int(loc_idx) in local_rows:
-                    result[global_snp] = local_rows[int(loc_idx)]
-        return result
-
+        idx = self._validated_indices(marker_idx)
+        return _lookup_bim_rows(bed_prefix + ".bim", idx)
 
 def _lookup_bim_rows(bim_path: str, snp_indices: np.ndarray) -> dict[int, tuple[str, str, str, str, str, str]]:
     idx = np.asarray(snp_indices, dtype=np.int64)
@@ -693,7 +389,7 @@ class _PredictionFitContext:
     """Prediction genotype/covariate state shared by iterative validation."""
 
     fitter: object
-    grm_index: MultiGRMIndex
+    grm_index: SingleGRMIndex
     covar: np.ndarray | None
     sample_ids: list[str]
     dropped_ids: list[str]
@@ -712,7 +408,6 @@ def _build_prediction_fit_context(
     *,
     args,
     training_fitter,
-    component_variant_indices: list[np.ndarray],
     prediction_bed_list: list[str],
     prediction_pgen_prefix: str,
     covar_transform,
@@ -722,16 +417,20 @@ def _build_prediction_fit_context(
     ring_depth: int,
 ) -> _PredictionFitContext:
     """Build prediction state using training-only genotype standardization."""
-    standardization_overrides = []
-    for streamer in training_fitter.streamers:
-        if streamer._means_host is None or streamer._inv_sds_host is None:
-            raise RuntimeError(
-                "Sparse prediction requires retained training SNP "
-                "standardization statistics."
-            )
-        standardization_overrides.append(
-            (streamer._means_host, streamer._inv_sds_host)
+    if len(training_fitter.streamers) != 1:
+        raise RuntimeError("Sparse prediction requires exactly one training GRM.")
+    training_streamer = training_fitter.streamers[0]
+    if (
+        training_streamer._means_host is None
+        or training_streamer._inv_sds_host is None
+    ):
+        raise RuntimeError(
+            "Sparse prediction requires retained training SNP "
+            "standardization statistics."
         )
+    standardization_overrides = [
+        (training_streamer._means_host, training_streamer._inv_sds_host)
+    ]
 
     if prediction_pgen_prefix:
         prediction_fam_path = make_nonbed_input_fam(
@@ -786,7 +485,6 @@ def _build_prediction_fit_context(
     prediction_cfg_kwargs = dict(
         device=args.device,
         sample_mask=prediction_sample_mask,
-        component_variant_indices=component_variant_indices or None,
         standardization_overrides=standardization_overrides,
         call_width=call_width,
         keep_host_stats=True,
@@ -818,11 +516,7 @@ def _build_prediction_fit_context(
     close_callback = prediction_fitter.close
     atexit.register(close_callback)
     try:
-        prediction_grm_index = MultiGRMIndex(
-            prediction_fitter.streamers,
-            call_plan=prediction_fitter._multi_call_plan,
-            component_variant_indices=component_variant_indices or None,
-        )
+        prediction_grm_index = SingleGRMIndex(prediction_fitter.streamers)
     except Exception:
         atexit.unregister(close_callback)
         close_callback()
@@ -840,99 +534,32 @@ def _build_prediction_fit_context(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run sparse REML + LASSO pipeline on real genotype data.")
-    # Genotype input — exactly one of the two groups must be supplied
+    # Exactly one single-GRM genotype source must be supplied.
     p.add_argument("--bed-prefix", default=env("BED_PREFIX", ""),
-                   help="PLINK1 BED file prefix (no extension); comma-separated for multiple GRMs")
+                   help="One PLINK1 BED file prefix (no extension).")
     p.add_argument("--pgen-prefix", default=env("PGEN_PREFIX", ""),
                    help="PLINK2 PGEN file prefix (direct read, no conversion needed)")
     p.add_argument(
-        "--component-spec",
-        default=env("COMPONENT_SPEC", ""),
-        help="Structured component spec (.json or .npz) defining SNP-ID/index GRM partitions.",
-    )
-    p.add_argument(
         "--variance-components-init",
         default="",
-        help=(
-            "Optional JSON array with one initial value per GRM followed by "
-            "the residual variance. Used by the Adaptive COHERIT warm start."
-        ),
+        help=argparse.SUPPRESS,
     )
     p.add_argument(
-        "--sparse-state-in",
+        "--lasso-warm-state-in",
         default="",
-        help=(
-            "Optional NPZ sparse numerical state from a covariance-preserving "
-            "parent layer. Source-marker coordinates are remapped to this partition."
-        ),
+        help=argparse.SUPPRESS,
     )
     p.add_argument(
-        "--sparse-state-out",
+        "--lasso-warm-state-out",
         default="",
-        help="Optional NPZ output used to warm-start the next CovTree layer.",
+        help=argparse.SUPPRESS,
     )
-    p.add_argument(
-        "--marker-score-out",
-        default="",
-        help=(
-            "Optional .npz output for covariance-standardized residual marker "
-            "scores used by Adaptive COHERIT."
-        ),
-    )
-    p.add_argument(
-        "--marker-score-probes",
-        type=int,
-        default=32,
-        help="Rademacher probes for the marker-information diagonal estimate.",
-    )
-    p.add_argument(
-        "--marker-score-seed",
-        type=int,
-        default=0,
-        help="Deterministic Rademacher seed for --marker-score-out.",
-    )
-    p.add_argument(
-        "--marker-score-min-validation-r2",
-        type=float,
-        default=None,
-        help=(
-            "Optional Adaptive-K optimization: emit marker scores only when "
-            "the final validation-selected model reaches this R2. A declining "
-            "K layer can then stop without paying for unused score probes."
-        ),
-    )
-    p.add_argument(
-        "--covtree-diagnostic-out",
-        default="",
-        help=(
-            "Optional JSON output for REML covariance-contrast split "
-            "tests under the converged fixed-K model."
-        ),
-    )
-    p.add_argument(
-        "--covtree-split-spec-out",
-        default="",
-        help=(
-            "Optional NPZ component spec for the single split accepted by "
-            "--covtree-diagnostic-out. No file is written when the layer stops."
-        ),
-    )
-    p.add_argument(
-        "--covtree-ld-score",
-        default="",
-        help="BIM-aligned TSV containing ID and individual-marker ld_score.",
-    )
-    p.add_argument("--covtree-bootstrap-draws", type=int, default=199)
-    p.add_argument("--covtree-bootstrap-seed", type=int, default=0)
-    p.add_argument("--covtree-alpha", type=float, default=0.05)
-    p.add_argument("--covtree-rank-rtol", type=float, default=1e-7)
-    p.add_argument("--covtree-min-child-markers", type=int, default=16)
     p.add_argument("--pheno-txt", default=env("PHENO_TXT", ""))
     p.add_argument("--covar-txt", default=env("COVAR_TXT", ""))
     p.add_argument(
         "--prediction-bed-prefix",
         default=env("PREDICTION_BED_PREFIX", ""),
-        help="Prediction BED prefix (comma-separated for multiple GRMs).",
+        help="One prediction BED prefix.",
     )
     p.add_argument(
         "--prediction-pgen-prefix",
@@ -994,24 +621,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pcg-ridge", type=float, default=float(env("PCG_RIDGE", "1e-6")))
     p.add_argument("--max-pcg-iters", type=int, default=int(env("MAX_PCG_ITERS", "400")))
     p.add_argument("--outer-max", type=int, default=20)
-    p.add_argument(
-        "--compare-four-estimators",
-        action="store_true",
-        help=(
-            "Opt in to the secondary four-estimator comparison. This runs "
-            "the selected-support REML--GLS refit and emits the uncorrected "
-            "Lasso plug-in, selected-span plug-in, and trace-corrected "
-            "selected-span estimates in addition to the primary COHERIT "
-            "estimate. By default only the COHERIT estimator and Lasso "
-            "prediction branch are produced."
-        ),
-    )
     p.add_argument("--screen-topk", type=int, default=2000)
     p.add_argument("--candidate-k", type=int, default=256)
     p.add_argument(
         "--h2-abs-tol",
         type=float,
-        default=1e-3,
+        default=1e-2,
         help=(
             "Absolute tolerance for the change in the primary COHERIT h2 "
             "estimate between consecutive outer updates."
@@ -1020,7 +635,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--effect-rel-tol",
         type=float,
-        default=1e-2,
+        default=5e-2,
         help=(
             "Relative tolerance for the change in the fitted fixed mean. "
             "This replaces exact selected-support equality."
@@ -1032,12 +647,7 @@ def parse_args() -> argparse.Namespace:
         "--lasso-fixed-lam-ratio",
         type=float,
         default=None,
-        help=(
-            "Frozen lambda/lambda_max ratio for the final train+validation "
-            "refit. When omitted, validation phenotype/output inputs are "
-            "required and validation R2 selects lambda inside every outer "
-            "iteration."
-        ),
+        help=argparse.SUPPRESS,
     )
     p.add_argument("--lasso-cd-max-iter", type=int, default=2000)
     p.add_argument("--lasso-cd-tol", type=float, default=1e-6)
@@ -1210,7 +820,7 @@ def _heritability_converged(
     current_h2: float,
     previous_h2: float | None,
     *,
-    abs_tol: float = 1e-3,
+    abs_tol: float = 1e-2,
 ) -> tuple[bool, float]:
     """Check absolute change in the primary COHERIT heritability estimate."""
     if previous_h2 is None:
@@ -1567,22 +1177,6 @@ def _finite_float_or_none(value: float) -> float | None:
     return value_f if np.isfinite(value_f) else None
 
 
-def _validation_allows_marker_score(
-    observed_r2: float | None,
-    minimum_r2: float | None,
-) -> bool:
-    """Skip score probes only when Adaptive K will stop at this layer."""
-    if minimum_r2 is None:
-        return True
-    if observed_r2 is None:
-        raise ValueError("Conditional marker scoring requires validation R2.")
-    observed = float(observed_r2)
-    minimum = float(minimum_r2)
-    if not np.isfinite(observed) or not np.isfinite(minimum):
-        raise ValueError("Marker-score validation thresholds must be finite.")
-    return observed >= minimum
-
-
 def _json_safe_value(value):
     """Recursively replace non-finite numeric diagnostics by JSON ``null``."""
     if isinstance(value, dict):
@@ -1771,7 +1365,7 @@ def _evaluate_lasso_path_on_validation(
         prediction_context.grm_index.extract_standardized_columns(candidate)
         .astype(np.float32, copy=False)
     )
-    path_prediction = predict_sparse_path_partitioned(
+    path_prediction = predict_sparse_path_single_grm(
         fitter=fitter,
         test_fitter=prediction_context.fitter,
         y_train=y_train,
@@ -1843,7 +1437,7 @@ def _write_iterative_validation_output(
     selection_trace: list[dict[str, object]],
     final_lasso: dict,
     final_candidate: np.ndarray,
-    grm_index: MultiGRMIndex,
+    grm_index: SingleGRMIndex,
     theta: np.ndarray,
     outer_converged: bool,
     outer_stop_reason: str,
@@ -1900,34 +1494,6 @@ def _write_iterative_validation_output(
         "n_path_selections": int(len(selection_trace)),
         "outputs": output_paths,
     }
-
-
-def _expand_selected_basis_coefficients(
-    *,
-    support_size: int,
-    basis_positions: np.ndarray,
-    basis_coefficients: np.ndarray,
-) -> np.ndarray:
-    """Map one full-rank selected-span coefficient back to the full support."""
-    size = int(support_size)
-    positions = np.asarray(basis_positions, dtype=np.int64).reshape(-1)
-    coefficients = np.asarray(
-        basis_coefficients, dtype=np.float64
-    ).reshape(-1)
-    if size < 0 or positions.size != coefficients.size:
-        raise ValueError("Selected-span basis coefficient shape mismatch.")
-    if (
-        positions.size > 0
-        and (
-            np.any(positions < 0)
-            or np.any(positions >= size)
-            or np.unique(positions).size != positions.size
-        )
-    ):
-        raise ValueError("Selected-span basis positions are invalid.")
-    expanded = np.zeros(size, dtype=np.float64)
-    expanded[positions] = coefficients
-    return expanded
 
 
 def _lasso_kkt_certificate_from_scores(
@@ -1989,72 +1555,14 @@ def _lasso_kkt_certificate_from_scores(
     }
 
 
-def _four_estimator_h2_from_branches(
+def _coherit_estimator_guard(
     *,
-    q_lasso_plugin: float,
-    q_lasso_calibrated: float,
-    q_selected_span_plugin: float,
-    q_selected_span_trace: float,
-    lasso_ml_background_variance: float,
-    lasso_ml_residual_variance: float,
-    selected_span_reml_background_variance: float,
-    selected_span_reml_residual_variance: float,
-) -> dict[str, float]:
-    """Map the four sparse quadratics to their two variance branches."""
-    return {
-        "h2_lasso_plugin": _sparse_dense_h2(
-            q_lasso_plugin,
-            lasso_ml_background_variance,
-            lasso_ml_residual_variance,
-        ),
-        "h2_chive": _sparse_dense_h2(
-            q_lasso_calibrated,
-            lasso_ml_background_variance,
-            lasso_ml_residual_variance,
-        ),
-        "h2_ss_gls_plugin": _sparse_dense_h2(
-            q_selected_span_plugin,
-            selected_span_reml_background_variance,
-            selected_span_reml_residual_variance,
-        ),
-        "h2_ss_gls_df_corrected": _sparse_dense_h2(
-            q_selected_span_trace,
-            selected_span_reml_background_variance,
-            selected_span_reml_residual_variance,
-        ),
-    }
-
-
-def _sparse_estimator_branch_guards(
-    *,
-    comparison_enabled: bool,
     alpha_theta_pair_certified: bool,
     lasso_quadratics_available: bool,
-    selected_span_refit_ok: bool,
-    lasso_estimator_values: np.ndarray,
-    selected_support_estimator_values: np.ndarray,
+    h2_chive: float,
 ) -> dict[str, object]:
-    """Validate the Lasso and selected-support estimator branches separately.
-
-    The primary COHERIT branch is validated independently.  When comparison
-    mode is enabled, failure of the downstream selected-support REML--GLS
-    refit must not erase a valid COHERIT estimate.  No ordinary-REML value is
-    substituted into either branch.
-    """
-    lasso_values = np.asarray(
-        lasso_estimator_values, dtype=np.float64
-    ).reshape(-1)
-    selected_values = np.asarray(
-        selected_support_estimator_values, dtype=np.float64
-    ).reshape(-1)
-    expected_lasso_outputs = 2 if comparison_enabled else 1
-    lasso_outputs_finite = bool(
-        lasso_values.size == expected_lasso_outputs
-        and np.all(np.isfinite(lasso_values))
-    )
-    selected_outputs_finite = bool(
-        selected_values.size == 2 and np.all(np.isfinite(selected_values))
-    )
+    """Validate the sole COHERIT estimator without baseline substitution."""
+    lasso_outputs_finite = bool(np.isfinite(float(h2_chive)))
 
     lasso_reasons: list[str] = []
     if not alpha_theta_pair_certified:
@@ -2069,104 +1577,15 @@ def _sparse_estimator_branch_guards(
         and lasso_quadratics_available
         and lasso_outputs_finite
     )
-
-    selected_reasons: list[str] = []
-    selected_support_branch_valid = False
-    if comparison_enabled:
-        if not lasso_branch_valid:
-            selected_reasons.append("lasso_support_branch_not_valid")
-        if not selected_span_refit_ok:
-            selected_reasons.append("selected_support_reml_gls_unavailable")
-        if not selected_outputs_finite:
-            selected_reasons.append("nonfinite_selected_support_estimator")
-        selected_support_branch_valid = bool(
-            lasso_branch_valid
-            and selected_span_refit_ok
-            and selected_outputs_finite
-        )
-    all_four_valid = bool(
-        comparison_enabled
-        and lasso_branch_valid
-        and selected_support_branch_valid
-    )
-    all_requested_valid = bool(
-        lasso_branch_valid
-        and (not comparison_enabled or selected_support_branch_valid)
-    )
-    all_requested_outputs_finite = bool(
-        lasso_outputs_finite
-        and (not comparison_enabled or selected_outputs_finite)
-    )
-    combined_reasons = list(lasso_reasons) + list(selected_reasons)
     return {
         "lasso_branch_valid": lasso_branch_valid,
         "lasso_outputs_finite": lasso_outputs_finite,
         "lasso_branch_invalid_reasons": lasso_reasons,
-        "selected_support_refit_branch_valid": (
-            selected_support_branch_valid
-        ),
-        "selected_support_outputs_finite": selected_outputs_finite,
-        "selected_support_refit_branch_invalid_reasons": selected_reasons,
-        "all_four_estimators_valid": all_four_valid,
-        "all_four_outputs_finite": bool(
-            comparison_enabled
-            and lasso_outputs_finite
-            and selected_outputs_finite
-        ),
-        "all_requested_estimators_valid": all_requested_valid,
-        "all_requested_outputs_finite": all_requested_outputs_finite,
-        "combined_invalid_reasons": combined_reasons,
     }
 
 
-def _sparse_prediction_branch_names(
-    *,
-    comparison_enabled: bool,
-    lasso_branch_valid: bool,
-    selected_support_refit_branch_valid: bool,
-) -> list[str]:
-    """Return independently available prediction branches in output order."""
-    if (
-        comparison_enabled
-        and selected_support_refit_branch_valid
-        and not lasso_branch_valid
-    ):
-        raise ValueError(
-            "A selected-support prediction requires a valid Lasso branch."
-        )
-    names = ["lasso"] if lasso_branch_valid else []
-    if comparison_enabled and selected_support_refit_branch_valid:
-        names.append("selected_span")
-    return names
-
-
-def _sparse_output_contract(comparison_enabled: bool) -> dict[str, object]:
-    """Return the mode-labelled sparse output contract for one run."""
-    if comparison_enabled:
-        return {
-            "sparse_output_schema_version": 7,
-            "estimator_mode": "four_estimator_comparison",
-            "computed_estimators": [
-                "h2_lasso_plugin",
-                "h2_chive",
-                "h2_ss_gls_plugin",
-                "h2_ss_gls_df_corrected",
-            ],
-            "selected_snp_columns": [
-                "snp_index",
-                "source_snp_index",
-                "grm",
-                "chr",
-                "snp_id",
-                "cm",
-                "bp",
-                "a1",
-                "a2",
-                "beta_lasso",
-                "beta_gls_reml",
-                "selected_span_basis",
-            ],
-        }
+def _sparse_output_contract() -> dict[str, object]:
+    """Return the fixed output contract for the sole COHERIT mode."""
     return {
         "sparse_output_schema_version": 7,
         "estimator_mode": "coherit",
@@ -2183,86 +1602,6 @@ def _sparse_output_contract(comparison_enabled: bool) -> dict[str, object]:
             "a2",
             "beta_lasso",
         ],
-    }
-
-
-def _selected_span_gls_quadratics(
-    *,
-    y: np.ndarray,
-    covar: np.ndarray | None,
-    z_active: np.ndarray,
-    Hinv_y: np.ndarray,
-    Hinv_covar: np.ndarray | None,
-    Hinv_z_active: np.ndarray,
-) -> dict[str, object]:
-    """Construct plug-in and trace-corrected quadratics after selected-span GLS."""
-    y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
-    z_arr = np.asarray(z_active, dtype=np.float64)
-    hy = np.asarray(Hinv_y, dtype=np.float64).reshape(-1)
-    hz = np.asarray(Hinv_z_active, dtype=np.float64)
-    if (
-        z_arr.ndim != 2
-        or hz.shape != z_arr.shape
-        or z_arr.shape[0] != y_arr.size
-        or hy.size != y_arr.size
-    ):
-        raise ValueError("Selected-span GLS inputs have incompatible shapes.")
-
-    merged, active_basis_idx = _merge_independent_fixed_effects(covar, z_arr)
-    if covar is None:
-        c_arr = np.empty((y_arr.size, 0), dtype=np.float64)
-        hc = np.empty((y_arr.size, 0), dtype=np.float64)
-    else:
-        c_arr = np.asarray(covar, dtype=np.float64)
-        hc = np.asarray(Hinv_covar, dtype=np.float64)
-        if c_arr.ndim != 2 or hc.shape != c_arr.shape:
-            raise ValueError("Covariate GLS inputs have incompatible shapes.")
-
-    z_basis = z_arr[:, active_basis_idx]
-    hz_basis = hz[:, active_basis_idx]
-    hfixed = np.concatenate([hc, hz_basis], axis=1)
-    fixed = np.asarray(merged, dtype=np.float64)
-    if fixed.shape != hfixed.shape:
-        raise RuntimeError("Selected-span basis and inverse-covariance image disagree.")
-
-    if fixed.shape[1] == 0:
-        return {
-            "active_basis_idx": active_basis_idx,
-            "beta_cov": np.empty((0,), dtype=np.float64),
-            "beta_active_basis": np.empty((0,), dtype=np.float64),
-            "q_plugin": 0.0,
-            "df_correction": 0.0,
-            "q_df_corrected": 0.0,
-        }
-
-    gram = fixed.T @ hfixed
-    gram = 0.5 * (gram + gram.T)
-    try:
-        gram_inv = sla.inv(gram, check_finite=False)
-    except np.linalg.LinAlgError:
-        gram_inv = sla.pinvh(gram, rtol=1e-10, check_finite=False)
-    gram_inv = 0.5 * (gram_inv + gram_inv.T)
-    coef = gram_inv @ (fixed.T @ hy)
-    p_c = int(c_arr.shape[1])
-    beta_cov = np.asarray(coef[:p_c], dtype=np.float64)
-    beta_active = np.asarray(coef[p_c:], dtype=np.float64)
-    fitted_sparse = z_basis @ beta_active
-    n = float(y_arr.size)
-    q_plugin = float(fitted_sparse @ fitted_sparse / n)
-
-    sparse_gram = z_basis.T @ z_basis / n
-    covariance_active = gram_inv[p_c:, p_c:]
-    df_correction = float(
-        np.trace(sparse_gram @ covariance_active)
-    )
-
-    return {
-        "active_basis_idx": active_basis_idx,
-        "beta_cov": beta_cov,
-        "beta_active_basis": beta_active,
-        "q_plugin": q_plugin,
-        "df_correction": df_correction,
-        "q_df_corrected": q_plugin - df_correction,
     }
 
 
@@ -2312,7 +1651,7 @@ def _outside_kkt_violators(
     return violators, max_outside, threshold
 
 
-def _partitioned_lasso_kkt_from_scores(
+def _candidate_lasso_kkt_from_scores(
     *,
     score: np.ndarray,
     candidate: np.ndarray,
@@ -2596,7 +1935,7 @@ def _top_scored_markers_outside(
 def _fit_complete_weighted_lasso_path_basil(
     *,
     args,
-    grm_index: MultiGRMIndex,
+    grm_index: SingleGRMIndex,
     hv,
     precond,
     y: np.ndarray,
@@ -3461,7 +2800,7 @@ def _complete_path_active_union(
     keep_local = np.flatnonzero(np.any(beta_arr != 0.0, axis=0)).astype(
         np.int64
     )
-    # Preserve a nonempty numerical basis for the downstream sparse-state
+    # Preserve a nonempty numerical basis for the downstream Lasso warm-state
     # schema in the degenerate all-zero path.  No pruning is needed there.
     if keep_local.size == 0:
         keep_local = np.arange(candidate_arr.size, dtype=np.int64)
@@ -3579,8 +2918,6 @@ def _complete_path_kkt_expansion_budget(
 
 def _parse_variance_components_init(
     value: str,
-    *,
-    n_grm: int,
 ) -> np.ndarray:
     try:
         parsed = json.loads(value)
@@ -3589,11 +2926,10 @@ def _parse_variance_components_init(
             "--variance-components-init must be a JSON array."
         ) from error
     theta = np.asarray(parsed, dtype=np.float64).reshape(-1)
-    if theta.shape != (int(n_grm) + 1,):
+    if theta.shape != (2,):
         raise ValueError(
-            "--variance-components-init must contain one value per GRM "
-            f"followed by residual variance; expected {int(n_grm) + 1}, "
-            f"got {int(theta.size)}."
+            "--variance-components-init must be "
+            "[genetic_variance, residual_variance]."
         )
     if (
         not np.all(np.isfinite(theta))
@@ -3601,583 +2937,10 @@ def _parse_variance_components_init(
         or theta[-1] <= 0.0
     ):
         raise ValueError(
-            "Initial genetic variance components must be nonnegative and "
+            "Initial genetic variance must be nonnegative and "
             "the residual component must be positive."
         )
     return theta
-
-
-def _compute_adaptive_marker_scores(
-    *,
-    output_path: str,
-    residual: np.ndarray,
-    covar: np.ndarray | None,
-    fitter,
-    ops,
-    grm_index: MultiGRMIndex,
-    theta: np.ndarray,
-    n_probes: int,
-    seed: int,
-    pcg_tol: float,
-    max_pcg_iters: int,
-) -> dict[str, object]:
-    """Write association and signed REML covariance marker scores.
-
-    Both information diagonals are estimated without materializing X or V.
-    For a sample-space Rademacher probe q,
-    E[(X' q) * (X' V^-1 q)] = diag(X' V^-1 X).
-    Replacing ``V^-1 q`` by ``P q`` gives the fixed-effect-adjusted quantity
-    needed by ``u_j = 0.5 * ((x_j' P e)^2 - x_j' P x_j)``.
-    """
-    if int(n_probes) < 1:
-        raise ValueError("marker-score-probes must be >= 1.")
-    if not output_path.lower().endswith(".npz"):
-        raise ValueError("--marker-score-out must end in .npz.")
-    residual = np.asarray(residual, dtype=np.float32).reshape(-1)
-    n_samples = int(fitter.streamers[0].n)
-    if residual.shape != (n_samples,) or not np.all(np.isfinite(residual)):
-        raise ValueError("Adaptive marker-score residual is malformed.")
-    if covar is None:
-        fixed_design = np.empty((n_samples, 0), dtype=np.float32)
-    else:
-        fixed_design = np.asarray(covar, dtype=np.float32)
-        if fixed_design.ndim != 2 or fixed_design.shape[0] != n_samples:
-            raise ValueError("Adaptive marker-score covariates are malformed.")
-
-    theta_values = np.asarray(theta, dtype=np.float64).reshape(-1)
-    if theta_values.shape != (grm_index.n_grm + 1,):
-        raise ValueError("Adaptive marker-score theta has the wrong length.")
-    theta_g = jnp.asarray(theta_values[:-1], dtype=jnp.float32)
-    theta_e = jnp.asarray(theta_values[-1], dtype=jnp.float32)
-    hv = fitter._make_hv(ops, theta_g, theta_e)
-    precond = fitter._make_effect_precond(ops, theta_g, theta_e)
-
-    rng = np.random.default_rng(int(seed))
-    probes = rng.integers(
-        0,
-        2,
-        size=(n_samples, int(n_probes)),
-        dtype=np.int8,
-    ).astype(np.float32)
-    probes *= 2.0
-    probes -= 1.0
-    rhs = np.concatenate(
-        [residual[:, None], probes, fixed_design], axis=1
-    ).astype(
-        np.float32,
-        copy=False,
-    )
-    rhs_dev = jnp.asarray(rhs, dtype=jnp.float32)
-    solution, reported_residual, iterations = pcg_solve(
-        hv,
-        rhs_dev,
-        M=precond,
-        tol=float(pcg_tol),
-        maxiter=int(max_pcg_iters),
-    )
-    reported = _require_pcg_converged(
-        reported_residual,
-        tol=float(pcg_tol),
-        iters=iterations,
-        maxiter=int(max_pcg_iters),
-        stage="adaptive marker score",
-    )
-    true_residual = _true_pcg_relative_residual(hv, rhs_dev, solution)
-    if not np.isfinite(true_residual):
-        raise RuntimeError("Adaptive marker-score PCG true residual is non-finite.")
-
-    solution_np = np.asarray(jax.device_get(solution), dtype=np.float32)
-    core_solution = solution_np[:, : int(n_probes) + 1]
-    if fixed_design.shape[1] > 0:
-        vinv_c = solution_np[:, int(n_probes) + 1 :]
-        covar_gram = (
-            fixed_design.astype(np.float64).T @ vinv_c.astype(np.float64)
-        )
-        covar_gram_inverse = np.linalg.pinv(
-            0.5 * (covar_gram + covar_gram.T),
-            rcond=1e-10,
-            hermitian=True,
-        )
-        projection_coefficients = covar_gram_inverse @ (
-            fixed_design.astype(np.float64).T
-            @ core_solution.astype(np.float64)
-        )
-        projected_solution = core_solution - vinv_c @ projection_coefficients.astype(
-            np.float32
-        )
-    else:
-        projected_solution = core_solution
-
-    xt_solution = np.asarray(
-        grm_index.xtv_all(
-            jnp.asarray(core_solution, dtype=jnp.float32), normalize=False
-        ),
-        dtype=np.float64,
-    )
-    xt_projected_solution = np.asarray(
-        grm_index.xtv_all(
-            jnp.asarray(projected_solution, dtype=jnp.float32),
-            normalize=False,
-        ),
-        dtype=np.float64,
-    )
-    xt_probe = np.asarray(
-        grm_index.xtv_all(
-            jnp.asarray(probes, dtype=jnp.float32),
-            normalize=False,
-        ),
-        dtype=np.float64,
-    )
-    expected_shape = (grm_index.m_total, int(n_probes) + 1)
-    if xt_solution.shape != expected_shape:
-        raise RuntimeError(
-            "Adaptive marker-score X'V^-1 RHS has the wrong shape: "
-            f"{xt_solution.shape} != {expected_shape}."
-        )
-    if xt_probe.shape != (grm_index.m_total, int(n_probes)):
-        raise RuntimeError("Adaptive marker-score X'probe has the wrong shape.")
-    if xt_projected_solution.shape != expected_shape:
-        raise RuntimeError(
-            "Adaptive marker-score X'P RHS has the wrong shape: "
-            f"{xt_projected_solution.shape} != {expected_shape}."
-        )
-
-    numerator = xt_solution[:, 0]
-    information = np.mean(
-        xt_probe * xt_solution[:, 1:],
-        axis=1,
-        dtype=np.float64,
-    )
-    positive = information[np.isfinite(information) & (information > 0.0)]
-    if positive.size == 0:
-        raise RuntimeError(
-            "Hutchinson marker-information estimate has no positive entries."
-        )
-    information_floor = max(
-        float(np.median(positive)) * 1e-6,
-        float(np.finfo(np.float32).tiny),
-    )
-    clipped = ~np.isfinite(information) | (information <= information_floor)
-    information_safe = np.where(clipped, information_floor, information)
-    signal_score = np.abs(numerator) / np.sqrt(information_safe)
-    if not np.all(np.isfinite(signal_score)):
-        raise RuntimeError("Adaptive marker score contains non-finite values.")
-
-    projected_numerator = xt_projected_solution[:, 0]
-    projected_information = np.mean(
-        xt_probe * xt_projected_solution[:, 1:],
-        axis=1,
-        dtype=np.float64,
-    )
-    projected_positive = projected_information[
-        np.isfinite(projected_information) & (projected_information > 0.0)
-    ]
-    if projected_positive.size == 0:
-        raise RuntimeError(
-            "Hutchinson projected marker-information estimate has no positive entries."
-        )
-    projected_information_floor = max(
-        float(np.median(projected_positive)) * 1e-6,
-        float(np.finfo(np.float32).tiny),
-    )
-    projected_clipped = (
-        ~np.isfinite(projected_information)
-        | (projected_information <= projected_information_floor)
-    )
-    projected_information_safe = np.where(
-        projected_clipped,
-        projected_information_floor,
-        projected_information,
-    )
-    covariance_score = 0.5 * (
-        np.square(projected_numerator) - projected_information_safe
-    )
-    if not np.all(np.isfinite(covariance_score)):
-        raise RuntimeError("Signed covariance marker score contains non-finite values.")
-
-    global_indices = np.arange(grm_index.m_total, dtype=np.int64)
-    source_indices = grm_index.source_variant_indices(global_indices)
-    source_order = np.argsort(source_indices, kind="stable")
-    if not np.array_equal(
-        source_indices[source_order],
-        np.arange(grm_index.m_total, dtype=np.int64),
-    ):
-        raise RuntimeError(
-            "Adaptive marker scores require a one-to-one source variant order."
-        )
-    component_global = np.empty(grm_index.m_total, dtype=np.int32)
-    for component_index in range(grm_index.n_grm):
-        component_global[
-            int(grm_index.offsets[component_index]) :
-            int(grm_index.offsets[component_index + 1])
-        ] = int(component_index)
-
-    ensure_parent_dir(output_path)
-    temporary = f"{output_path}.tmp.{os.getpid()}"
-    with open(temporary, "wb") as handle:
-        np.savez_compressed(
-            handle,
-            source_variant_index=source_indices[source_order],
-            parent_component_index=component_global[source_order],
-            signal_score=signal_score[source_order].astype(np.float32),
-            score_numerator=numerator[source_order].astype(np.float32),
-            information_diagonal=information_safe[source_order].astype(
-                np.float32
-            ),
-            covariance_score=covariance_score[source_order].astype(np.float32),
-            projected_score_numerator=projected_numerator[source_order].astype(
-                np.float32
-            ),
-            projected_information_diagonal=projected_information_safe[
-                source_order
-            ].astype(np.float32),
-        )
-    os.replace(temporary, output_path)
-    return {
-        "requested": True,
-        "status": "emitted",
-        "path": os.path.abspath(output_path),
-        "definition": "abs(x_t_Vinv_residual)/sqrt(x_t_Vinv_x)",
-        "covariance_score_definition": (
-            "0.5*((x_t_P_residual)^2-x_t_P_x)"
-        ),
-        "fixed_effect_projection": "P_includes_all_unpenalized_covariates",
-        "information_diagonal_estimator": (
-            "sample_space_rademacher_hutchinson"
-        ),
-        "n_markers": int(grm_index.m_total),
-        "n_probes": int(n_probes),
-        "seed": int(seed),
-        "information_floor": float(information_floor),
-        "information_clipped_count": int(np.count_nonzero(clipped)),
-        "information_clipped_fraction": float(np.mean(clipped)),
-        "projected_information_floor": float(projected_information_floor),
-        "projected_information_clipped_count": int(
-            np.count_nonzero(projected_clipped)
-        ),
-        "projected_information_clipped_fraction": float(
-            np.mean(projected_clipped)
-        ),
-        "pcg_reported_relative_residual": float(reported),
-        "pcg_true_relative_residual": float(true_residual),
-        "pcg_iterations": int(iterations),
-    }
-
-
-def _write_covtree_bootstrap_marker_scores(
-    *,
-    output_path: str,
-    grm_index: MultiGRMIndex,
-    marker_scores: dict[str, np.ndarray],
-    bootstrap_draws: int,
-    seed: int,
-) -> tuple[dict[str, object], np.ndarray]:
-    """Write CovTree's already-computed marker diagnostics in source order."""
-    required = {
-        "covariance_score",
-        "projected_score_numerator",
-        "projected_information_diagonal",
-    }
-    if not required.issubset(marker_scores):
-        raise ValueError("CovTree bootstrap marker-score payload is incomplete.")
-    cache_arrays = {
-        name: np.asarray(marker_scores[name], dtype=np.float32).reshape(-1)
-        for name in required
-    }
-    if any(value.shape != (grm_index.m_total,) for value in cache_arrays.values()):
-        raise ValueError("CovTree bootstrap marker-score length mismatch.")
-    if not all(np.all(np.isfinite(value)) for value in cache_arrays.values()):
-        raise ValueError("CovTree bootstrap marker scores contain non-finite values.")
-
-    cache_indices = np.arange(grm_index.m_total, dtype=np.int64)
-    cache_to_source = grm_index.source_variant_indices(cache_indices)
-    source_order = np.argsort(cache_to_source, kind="stable")
-    if not np.array_equal(
-        cache_to_source[source_order],
-        np.arange(grm_index.m_total, dtype=np.int64),
-    ):
-        raise RuntimeError("CovTree marker scores require a one-to-one source order.")
-    component_cache = np.empty(grm_index.m_total, dtype=np.int32)
-    for component_index in range(grm_index.n_grm):
-        component_cache[
-            int(grm_index.offsets[component_index]) :
-            int(grm_index.offsets[component_index + 1])
-        ] = int(component_index)
-
-    ensure_parent_dir(output_path)
-    temporary = f"{output_path}.tmp.{os.getpid()}"
-    with open(temporary, "wb") as handle:
-        np.savez_compressed(
-            handle,
-            source_variant_index=cache_to_source[source_order],
-            parent_component_index=component_cache[source_order],
-            covariance_score=cache_arrays["covariance_score"][source_order],
-            projected_score_numerator=cache_arrays[
-                "projected_score_numerator"
-            ][source_order],
-            projected_information_diagonal=cache_arrays[
-                "projected_information_diagonal"
-            ][source_order],
-        )
-    os.replace(temporary, output_path)
-    covariance_source = cache_arrays["covariance_score"][source_order]
-    return (
-        {
-            "requested": True,
-            "status": "emitted",
-            "path": os.path.abspath(output_path),
-            "definition": "0.5*((x_t_P_e)^2-x_t_P_x)",
-            "fixed_effect_projection": "P_includes_all_unpenalized_covariates",
-            "information_diagonal_estimator": (
-                "fitted_null_parametric_bootstrap_mean_square"
-            ),
-            "quadratic_backend": "reused_covtree_Xt_Pe_bootstrap_pass",
-            "n_markers": int(grm_index.m_total),
-            "bootstrap_draws": int(bootstrap_draws),
-            "seed": int(seed),
-        },
-        covariance_source,
-    )
-
-
-def _run_covtree_diagnostic(
-    *,
-    args: argparse.Namespace,
-    fitter,
-    ops,
-    grm_index: MultiGRMIndex,
-    component_spec_path: str,
-    bed_prefix: str,
-    marker_score_path: str,
-    residual: np.ndarray,
-    covar: np.ndarray | None,
-    theta: np.ndarray,
-) -> dict[str, object]:
-    """Test all genotype-only splits and optionally emit one accepted spec."""
-    components = _covtree_components_from_spec(component_spec_path)
-    ld_score = _load_ld_score_in_bim_order(
-        args.covtree_ld_score,
-        bed_prefix + ".bim",
-    )
-    if ld_score.shape != (grm_index.m_total,):
-        raise RuntimeError("CovTree LD-score length does not match the genotype panel.")
-    streamer = fitter.streamers[0]
-    means_cache = np.asarray(streamer._means_host, dtype=np.float64)
-    cache_indices = np.arange(grm_index.m_total, dtype=np.int64)
-    cache_to_source = grm_index.source_variant_indices(cache_indices)
-    means_source = np.empty(grm_index.m_total, dtype=np.float64)
-    means_source[cache_to_source] = means_cache
-    allele_frequency = np.clip(0.5 * means_source, 0.0, 1.0)
-    heterozygosity = 2.0 * allele_frequency * (1.0 - allele_frequency)
-    positive_heterozygosity = heterozygosity[heterozygosity > 0.0]
-    if positive_heterozygosity.size == 0:
-        raise RuntimeError("CovTree could not estimate any positive heterozygosity.")
-    heterozygosity_floor = max(
-        float(np.min(positive_heterozygosity)) * 0.5,
-        float(np.finfo(np.float32).tiny),
-    )
-    heterozygosity_floored = heterozygosity <= 0.0
-    heterozygosity = np.where(
-        heterozygosity_floored, heterozygosity_floor, heterozygosity
-    )
-
-    candidates, candidate_rejections = generate_covtree_candidates(
-        components,
-        ld_score=ld_score,
-        heterozygosity=heterozygosity,
-        min_child_markers=int(args.covtree_min_child_markers),
-    )
-    theta_values = np.asarray(theta, dtype=np.float64).reshape(-1)
-    eligible_candidates = []
-    for candidate in candidates:
-        parent_theta = float(theta_values[candidate.parent_index])
-        if parent_theta <= 0.0:
-            candidate_rejections.append(
-                {
-                    "parent_index": int(candidate.parent_index),
-                    "parent_name": candidate.parent_name,
-                    "split_kind": candidate.split_kind,
-                    "reason": "parent_variance_at_boundary",
-                    "parent_theta": parent_theta,
-                }
-            )
-        else:
-            eligible_candidates.append(candidate)
-
-    residual = np.asarray(residual, dtype=np.float32)
-    selected_candidate = None
-    marker_score_summary: dict[str, object] = {
-        "requested": True,
-        "status": "not_emitted_no_eligible_candidate",
-        "path": None,
-    }
-    if eligible_candidates:
-        inference, selected_candidate, bootstrap_marker_scores = (
-            evaluate_covtree_candidates(
-                fitter=fitter,
-                ops=ops,
-                grm_index=grm_index,
-                candidates=eligible_candidates,
-                theta=theta_values,
-                covar=covar,
-                residual=residual,
-                bootstrap_draws=int(args.covtree_bootstrap_draws),
-                seed=int(args.covtree_bootstrap_seed),
-                alpha=float(args.covtree_alpha),
-                rank_rtol=float(args.covtree_rank_rtol),
-                pcg_tol=float(args.pcg_tol),
-                max_pcg_iters=int(args.max_pcg_iters),
-            )
-        )
-        marker_score_summary, signed_marker = _write_covtree_bootstrap_marker_scores(
-            output_path=marker_score_path,
-            grm_index=grm_index,
-            marker_scores=bootstrap_marker_scores,
-            bootstrap_draws=int(args.covtree_bootstrap_draws),
-            seed=int(args.covtree_bootstrap_seed),
-        )
-        for candidate, metadata in zip(
-            eligible_candidates, inference["candidates"], strict=True
-        ):
-            signed_child_means = np.asarray(
-                [float(np.mean(signed_marker[child])) for child in candidate.children]
-            )
-            contrasts = np.asarray(
-                metadata["contrast_coefficients"], dtype=np.float64
-            )
-            raw_signed_contrasts = signed_child_means @ contrasts
-            metadata.update(
-                {
-                    "signed_marker_child_means": signed_child_means.tolist(),
-                    "raw_signed_marker_contrast_scores": raw_signed_contrasts.tolist(),
-                    "raw_signed_marker_contrast_norm": float(
-                        np.linalg.norm(raw_signed_contrasts)
-                    ),
-                }
-            )
-    else:
-        inference = {
-            "method": "covariance_contrast_parametric_max_bootstrap",
-            "accepted": False,
-            "best_candidate_index": None,
-            "selected_candidate_index": None,
-            "best_candidate_name": None,
-            "max_score_adjusted_p": None,
-            "max_score_adjusted_p_mc_se": None,
-            "bootstrap_draws": 0,
-            "candidate_count": 0,
-            "candidate_contrast_count": 0,
-            "candidates": [],
-            "pcg": [],
-        }
-
-    split_spec_path = None
-    warm_start = None
-    warm_start_weighting = None
-    if selected_candidate is not None:
-        selected_metadata = inference["candidates"][
-            int(inference["selected_candidate_index"])
-        ]
-        warm_start = selective_covariance_warm_start(
-            theta_values,
-            components,
-            selected_candidate,
-            child_effective_markers=selected_metadata[
-                "child_effective_markers"
-            ],
-        )
-        warm_start_weighting = "effective_marker_count"
-        if args.covtree_split_spec_out:
-            updated_components = replace_covtree_parent(
-                components, selected_candidate
-            )
-            split_spec_path = str(
-                write_component_spec(
-                    args.covtree_split_spec_out,
-                    updated_components,
-                    provenance={
-                        "algorithm": "coherit_covtree_v1",
-                        "source_component_spec": os.path.abspath(
-                            component_spec_path
-                        ),
-                        "selected_candidate": selected_candidate.name,
-                        "max_score_adjusted_p": inference[
-                            "max_score_adjusted_p"
-                        ],
-                    },
-                )
-            )
-
-    diagnostic = {
-        **inference,
-        "status": "complete",
-        "current_k": len(components),
-        "next_k": (
-            len(components) - 1 + len(selected_candidate.children)
-            if selected_candidate is not None
-            else len(components)
-        ),
-        "candidate_generation": (
-            "within_parent_recursive_exact_2means_ld_maf_and_ld_by_maf"
-        ),
-        "candidate_features": {
-            "ld": "log1p_individual_ld_score",
-            "maf": "log_2p1mp_from_training_genotype_mean",
-            "phenotype_independent": True,
-        },
-        "candidate_rejections": candidate_rejections,
-        "parent_variance_eligibility": "strictly_positive",
-        "heterozygosity_floor": heterozygosity_floor,
-        "heterozygosity_floored_count": int(
-            np.count_nonzero(heterozygosity_floored)
-        ),
-        "signed_marker_score_path": marker_score_summary["path"],
-        "marker_score": marker_score_summary,
-        "selected_split_spec": split_spec_path,
-        "covariance_preserving_warm_start": (
-            warm_start.tolist() if warm_start is not None else None
-        ),
-        "covariance_preserving_warm_start_weighting": warm_start_weighting,
-        "stopping_reason": (
-            None
-            if selected_candidate is not None
-            else (
-                "no_eligible_candidate"
-                if not eligible_candidates
-                else "max_score_not_significant"
-            )
-        ),
-    }
-    output_path = args.covtree_diagnostic_out
-    ensure_parent_dir(output_path)
-    temporary = f"{output_path}.tmp.{os.getpid()}"
-    with open(temporary, "w", encoding="utf-8") as handle:
-        json.dump(
-            _json_safe_value(diagnostic),
-            handle,
-            indent=2,
-            sort_keys=True,
-            allow_nan=False,
-        )
-        handle.write("\n")
-    os.replace(temporary, output_path)
-    return {
-        "status": "complete",
-        "path": os.path.abspath(output_path),
-        "accepted": bool(selected_candidate is not None),
-        "selected_candidate": (
-            selected_candidate.name if selected_candidate is not None else None
-        ),
-        "max_score_adjusted_p": inference["max_score_adjusted_p"],
-        "current_k": len(components),
-        "next_k": diagnostic["next_k"],
-        "selected_split_spec": split_spec_path,
-        "covariance_preserving_warm_start": diagnostic[
-            "covariance_preserving_warm_start"
-        ],
-        "stopping_reason": diagnostic["stopping_reason"],
-        "marker_score": marker_score_summary,
-    }
 
 
 def main() -> None:
@@ -4220,60 +2983,19 @@ def main() -> None:
         or float(args.pcg_tol) <= 0.0
     ):
         raise SystemExit("pcg-tol must be finite and > 0.")
-    if args.marker_score_out and int(args.marker_score_probes) < 1:
-        raise SystemExit("marker-score-probes must be >= 1.")
     for state_flag, state_path in (
-        ("--sparse-state-in", args.sparse_state_in),
-        ("--sparse-state-out", args.sparse_state_out),
+        ("--lasso-warm-state-in", args.lasso_warm_state_in),
+        ("--lasso-warm-state-out", args.lasso_warm_state_out),
     ):
         if state_path and not state_path.lower().endswith(".npz"):
             raise SystemExit(f"{state_flag} must end in .npz.")
-    if args.sparse_state_in and not os.path.isfile(args.sparse_state_in):
+    if args.lasso_warm_state_in and not os.path.isfile(
+        args.lasso_warm_state_in
+    ):
         raise SystemExit(
-            f"--sparse-state-in does not exist: {args.sparse_state_in}"
+            "--lasso-warm-state-in does not exist: "
+            f"{args.lasso_warm_state_in}"
         )
-    if args.marker_score_min_validation_r2 is not None:
-        threshold = float(args.marker_score_min_validation_r2)
-        if not np.isfinite(threshold):
-            raise SystemExit("marker-score-min-validation-r2 must be finite.")
-        if not args.marker_score_out:
-            raise SystemExit(
-                "--marker-score-min-validation-r2 requires --marker-score-out."
-            )
-    covtree_requested = bool(args.covtree_diagnostic_out)
-    if args.covtree_split_spec_out and not covtree_requested:
-        raise SystemExit(
-            "--covtree-split-spec-out requires --covtree-diagnostic-out."
-        )
-    if covtree_requested:
-        if not args.marker_score_out:
-            raise SystemExit(
-                "--covtree-diagnostic-out requires --marker-score-out so the "
-                "signed marker diagnostic is auditable."
-            )
-        if not args.covtree_ld_score:
-            raise SystemExit(
-                "--covtree-diagnostic-out requires --covtree-ld-score."
-            )
-        if args.marker_score_min_validation_r2 is not None:
-            raise SystemExit(
-                "CovTree covariance testing cannot be skipped by a prediction-R2 "
-                "threshold; remove --marker-score-min-validation-r2."
-            )
-        if int(args.covtree_bootstrap_draws) < 19:
-            raise SystemExit("covtree-bootstrap-draws must be >= 19.")
-        if int(args.covtree_min_child_markers) < 1:
-            raise SystemExit("covtree-min-child-markers must be >= 1.")
-        if (
-            not np.isfinite(float(args.covtree_rank_rtol))
-            or float(args.covtree_rank_rtol) <= 0.0
-        ):
-            raise SystemExit("covtree-rank-rtol must be > 0.")
-        if (
-            not np.isfinite(float(args.covtree_alpha))
-            or not 0.0 < float(args.covtree_alpha) < 1.0
-        ):
-            raise SystemExit("covtree-alpha must lie in (0, 1).")
     if (
         not np.isfinite(float(args.lasso_lam_min_ratio))
         or not 0.0 < float(args.lasso_lam_min_ratio) <= 1.0
@@ -4283,13 +3005,6 @@ def main() -> None:
         raise SystemExit("lasso-n-lambda must be >= 1.")
     fixed_ratio_refit = args.lasso_fixed_lam_ratio is not None
     iterative_validation_selection = not fixed_ratio_refit
-    if (
-        args.marker_score_min_validation_r2 is not None
-        and not iterative_validation_selection
-    ):
-        raise SystemExit(
-            "Conditional marker-score emission requires validation-lambda selection."
-        )
     if fixed_ratio_refit:
         args.lasso_fixed_lam_ratio = _canonical_fixed_lam_ratio(
             float(args.lasso_fixed_lam_ratio)
@@ -4308,6 +3023,28 @@ def main() -> None:
                 "lasso-fixed-lam-ratio must be at least "
                 "--lasso-lam-min-ratio so it lies on the fitted path."
             )
+    if args.lasso_warm_state_in and not fixed_ratio_refit:
+        raise SystemExit(
+            "--lasso-warm-state-in is valid only for the frozen-ratio final refit."
+        )
+    if args.lasso_warm_state_out and fixed_ratio_refit:
+        raise SystemExit(
+            "--lasso-warm-state-out is valid only for validation selection."
+        )
+    supplied_theta_init = args.variance_components_init.strip()
+    if fixed_ratio_refit and not (
+        args.lasso_warm_state_in and supplied_theta_init
+    ):
+        raise SystemExit(
+            "The frozen-ratio fit is an internal final-refit stage and "
+            "requires both its validation-selected Lasso warm state and "
+            "variance-component warm start. Use gpu-reml-sparse-validation."
+        )
+    if iterative_validation_selection and supplied_theta_init:
+        raise SystemExit(
+            "Variance-component initialization is reserved for the automatic "
+            "final refit."
+        )
 
     sparsity_validation_requested = bool(
         args.sparsity_validation_pheno_txt
@@ -4344,20 +3081,21 @@ def main() -> None:
     logger.info("[INFO] sparse pipeline start @ %s", datetime.now().isoformat(timespec='seconds'))
     t0 = time.time()
 
-    bed_list = [b.strip() for b in args.bed_prefix.split(",") if b.strip()]
+    bed_prefix = args.bed_prefix.strip()
+    if "," in bed_prefix:
+        raise SystemExit(
+            "Sparse fitting supports exactly one GRM; supply one BED prefix."
+        )
+    bed_list = [bed_prefix] if bed_prefix else []
     pgen_prefix = args.pgen_prefix.strip()
-    component_spec_path = args.component_spec.strip()
-    component_spec_source = component_spec_path
-    component_variant_indices = (
-        _load_component_variant_indices(component_spec_source)
-        if component_spec_source
-        else []
+    prediction_bed_prefix = args.prediction_bed_prefix.strip()
+    if "," in prediction_bed_prefix:
+        raise SystemExit(
+            "Sparse prediction supports exactly one GRM; supply one BED prefix."
+        )
+    prediction_bed_list = (
+        [prediction_bed_prefix] if prediction_bed_prefix else []
     )
-    prediction_bed_list = [
-        value.strip()
-        for value in args.prediction_bed_prefix.split(",")
-        if value.strip()
-    ]
     prediction_pgen_prefix = args.prediction_pgen_prefix.strip()
     prediction_active = bool(
         prediction_bed_list or prediction_pgen_prefix
@@ -4392,29 +3130,6 @@ def main() -> None:
         raise SystemExit(
             "Sparsity validation requires a prediction BED or PGEN prefix."
         )
-    if sparsity_validation_requested and not component_variant_indices:
-        raise SystemExit(
-            "Sparsity validation requires --component-spec, including for "
-            "a single K=1 component."
-        )
-    if component_variant_indices:
-        if len(bed_list) > 1:
-            raise SystemExit("single-source component partitioning cannot be combined with multiple BED prefixes.")
-        if not (len(bed_list) == 1 or pgen_prefix):
-            raise SystemExit("single-source component partitioning requires exactly one genotype input.")
-    if covtree_requested:
-        if not component_variant_indices:
-            raise SystemExit(
-                "CovTree diagnostics require --component-spec, including at K=1."
-            )
-        if len(bed_list) != 1 or pgen_prefix:
-            raise SystemExit(
-                "CovTree diagnostics currently require one PLINK1 BED source."
-            )
-        if not os.path.isfile(args.covtree_ld_score):
-            raise SystemExit(
-                f"CovTree LD-score file does not exist: {args.covtree_ld_score}"
-            )
     if not args.pheno_txt:
         raise SystemExit("--pheno-txt is required.")
 
@@ -4434,7 +3149,7 @@ def main() -> None:
     if args.keep_path and os.path.exists(args.keep_path):
         keep_ids = read_keep_ids(args.keep_path)
 
-    # Use first GRM's FAM as the reference for sample alignment.
+    # Use the single GRM's FAM as the sample-order reference.
     (
         y_np,
         covar_np,
@@ -4504,16 +3219,8 @@ def main() -> None:
         p_list = [_bed_count(pref + ".bed", "sid_count") for pref in bed_list]
     plan = run_planner(
         n_samples=y_np.shape[0], p_list=p_list,
-        n_grm=(
-            len(component_variant_indices)
-            if component_variant_indices
-            else len(p_list)
-        ),
-        component_block_sizes=(
-            [int(len(group)) for group in component_variant_indices]
-            if component_variant_indices
-            else None
-        ),
+        n_grm=1,
+        component_block_sizes=None,
         gpu_free=gpu_free,
         gpu_budget=(args.gpu_budget_gib * 1024**3) if args.gpu_budget_gib > 0 else None,
         n_covar=n_covar,
@@ -4528,7 +3235,7 @@ def main() -> None:
             if pgen_prefix
             else None
         ),
-        arbitrary_component_partition=bool(component_variant_indices),
+        arbitrary_component_partition=False,
         requested_call_width=(args.call_width if args.call_width > 0 else None),
     )
     call_width = plan.call_width
@@ -4558,19 +3265,9 @@ def main() -> None:
     )
     logger.info("[INFO] cpu_threads=%s (source=%s)", cpu_threads, cpu_threads_src)
     logger.info("jax devices: %s", jax.devices())
-    if component_variant_indices:
-        logger.info(
-            "[INFO] single-source SNP-ID component partition enabled: "
-            "component_spec=%s n_components=%s block_sizes=%s",
-            component_spec_source,
-            len(component_variant_indices),
-            [int(len(group)) for group in component_variant_indices],
-        )
-
     if sources is not None:
         fit_cfg = FitConfig(
             sources=sources, sample_mask=sample_mask, device=args.device,
-            component_variant_indices=component_variant_indices or None,
             call_width=call_width,
             cpu_threads=cpu_threads,
             keep_host_stats=True,
@@ -4590,7 +3287,6 @@ def main() -> None:
         fit_cfg = FitConfig(
             bed_prefix=bed_list, device=args.device,
             sample_mask=sample_mask,
-            component_variant_indices=component_variant_indices or None,
             call_width=call_width,
             cpu_threads=cpu_threads,
             keep_host_stats=True,
@@ -4617,19 +3313,16 @@ def main() -> None:
     close_fitter = fitter.close
     atexit.register(close_fitter)
     ops = fitter._assemble_reml_operators()
-    grm_index = MultiGRMIndex(
-        fitter.streamers,
-        call_plan=fitter._multi_call_plan,
-        component_variant_indices=component_variant_indices or None,
-    )
+    grm_index = SingleGRMIndex(fitter.streamers)
     logger.info(
-        "[INFO] multi-GRM: n_grm=%s "
-        "m_per_grm=%s m_total=%s",
-        grm_index.n_grm, grm_index.m_per_grm.tolist(), grm_index.m_total,
+        "[INFO] sparse GRM: K=1, markers=%s",
+        grm_index.m_total,
     )
 
     y_jax = jnp.asarray(y_np, dtype=jnp.float32)
     n_grm = len(ops.K_mvs)
+    if n_grm != 1:
+        raise RuntimeError("Sparse fitting must assemble exactly one GRM operator.")
 
     def _background_h2(theta_values: np.ndarray) -> float:
         theta_arr = np.asarray(theta_values, dtype=np.float64).reshape(-1)
@@ -4644,11 +3337,9 @@ def main() -> None:
     # Every standardized GRM is modeled with unit mean diagonal.  Finite-sample
     # deviations from one are intentionally not propagated as scale factors.
     h2_init_default = 0.5
-    supplied_theta_init = args.variance_components_init.strip()
     if supplied_theta_init:
         theta = _parse_variance_components_init(
             supplied_theta_init,
-            n_grm=n_grm,
         )
         theta_init_source = "command_line_json"
     else:
@@ -4698,7 +3389,6 @@ def main() -> None:
         prediction_context = _build_prediction_fit_context(
             args=args,
             training_fitter=fitter,
-            component_variant_indices=component_variant_indices,
             prediction_bed_list=prediction_bed_list,
             prediction_pgen_prefix=prediction_pgen_prefix,
             covar_transform=covar_transform,
@@ -4822,93 +3512,43 @@ def main() -> None:
     B_screen_np = np.concatenate(screen_parts, axis=1).astype(np.float32, copy=False)
     B_screen_dev = jnp.asarray(B_screen_np, dtype=jnp.float32)
     n_screen = B_screen_np.shape[1]
-    sparse_state_in_summary = None
-    if args.sparse_state_in:
-        sparse_state = _load_sparse_numerical_state(
-            args.sparse_state_in,
-            grm_index=grm_index,
-            n_samples=n_samples,
-            n_lambda=int(args.lasso_n_lambda),
+    lasso_warm_state_in_summary = None
+    if args.lasso_warm_state_in:
+        warm_state = _load_lasso_warm_state(
+            args.lasso_warm_state_in,
+            n_markers=grm_index.m_total,
+            target_lam_ratio=float(args.lasso_fixed_lam_ratio),
         )
-        state_screen = sparse_state["screen_solution"]
-        if state_screen.shape != (n_samples, n_screen):
-            raise ValueError(
-                "Sparse state screening RHS count differs from the current design."
-            )
         state_candidate = np.asarray(
-            sparse_state["candidate"], dtype=np.int64
+            warm_state["candidate"], dtype=np.int64
         )
-        support = np.asarray(sparse_state["support"], dtype=np.int64)
+        support = np.asarray(warm_state["support"], dtype=np.int64)
         candidate_cache = state_candidate.copy()
         warm_lasso_candidate = state_candidate.copy()
         warm_lasso_beta_path = np.asarray(
-            sparse_state["beta_snp_path"], dtype=np.float64
+            warm_state["beta_snp_path"], dtype=np.float64
         )
-        warm_screen = state_screen
-        state_z = np.asarray(sparse_state["z_solution"], dtype=np.float32)
-        warm_z_dict = {
-            int(marker): state_z[:, column]
-            for column, marker in enumerate(state_candidate.tolist())
-        }
-        previous_fixed_mean = np.asarray(
-            sparse_state["fixed_mean"], dtype=np.float64
-        )
-        sparse_state_in_summary = {
+        lasso_warm_state_in_summary = {
             "status": "loaded",
-            "path": os.path.abspath(args.sparse_state_in),
-            "candidate_size": int(state_candidate.size),
-            "support_size": int(support.size),
+            "path": os.path.abspath(args.lasso_warm_state_in),
+            "marker_count": int(state_candidate.size),
             "lambda_rows": int(warm_lasso_beta_path.shape[0]),
-            "screen_rhs_columns": int(n_screen),
-            "coordinate_remap": "source_to_current_component_cache",
+            "selected_lam_ratio": float(
+                warm_state["selected_lam_ratio"]
+            ),
+            "coordinate_system": "single_grm_marker_index",
         }
-        sparse_path_performance["covtree_parent_state_loaded"] = True
-        sparse_path_performance["covtree_parent_candidate_columns"] = int(
+        sparse_path_performance["final_refit_marker_state_reused"] = True
+        sparse_path_performance["final_refit_warm_marker_count"] = int(
             state_candidate.size
         )
         logger.info(
-            "[covtree warm] loaded parent sparse state: candidate=%s support=%s",
+            "[Lasso warm] loaded selection state: markers=%s",
             int(state_candidate.size),
-            int(support.size),
         )
     else:
-        sparse_path_performance["covtree_parent_state_loaded"] = False
-
-    covariance_settling_summary = None
-    if sparse_state_in_summary is not None:
-        settling_residual = (
-            np.asarray(y_np, dtype=np.float64) - previous_fixed_mean
-        )
-        settling_result = _fit_covariate_contrast_residual_reml(
-            fitter,
-            settling_residual,
-            theta,
-            covar=covar_np,
-            h2_init=_background_h2(theta),
-        )
-        settled_theta, settling_stop_reason = _accepted_reml_theta(
-            settling_result,
-            expected_components=n_grm + 1,
-            stage="CovTree covariance-only settling",
-        )
-        covariance_settling_summary = {
-            "alpha_frozen": True,
-            "theta_input": np.asarray(theta, dtype=np.float64).tolist(),
-            "theta_output": np.asarray(settled_theta, dtype=np.float64).tolist(),
-            "relative_change": float(
-                _max_rel_change(settled_theta, theta)
-            ),
-            "stop_reason": settling_stop_reason,
-        }
-        theta = np.asarray(settled_theta, dtype=np.float64)
-        sparse_path_performance["covtree_covariance_only_settling"] = True
-        logger.info(
-            "[covtree warm] covariance-only settling stop=%s theta=%s",
-            settling_stop_reason,
-            theta.tolist(),
-        )
-    else:
-        sparse_path_performance["covtree_covariance_only_settling"] = False
+        sparse_path_performance["final_refit_marker_state_reused"] = False
+        sparse_path_performance["final_refit_warm_marker_count"] = 0
 
     final_kkt_certificate = {
         "passed": False,
@@ -5383,7 +4023,7 @@ def main() -> None:
                 break
 
             # Retain only the current monotone candidate as a warm start for
-            # the next covariance update and for optional sparse-state output.
+            # the next covariance update and optional final-refit state.
             warm_z_dict = {
                 int(marker): outer_hinv_z_dict[int(marker)]
                 for marker in candidate.tolist()
@@ -5873,7 +4513,7 @@ def main() -> None:
                 grm_index.xtv_all(sol_resid[:, 0], normalize=False),
                 dtype=np.float64,
             )
-            partitioned = _partitioned_lasso_kkt_from_scores(
+            kkt_parts = _candidate_lasso_kkt_from_scores(
                 score=score_signed,
                 candidate=candidate,
                 beta_candidate=beta_snp,
@@ -5882,12 +4522,12 @@ def main() -> None:
                 rel_tol=float(args.kkt_rel_tol),
             )
             violators = np.asarray(
-                partitioned["outside_violators"], dtype=np.int64
+                kkt_parts["outside_violators"], dtype=np.int64
             )
             max_outside_score = float(
-                partitioned["max_outside_score"]
+                kkt_parts["max_outside_score"]
             )
-            kkt_threshold = float(partitioned["threshold"])
+            kkt_threshold = float(kkt_parts["threshold"])
             score_kkt_decision = np.abs(score_signed)
             n_viol = int(violators.size)
             internal_kkt_passed = bool(best_path.get("kkt_passed", False))
@@ -5968,7 +4608,7 @@ def main() -> None:
                 # differences on candidate coordinates do not reject an
                 # otherwise solved Lasso block.
                 "direct_score_candidate_diagnostic": dict(
-                    partitioned["candidate_certificate"]
+                    kkt_parts["candidate_certificate"]
                 ),
             }
             kkt_trace.append(
@@ -6481,76 +5121,6 @@ def main() -> None:
         else "outer_max_reached_before_change_tolerances"
     )
 
-    comparison_enabled = bool(args.compare_four_estimators)
-
-    # ---- Optional selected-support REML refit ----------------------------
-    Z_selected_for_reml = np.empty((n_samples, 0), dtype=np.float32)
-    X_selected_span = covar_np
-    selected_span_basis_local = np.empty((0,), dtype=np.int64)
-    selected_span_reml_iterations = 0
-    selected_span_reml_stop_reason = ""
-    selected_span_reml_history = []
-    selected_span_refit_ok = False
-    selected_span_refit_error = None
-    theta_selected_span_reml = theta_lasso_ml.copy()
-    if comparison_enabled and alpha_theta_pair_usable:
-        try:
-            Z_selected_for_reml = (
-                grm_index.extract_standardized_columns(support)
-                .astype(np.float32, copy=False)
-            )
-            if support.size > 0:
-                X_selected_span, selected_span_basis_local = (
-                    _merge_independent_fixed_effects(
-                        X_selected_span,
-                        Z_selected_for_reml,
-                    )
-                )
-                if selected_span_basis_local.size != support.size:
-                    logger.info(
-                        "[refit] selected-span REML retained %s/%s active SNP "
-                        "columns after removing numerical dependencies.",
-                        int(selected_span_basis_local.size),
-                        int(support.size),
-                    )
-            selected_span_reml = fitter.fit_infinitesimal(
-                y_jax,
-                (
-                    jnp.asarray(X_selected_span, dtype=jnp.float32)
-                    if X_selected_span is not None
-                    else None
-                ),
-                h2_init=_background_h2(theta_lasso_ml),
-                var_components_init=jnp.asarray(
-                    theta_lasso_ml, dtype=jnp.float32
-                ),
-            )
-            selected_span_reml_history = list(selected_span_reml.history)
-            (
-                theta_selected_span_reml,
-                selected_span_reml_stop_reason,
-            ) = _accepted_reml_theta(
-                selected_span_reml,
-                expected_components=n_grm + 1,
-                stage="selected-span REML refit",
-            )
-            selected_span_reml_iterations = len(
-                selected_span_reml.history
-            )
-            selected_span_refit_ok = True
-        except (FloatingPointError, RuntimeError, ValueError) as error:
-            selected_span_refit_error = str(error)
-            logger.warning(
-                "[WARN] selected-support REML refit is unavailable; "
-                "estimators 3 and 4 will be null while a valid Lasso branch "
-                "remains unchanged: %s",
-                selected_span_refit_error,
-            )
-    elif comparison_enabled:
-        selected_span_refit_error = (
-            "skipped because the penalized-ML branch was not accepted"
-        )
-
     # ---- Output results ----
     out_dir = os.path.dirname(out_prefix)
     if out_dir:
@@ -6559,28 +5129,11 @@ def main() -> None:
     unavailable = float("nan")
     theta_lasso_ml_sum = _background_genetic_variance(theta_lasso_ml)
     theta_e_lasso_ml = float(theta_lasso_ml[-1])
-    theta_final_sum = (
-        _background_genetic_variance(theta_selected_span_reml)
-        if selected_span_refit_ok
-        else unavailable
-    )
-    theta_e_final = (
-        float(theta_selected_span_reml[-1])
-        if selected_span_refit_ok
-        else unavailable
-    )
     q_chive = unavailable
     q_chive_term1 = unavailable
     q_chive_term2 = unavailable
-    q_ss_gls_plugin = unavailable
-    q_ss_gls_df_corrected = unavailable
-    ss_gls_df_correction = unavailable
-    ss_gls_basis_size = 0
     beta_cov_lasso = np.empty((0,), dtype=np.float64)
-    beta_cov_gls = np.empty((0,), dtype=np.float64)
-    beta_gls_active = np.empty((0,), dtype=np.float64)
     beta_lasso_active = np.empty((0,), dtype=np.float64)
-    selected_span_basis_positions = np.empty((0,), dtype=np.int64)
     lasso_quadratics_available = bool(
         alpha_theta_pair_usable
         and final_lasso is not None
@@ -6610,11 +5163,6 @@ def main() -> None:
                     )
                 alpha_theta_fixed_point_coherent = False
                 alpha_theta_pair_usable = False
-                selected_span_refit_ok = False
-                selected_span_refit_error = (
-                    "invalidated because the final Lasso active set does not "
-                    "match the exported support"
-                )
         except (IndexError, KeyError) as error:
             lasso_quadratics_available = False
             if penalized_failure_reason is None:
@@ -6624,10 +5172,6 @@ def main() -> None:
                 )
             alpha_theta_fixed_point_coherent = False
             alpha_theta_pair_usable = False
-            selected_span_refit_ok = False
-            selected_span_refit_error = (
-                "invalidated by final Lasso active-set validation failure"
-            )
         if support.size > 0:
             Z_support = (
                 grm_index.extract_standardized_columns(support)
@@ -6672,393 +5216,68 @@ def main() -> None:
                 )
             )
 
-    # Comparison estimators 3 and 4 and exported refit coefficients use this
-    # one selected-span REML--GLS solution.  The independent basis is mapped
-    # back to the selected support with zero coefficients for numerically
-    # dependent marker columns.
-    if selected_span_refit_ok:
-        q_ss_gls_plugin = 0.0
-        q_ss_gls_df_corrected = 0.0
-        ss_gls_df_correction = 0.0
-        beta_gls_active = np.zeros(support.size, dtype=np.float64)
-
-    if selected_span_refit_ok:
-        try:
-            theta_g = jnp.asarray(
-                theta_selected_span_reml[:-1], dtype=jnp.float32
-            )
-            theta_e = jnp.asarray(
-                theta_selected_span_reml[-1], dtype=jnp.float32
-            )
-            hv_final = fitter._make_hv(ops, theta_g, theta_e)
-            precond_final = fitter._make_effect_precond(
-                ops, theta_g, theta_e
-            )
-
-            solve_parts = [y_np[:, None]]
-            n_covar = 0
-            if covar_np is not None:
-                solve_parts.append(covar_np)
-                n_covar = int(covar_np.shape[1])
-            solve_parts.append(Z_support)
-            B_final = np.concatenate(
-                solve_parts, axis=1
-            ).astype(np.float32, copy=False)
-            sol_final, res_final, it_final = pcg_solve(
-                hv_final,
-                jnp.asarray(B_final, dtype=jnp.float32),
-                M=precond_final,
-                tol=args.pcg_tol,
-                maxiter=args.max_pcg_iters,
-            )
-            _require_pcg_converged(
-                res_final,
-                tol=args.pcg_tol,
-                iters=it_final,
-                maxiter=args.max_pcg_iters,
-                stage="final selected-span REML--GLS",
-            )
-            sol_final_np = np.asarray(sol_final, dtype=np.float64)
-            Hinv_y_final = sol_final_np[:, 0]
-            Hinv_covar_final = None
-            if n_covar > 0:
-                Hinv_covar_final = sol_final_np[:, 1 : 1 + n_covar]
-            Hinv_Z_support = sol_final_np[:, 1 + n_covar :]
-
-            ss_gls = _selected_span_gls_quadratics(
-                y=y_np,
-                covar=covar_np,
-                z_active=Z_support,
-                Hinv_y=Hinv_y_final,
-                Hinv_covar=Hinv_covar_final,
-                Hinv_z_active=Hinv_Z_support,
-            )
-            selected_span_basis_positions = np.asarray(
-                ss_gls["active_basis_idx"], dtype=np.int64
-            )
-            if not np.array_equal(
-                selected_span_basis_positions,
-                selected_span_basis_local,
-            ):
-                raise RuntimeError(
-                    "Selected-span REML and GLS retained different marker "
-                    "bases."
-                )
-            q_ss_gls_plugin = float(ss_gls["q_plugin"])
-            q_ss_gls_df_corrected = float(ss_gls["q_df_corrected"])
-            ss_gls_df_correction = float(ss_gls["df_correction"])
-            ss_gls_basis_size = int(
-                selected_span_basis_positions.size
-            )
-
-            beta_cov_gls = np.asarray(
-                ss_gls["beta_cov"], dtype=np.float64
-            ).reshape(-1)
-            beta_gls_active = _expand_selected_basis_coefficients(
-                support_size=int(support.size),
-                basis_positions=selected_span_basis_positions,
-                basis_coefficients=np.asarray(
-                    ss_gls["beta_active_basis"], dtype=np.float64
-                ),
-            )
-        except (FloatingPointError, RuntimeError, ValueError) as error:
-            selected_span_refit_ok = False
-            selected_span_refit_error = (
-                "Selected-span coefficient recovery failed: "
-                f"{error}"
-            )
-            logger.warning(
-                "[WARN] %s; estimators 3 and 4 will be null while a valid "
-                "Lasso branch remains unchanged.",
-                selected_span_refit_error,
-            )
-            theta_final_sum = unavailable
-            theta_e_final = unavailable
-            q_ss_gls_plugin = unavailable
-            q_ss_gls_df_corrected = unavailable
-            ss_gls_df_correction = unavailable
-            beta_cov_gls = np.empty((0,), dtype=np.float64)
-            beta_gls_active = np.empty((0,), dtype=np.float64)
-            selected_span_basis_positions = np.empty(
-                (0,), dtype=np.int64
-            )
-            ss_gls_basis_size = 0
-
-    # The primary COHERIT estimate always uses the calibrated Lasso quadratic
-    # and the covariate-contrast REML covariance from the same penalized
-    # branch. The other three estimators are constructed only in explicit
-    # comparison mode.
+    # The sole COHERIT estimate uses the calibrated Lasso quadratic and the
+    # covariate-contrast REML covariance from the same penalized branch.
     h2_chive = _sparse_dense_h2(
         q_chive,
         theta_lasso_ml_sum,
         theta_e_lasso_ml,
     )
-    h2_lasso_plugin = unavailable
-    h2_ss_gls_plugin = unavailable
-    h2_ss_gls_df_corrected = unavailable
-    if comparison_enabled:
-        four_h2 = _four_estimator_h2_from_branches(
-            q_lasso_plugin=q_chive_term1,
-            q_lasso_calibrated=q_chive,
-            q_selected_span_plugin=q_ss_gls_plugin,
-            q_selected_span_trace=q_ss_gls_df_corrected,
-            lasso_ml_background_variance=theta_lasso_ml_sum,
-            lasso_ml_residual_variance=theta_e_lasso_ml,
-            selected_span_reml_background_variance=theta_final_sum,
-            selected_span_reml_residual_variance=theta_e_final,
-        )
-        h2_lasso_plugin = four_h2["h2_lasso_plugin"]
-        h2_chive = four_h2["h2_chive"]
-        h2_ss_gls_plugin = four_h2["h2_ss_gls_plugin"]
-        h2_ss_gls_df_corrected = four_h2["h2_ss_gls_df_corrected"]
-    branch_guards = _sparse_estimator_branch_guards(
-        comparison_enabled=comparison_enabled,
+    branch_guards = _coherit_estimator_guard(
         alpha_theta_pair_certified=alpha_theta_pair_usable,
         lasso_quadratics_available=lasso_quadratics_available,
-        selected_span_refit_ok=selected_span_refit_ok,
-        lasso_estimator_values=np.asarray(
-            [h2_lasso_plugin, h2_chive]
-            if comparison_enabled
-            else [h2_chive],
-            dtype=np.float64,
-        ),
-        selected_support_estimator_values=np.asarray(
-            [h2_ss_gls_plugin, h2_ss_gls_df_corrected],
-            dtype=np.float64,
-        ),
+        h2_chive=h2_chive,
     )
     lasso_branch_valid = bool(branch_guards["lasso_branch_valid"])
-    selected_support_refit_branch_valid = bool(
-        branch_guards["selected_support_refit_branch_valid"]
-    )
-    all_requested_estimators_valid = bool(
-        branch_guards["all_requested_estimators_valid"]
-    )
     sparse_outputs_finite = bool(
-        branch_guards["all_requested_outputs_finite"]
+        branch_guards["lasso_outputs_finite"]
     )
     sparse_fit_rejection_reasons = list(
-        branch_guards["combined_invalid_reasons"]
+        branch_guards["lasso_branch_invalid_reasons"]
     )
-    if not all_requested_estimators_valid:
-        if comparison_enabled:
-            logger.warning(
-                "[WARN] requested sparse estimator branches incomplete: "
-                "lasso_valid=%s selected_support_refit_valid=%s reasons=%s. "
-                "No ordinary-REML value will replace a sparse estimator.",
-                lasso_branch_valid,
-                selected_support_refit_branch_valid,
-                ",".join(sparse_fit_rejection_reasons),
-            )
-        else:
-            logger.warning(
-                "[WARN] COHERIT estimator unavailable: lasso_valid=%s "
-                "reasons=%s. No ordinary-REML value will replace it.",
-                lasso_branch_valid,
-                ",".join(sparse_fit_rejection_reasons),
-            )
+    if not lasso_branch_valid:
+        logger.warning(
+            "[WARN] COHERIT estimator unavailable: lasso_valid=%s "
+            "reasons=%s. No ordinary-REML value will replace it.",
+            lasso_branch_valid,
+            ",".join(sparse_fit_rejection_reasons),
+        )
 
-    h2_lasso_plugin_guarded = (
-        float(h2_lasso_plugin)
-        if comparison_enabled and lasso_branch_valid
-        else unavailable
-    )
     h2_chive_guarded = float(h2_chive) if lasso_branch_valid else unavailable
-    h2_ss_gls_plugin_guarded = (
-        float(h2_ss_gls_plugin)
-        if selected_support_refit_branch_valid
-        else unavailable
-    )
-    h2_ss_gls_df_guarded = (
-        float(h2_ss_gls_df_corrected)
-        if selected_support_refit_branch_valid
-        else unavailable
-    )
     h2 = h2_chive_guarded
     primary_h2_method = (
         "penalized_reml_lasso_chive" if lasso_branch_valid else "unavailable"
     )
 
-    h2_background_selected_span_reml = (
-        _background_h2(theta_selected_span_reml)
-        if selected_support_refit_branch_valid
-        else unavailable
-    )
-
-    adaptive_marker_score_summary = None
-    covtree_diagnostic_summary = None
-    marker_score_output = args.marker_score_out.strip()
-    if marker_score_output and not covtree_requested:
-        if not lasso_branch_valid:
-            raise RuntimeError(
-                "Adaptive marker scores require a valid covariance-aligned "
-                "COHERIT Lasso branch."
-            )
-        marker_score_threshold = args.marker_score_min_validation_r2
-        observed_validation_r2 = None
-        if marker_score_threshold is not None:
-            validation_selection = (
-                final_lasso.get("validation_selection")
-                if final_lasso is not None
-                else None
-            )
-            if not isinstance(validation_selection, dict):
-                raise RuntimeError(
-                    "Conditional marker scoring requires final validation selection."
-                )
-            observed_validation_r2 = float(
-                validation_selection["selected"]["correlation_squared"]
-            )
-
-        if not _validation_allows_marker_score(
-            observed_validation_r2,
-            marker_score_threshold,
+    lasso_warm_state_out_summary = None
+    if args.lasso_warm_state_out:
+        if (
+            not alpha_theta_pair_usable
+            or final_lasso is None
         ):
-            adaptive_marker_score_summary = {
-                "status": "skipped_validation_decline",
-                "path": os.path.abspath(marker_score_output),
-                "observed_validation_r2": observed_validation_r2,
-                "required_min_validation_r2": float(marker_score_threshold),
-                "reason": "adaptive_k_layer_will_not_be_split",
-            }
-            logger.info(
-                "[adaptive] skipped unused marker scores: validation_R2=%.8f "
-                "< required %.8f",
-                observed_validation_r2,
-                float(marker_score_threshold),
+            raise RuntimeError(
+                "Lasso warm-state output requires a valid final "
+                "covariance-aligned Lasso pair."
             )
-        else:
-            marker_score_residual = _lasso_residual(
-                y=y_np,
-                covar=covar_np,
-                geno=Z_support,
-                beta_cov=beta_cov_lasso,
-                beta_snp=beta_lasso_active,
-            )
-            adaptive_marker_score_summary = _compute_adaptive_marker_scores(
-                output_path=marker_score_output,
-                residual=marker_score_residual,
-                covar=covar_np,
-                fitter=fitter,
-                ops=ops,
-                grm_index=grm_index,
-                theta=theta_lasso_ml,
-                n_probes=int(args.marker_score_probes),
-                seed=int(args.marker_score_seed),
-                pcg_tol=float(args.pcg_tol),
-                max_pcg_iters=int(args.max_pcg_iters),
-            )
-            logger.info(
-                "[adaptive] marker scores -> %s (probes=%s clipped=%s)",
-                marker_score_output,
-                int(args.marker_score_probes),
-                adaptive_marker_score_summary[
-                    "information_clipped_count"
-                ],
-            )
-
-    if covtree_requested:
-        marker_score_residual = _lasso_residual(
-            y=y_np,
-            covar=covar_np,
-            geno=Z_support,
-            beta_cov=beta_cov_lasso,
-            beta_snp=beta_lasso_active,
+        lasso_warm_state_out_summary = _write_lasso_warm_state(
+            args.lasso_warm_state_out,
+            candidate=final_candidate,
+            support=support,
+            selected_beta_snp=np.asarray(
+                final_lasso["beta_snp"], dtype=np.float64
+            ),
+            selected_lam_ratio=float(final_lasso["selected_lam_ratio"]),
         )
-        covtree_diagnostic_summary = _run_covtree_diagnostic(
-            args=args,
-            fitter=fitter,
-            ops=ops,
-            grm_index=grm_index,
-            component_spec_path=component_spec_source,
-            bed_prefix=bed_list[0],
-            marker_score_path=marker_score_output,
-            residual=marker_score_residual,
-            covar=covar_np,
-            theta=theta_lasso_ml,
-        )
-        adaptive_marker_score_summary = covtree_diagnostic_summary["marker_score"]
         logger.info(
-            "[covtree] accepted=%s candidate=%s adjusted_p=%s next_K=%s",
-            covtree_diagnostic_summary["accepted"],
-            covtree_diagnostic_summary["selected_candidate"],
-            covtree_diagnostic_summary["max_score_adjusted_p"],
-            covtree_diagnostic_summary["next_k"],
+            "[Lasso warm] emitted selection state -> %s",
+            args.lasso_warm_state_out,
         )
-
-    sparse_state_out_summary = None
-    if args.sparse_state_out:
-        next_split_needed = not covtree_requested or bool(
-            covtree_diagnostic_summary["accepted"]
-        )
-        if not next_split_needed:
-            sparse_state_out_summary = {
-                "status": "not_emitted_covtree_stopped",
-                "path": None,
-            }
-        else:
-            if (
-                not alpha_theta_pair_usable
-                or final_candidate.size == 0
-                or warm_lasso_beta_path is None
-                or warm_screen is None
-            ):
-                raise RuntimeError(
-                    "Sparse numerical state output requires a valid final "
-                    "covariance-aligned Lasso pair."
-                )
-            sparse_state_out_summary = _write_sparse_numerical_state(
-                args.sparse_state_out,
-                grm_index=grm_index,
-                candidate=final_candidate,
-                support=support,
-                beta_snp_path=warm_lasso_beta_path,
-                screen_solution=warm_screen,
-                warm_z_dict=warm_z_dict,
-                fixed_mean=fixed_mean_current,
-            )
-            logger.info(
-                "[covtree warm] sparse numerical state -> %s",
-                args.sparse_state_out,
-            )
 
     print(f"[RESULT] var_components_lasso_ml={theta_lasso_ml.tolist()}")
     print(f"[RESULT] h2={h2:.6f} (primary={primary_h2_method})")
     print(f"[RESULT] h2_chive={h2_chive:.6f} (penalized LASSO calibration)")
-    if comparison_enabled:
-        print(
-            "[RESULT] var_components_selected_span_reml="
-            f"{theta_selected_span_reml.tolist() if selected_span_refit_ok else None}"
-        )
-        print(
-            "[RESULT] h2_background_selected_span_reml="
-            f"{h2_background_selected_span_reml:.6f}"
-        )
-        print(
-            f"[RESULT] h2_lasso_plugin={h2_lasso_plugin:.6f} "
-            "(uncorrected penalized-LASSO plug-in)"
-        )
-        print(
-            f"[RESULT] h2_ss_gls_plugin={h2_ss_gls_plugin:.6f} "
-            "(selected-span GLS plug-in)"
-        )
-        print(
-            f"[RESULT] h2_ss_gls_df_corrected={h2_ss_gls_df_corrected:.6f} "
-            "(trace-corrected selected-span GLS)"
-        )
     print(f"[RESULT] support_size={int(support.size)}")
-
-    theta_lasso_ml_to_selected_span_rel = (
-        _max_rel_change(theta_selected_span_reml, theta_lasso_ml)
-        if selected_span_refit_ok
-        else None
-    )
-    selected_span_basis_support_indices = (
-        support[selected_span_basis_positions].tolist()
-        if selected_span_refit_ok
-        else []
-    )
-    # Preserve the partitioned, PCG-compatible KKT diagnostic. Non-finite
+    # Preserve the candidate/outside, PCG-compatible KKT diagnostic. Non-finite
     # placeholders from an unavailable check become JSON null.
     final_kkt_certificate_summary = _json_safe_value(final_kkt_certificate)
 
@@ -7092,22 +5311,12 @@ def main() -> None:
         }
     if not prediction_active:
         # A reused output prefix must not retain a prediction table from an
-        # earlier comparison run when the current run did not request one.
+        # earlier run when the current run did not request one.
         remove_sparse_prediction_outputs(out_prefix)
     if prediction_active:
-        emitted_branches = _sparse_prediction_branch_names(
-            comparison_enabled=comparison_enabled,
-            lasso_branch_valid=lasso_branch_valid,
-            selected_support_refit_branch_valid=(
-                selected_support_refit_branch_valid
-            ),
-        )
+        emitted_branches = ["lasso"] if lasso_branch_valid else []
         prediction_request_metadata = {
-            "estimator_mode": (
-                "four_estimator_comparison"
-                if comparison_enabled
-                else "coherit"
-            ),
+            "estimator_mode": "coherit",
             "test_phenotype_used": False,
             "genotype_standardization_source": "training_samples_only",
             "covariate_transform_source": "training_samples_only",
@@ -7128,20 +5337,13 @@ def main() -> None:
             },
         }
         if not emitted_branches:
-            unavailable_branch_metadata = {
-                "lasso_branch_valid": lasso_branch_valid,
-            }
-            if comparison_enabled:
-                unavailable_branch_metadata[
-                    "selected_support_refit_branch_valid"
-                ] = selected_support_refit_branch_valid
             metadata_path = write_sparse_prediction_status(
                 out_prefix=out_prefix,
                 status="not_emitted_no_valid_branch",
                 metadata={
                     **prediction_request_metadata,
                     "reason": "no_valid_sparse_prediction_branch",
-                    **unavailable_branch_metadata,
+                    "lasso_branch_valid": lasso_branch_valid,
                     "sparse_fit_rejection_reasons": list(
                         sparse_fit_rejection_reasons
                     ),
@@ -7157,21 +5359,6 @@ def main() -> None:
                                 ]
                             ),
                         },
-                        **(
-                            {
-                                "selected_span": {
-                                    "estimator_valid": False,
-                                    "output_emitted": False,
-                                    "invalid_reasons": list(
-                                        branch_guards[
-                                            "selected_support_refit_branch_invalid_reasons"
-                                        ]
-                                    ),
-                                }
-                            }
-                            if comparison_enabled
-                            else {}
-                        ),
                     },
                 },
             )
@@ -7199,7 +5386,6 @@ def main() -> None:
                 prediction_context = _build_prediction_fit_context(
                     args=args,
                     training_fitter=fitter,
-                    component_variant_indices=component_variant_indices,
                     prediction_bed_list=prediction_bed_list,
                     prediction_pgen_prefix=prediction_pgen_prefix,
                     covar_transform=covar_transform,
@@ -7233,23 +5419,6 @@ def main() -> None:
                     pcg_tol=args.pcg_tol,
                     max_pcg_iters=args.max_pcg_iters,
                 )
-                selected_span_prediction = None
-                if "selected_span" in emitted_branches:
-                    selected_span_prediction = predict_sparse_branch(
-                        name="selected_span",
-                        fitter=fitter,
-                        test_fitter=prediction_fitter,
-                        y_train=y_np,
-                        train_covar=covar_np,
-                        test_covar=prediction_covar,
-                        train_active_geno=Z_support,
-                        test_active_geno=prediction_support,
-                        beta_cov=beta_cov_gls,
-                        beta_active=beta_gls_active,
-                        theta=theta_selected_span_reml,
-                        pcg_tol=args.pcg_tol,
-                        max_pcg_iters=args.max_pcg_iters,
-                    )
             finally:
                 prediction_context.close()
 
@@ -7267,39 +5436,10 @@ def main() -> None:
                     "pcg_iters": lasso_prediction.pcg_iters,
                 },
             }
-            if comparison_enabled:
-                branch_metadata["selected_span"] = {
-                    "estimator_valid": bool(
-                        selected_support_refit_branch_valid
-                    ),
-                    "output_emitted": bool(
-                        selected_support_refit_branch_valid
-                    ),
-                    "invalid_reasons": list(
-                        branch_guards[
-                            "selected_support_refit_branch_invalid_reasons"
-                        ]
-                    ),
-                }
-            if "selected_span" in emitted_branches:
-                assert selected_span_prediction is not None
-                branch_metadata["selected_span"].update({
-                    "mean_estimator": "selected_span_gls",
-                    "covariance_estimator": "selected_span_reml",
-                    "theta": theta_selected_span_reml.tolist(),
-                    "residual": "y-X_beta_cov_gls-Z_support_beta_gls",
-                    "support_size": int(support.size),
-                    "independent_basis_size": int(ss_gls_basis_size),
-                    "pcg_rel_res": (
-                        selected_span_prediction.pcg_rel_res
-                    ),
-                    "pcg_iters": selected_span_prediction.pcg_iters,
-                })
             prediction_paths = write_sparse_prediction_outputs(
                 out_prefix=out_prefix,
                 sample_ids=prediction_ids,
                 lasso=lasso_prediction,
-                selected_span=selected_span_prediction,
                 metadata={
                     **prediction_request_metadata,
                     "branch_outputs_emitted": True,
@@ -7315,7 +5455,7 @@ def main() -> None:
                 "paths": prediction_paths,
             }
 
-    output_contract = _sparse_output_contract(comparison_enabled)
+    output_contract = _sparse_output_contract()
     evaluated_path_kkt_certified = bool(
         final_lasso is not None
         and final_lasso.get("path")
@@ -7343,6 +5483,7 @@ def main() -> None:
         "n_snps_total": grm_index.m_total,
         "n_grms": grm_index.n_grm,
         "m_per_grm": grm_index.m_per_grm.tolist(),
+        "sparse_grm_mode": "single_whole_genome_grm",
         "grm_variance_scale": "unit_mean_diagonal",
         "lambda_selection_method": (
             str(final_lasso["selection_method"])
@@ -7392,10 +5533,6 @@ def main() -> None:
             and final_lasso.get("validation_selection") is not None
             else None
         ),
-        "component_spec": component_spec_source or None,
-        "component_partition_mode": (
-            "snp_id" if component_variant_indices else "input_prefix"
-        ),
         "var_components_lasso_ml": theta_lasso_ml.tolist(),
         "variance_component_branch_mapping": {
             "h2_chive": "var_components_lasso_ml",
@@ -7408,7 +5545,6 @@ def main() -> None:
             ),
         },
         "primary_h2_method": primary_h2_method,
-        "all_requested_estimators_valid": all_requested_estimators_valid,
         "lasso_branch_valid": lasso_branch_valid,
         "lasso_branch_invalid_reasons": list(
             branch_guards["lasso_branch_invalid_reasons"]
@@ -7481,94 +5617,10 @@ def main() -> None:
     if supplied_theta_init:
         summary["variance_components_initial"] = theta_initial.tolist()
         summary["variance_components_init_source"] = theta_init_source
-    if adaptive_marker_score_summary is not None:
-        summary["adaptive_marker_score"] = adaptive_marker_score_summary
-    if covtree_diagnostic_summary is not None:
-        summary["covtree_diagnostic"] = covtree_diagnostic_summary
-    if sparse_state_in_summary is not None:
-        summary["sparse_state_in"] = sparse_state_in_summary
-    if covariance_settling_summary is not None:
-        summary["covtree_covariance_only_settling"] = (
-            covariance_settling_summary
-        )
-    if sparse_state_out_summary is not None:
-        summary["sparse_state_out"] = sparse_state_out_summary
-
-    if comparison_enabled:
-        summary.update({
-            "var_components_selected_span_reml": (
-                theta_selected_span_reml.tolist()
-                if selected_span_refit_ok
-                else None
-            ),
-            "variance_component_branch_mapping": {
-                "h2_lasso_plugin": "var_components_lasso_ml",
-                "h2_chive": "var_components_lasso_ml",
-                "h2_ss_gls_plugin": "var_components_selected_span_reml",
-                "h2_ss_gls_df_corrected": "var_components_selected_span_reml",
-            },
-            "all_sparse_branches_valid": bool(
-                branch_guards["all_four_estimators_valid"]
-            ),
-            "selected_support_refit_branch_valid": (
-                selected_support_refit_branch_valid
-            ),
-            "selected_support_refit_branch_invalid_reasons": list(
-                branch_guards[
-                    "selected_support_refit_branch_invalid_reasons"
-                ]
-            ),
-            "selected_support_outputs_finite": bool(
-                branch_guards["selected_support_outputs_finite"]
-            ),
-            "selected_span_reml_iterations": selected_span_reml_iterations,
-            "selected_span_reml_history": selected_span_reml_history,
-            "selected_span_reml_stop_reason": (
-                selected_span_reml_stop_reason or None
-            ),
-            "selected_span_reml_converged": bool(
-                selected_span_reml_stop_reason
-                in {"rel_dll", "scoring_step", "ll_down"}
-            ),
-            "selected_span_refit_ok": selected_span_refit_ok,
-            "selected_span_refit_error": selected_span_refit_error,
-            "selected_span_basis_size": ss_gls_basis_size,
-            "selected_span_basis_support_positions": (
-                selected_span_basis_positions.tolist()
-            ),
-            "selected_span_basis_support_indices": (
-                selected_span_basis_support_indices
-            ),
-            "theta_lasso_ml_to_selected_span_reml_rel_change": (
-                theta_lasso_ml_to_selected_span_rel
-            ),
-            "h2_background_selected_span_reml": _finite_float_or_none(
-                h2_background_selected_span_reml
-            ),
-            "h2_lasso_plugin": _finite_float_or_none(h2_lasso_plugin),
-            "h2_lasso_plugin_guarded": h2_lasso_plugin_guarded,
-            "h2_lasso_plugin_role": (
-                "estimator_1_uncorrected_lasso_ml_plugin"
-            ),
-            "h2_ss_gls_plugin": _finite_float_or_none(h2_ss_gls_plugin),
-            "h2_ss_gls_plugin_guarded": h2_ss_gls_plugin_guarded,
-            "h2_ss_gls_df_corrected": _finite_float_or_none(
-                h2_ss_gls_df_corrected
-            ),
-            "h2_ss_gls_df_guarded": h2_ss_gls_df_guarded,
-            "h2_ss_gls_role": (
-                "estimators_3_and_4_selected_support_reml_gls"
-            ),
-            "q_lasso_plugin": _finite_float_or_none(q_chive_term1),
-            "q_ss_gls_plugin": _finite_float_or_none(q_ss_gls_plugin),
-            "q_ss_gls_df_corrected": _finite_float_or_none(
-                q_ss_gls_df_corrected
-            ),
-            "ss_gls_df_correction": _finite_float_or_none(
-                ss_gls_df_correction
-            ),
-            "ss_gls_basis_size": ss_gls_basis_size,
-        })
+    if lasso_warm_state_in_summary is not None:
+        summary["lasso_warm_state_in"] = lasso_warm_state_in_summary
+    if lasso_warm_state_out_summary is not None:
+        summary["lasso_warm_state_out"] = lasso_warm_state_out_summary
 
     with open(out_prefix + ".summary.json", "w") as f:
         json.dump(
@@ -7586,18 +5638,13 @@ def main() -> None:
         )
 
     beta_map: dict[int, float] = {}
-    beta_reml_map: dict[int, float] = {}
     if final_lasso is not None and final_candidate.size > 0:
         beta_snp = np.asarray(final_lasso["beta_snp"], dtype=np.float64)
         for snp_idx, beta_val in zip(final_candidate.tolist(), beta_snp.tolist()):
             if beta_val != 0.0:
                 beta_map[int(snp_idx)] = float(beta_val)
-    if support.size > 0 and beta_gls_active.size == support.size:
-        for snp_idx, beta_val in zip(support.tolist(), beta_gls_active.tolist()):
-            beta_reml_map[int(snp_idx)] = float(beta_val)
-
     if sources is None:
-        bim_rows = grm_index.lookup_bim_rows(bed_list, support)
+        bim_rows = grm_index.lookup_bim_rows(bed_list[0], support)
     elif support.size > 0 and pgen_prefix:
         source_support = grm_index.source_variant_indices(support)
         source_rows = _lookup_pvar_rows(pgen_prefix + ".pvar", source_support)
@@ -7620,9 +5667,6 @@ def main() -> None:
             for pos in _positions:
                 _snp_grm_map[int(support[pos])] = g
 
-    selected_span_basis_set = set(
-        int(v) for v in selected_span_basis_support_indices
-    )
     with open(out_prefix + ".selected_snps.tsv", "w") as f:
         f.write("\t".join(output_contract["selected_snp_columns"]) + "\n")
         for snp_idx in support.tolist():
@@ -7637,14 +5681,6 @@ def main() -> None:
                 f"{int(snp_idx)}\t{source_snp_idx}\t{grm_id}\t{chr_}\t"
                 f"{snp_id}\t{cm}\t{bp}\t{a1}\t{a2}\t{beta_val:.8e}"
             )
-            if comparison_enabled:
-                beta_reml = (
-                    beta_reml_map.get(int(snp_idx), 0.0)
-                    if selected_span_refit_ok
-                    else float("nan")
-                )
-                basis_member = int(int(snp_idx) in selected_span_basis_set)
-                row += f"\t{beta_reml:.8e}\t{basis_member}"
             f.write(row + "\n")
 
     logger.info("[INFO] done @ %s elapsed=%.1fs", datetime.now().isoformat(timespec='seconds'), time.time() - t0)

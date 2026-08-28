@@ -22,84 +22,33 @@ REML = importlib.import_module(f"{PKG}.reml")
 LASSO = importlib.import_module(f"{PKG}.lasso_cd")
 
 
-class _StateIndex:
-    def __init__(self, cache_to_source, offsets=None):
-        self.cache_to_source = np.asarray(cache_to_source, dtype=np.int64)
-        self.m_total = int(self.cache_to_source.size)
-        self.offsets = np.asarray(
-            [0, self.m_total] if offsets is None else offsets,
-            dtype=np.int64,
-        )
-        self.n_grm = int(self.offsets.size - 1)
-
-    def source_variant_indices(self, cache_indices):
-        return self.cache_to_source[np.asarray(cache_indices, dtype=np.int64)]
-
-
-def test_covtree_sparse_state_round_trip_remaps_source_coordinates(tmp_path):
-    parent_index = _StateIndex([0, 1, 2, 3])
-    state_path = tmp_path / "state.npz"
+def test_lasso_warm_state_reuses_selected_alpha_for_final_refit(tmp_path):
+    state_path = tmp_path / "lasso_warm_state.npz"
     candidate = np.asarray([0, 2, 3], dtype=np.int64)
     support = np.asarray([2, 3], dtype=np.int64)
-    beta_path = np.arange(9, dtype=np.float64).reshape(3, 3)
-    screen = SPARSE.jnp.asarray(np.arange(10, dtype=np.float32).reshape(5, 2))
-    z_values = {
-        0: np.full(5, 1.0, dtype=np.float32),
-        2: np.full(5, 2.0, dtype=np.float32),
-        3: np.full(5, 3.0, dtype=np.float32),
-    }
+    selected_beta = np.asarray([0.0, 0.2, -0.1], dtype=np.float64)
 
-    SPARSE._write_sparse_numerical_state(
+    emitted = SPARSE._write_lasso_warm_state(
         str(state_path),
-        grm_index=parent_index,
         candidate=candidate,
         support=support,
-        beta_snp_path=beta_path,
-        screen_solution=screen,
-        warm_z_dict=z_values,
-        fixed_mean=np.arange(5, dtype=np.float64),
+        selected_beta_snp=selected_beta,
+        selected_lam_ratio=0.25,
     )
-    child_index = _StateIndex([2, 0, 3, 1])
-    loaded = SPARSE._load_sparse_numerical_state(
+    assert emitted["coordinate_system"] == "single_grm_marker_index"
+    assert emitted["marker_count"] == 2
+
+    loaded = SPARSE._load_lasso_warm_state(
         str(state_path),
-        grm_index=child_index,
-        n_samples=5,
-        n_lambda=3,
+        n_markers=4,
+        target_lam_ratio=0.25,
     )
 
-    np.testing.assert_array_equal(loaded["candidate"], [1, 0, 2])
-    np.testing.assert_array_equal(loaded["support"], [0, 2])
-    np.testing.assert_array_equal(loaded["beta_snp_path"], beta_path)
-    np.testing.assert_array_equal(
-        loaded["z_solution"], np.column_stack([z_values[0], z_values[2], z_values[3]])
-    )
-
-
-def test_covtree_bootstrap_marker_scores_are_written_in_source_order(tmp_path):
-    index = _StateIndex([2, 0, 3, 1], offsets=[0, 2, 4])
-    output = tmp_path / "marker_score.npz"
-    marker_scores = {
-        "covariance_score": np.asarray([20.0, 0.0, 30.0, 10.0]),
-        "projected_score_numerator": np.asarray([2.0, 0.0, 3.0, 1.0]),
-        "projected_information_diagonal": np.asarray([4.0, 1.0, 9.0, 2.0]),
-    }
-
-    summary, covariance_source = SPARSE._write_covtree_bootstrap_marker_scores(
-        output_path=str(output),
-        grm_index=index,
-        marker_scores=marker_scores,
-        bootstrap_draws=199,
-        seed=7,
-    )
-
-    assert summary["quadratic_backend"] == "reused_covtree_Xt_Pe_bootstrap_pass"
-    np.testing.assert_array_equal(covariance_source, [0.0, 10.0, 20.0, 30.0])
-    with np.load(output, allow_pickle=False) as payload:
-        np.testing.assert_array_equal(payload["source_variant_index"], [0, 1, 2, 3])
-        np.testing.assert_array_equal(payload["parent_component_index"], [0, 1, 0, 1])
-        np.testing.assert_array_equal(
-            payload["projected_score_numerator"], [0.0, 1.0, 2.0, 3.0]
-        )
+    np.testing.assert_array_equal(loaded["candidate"], [2, 3])
+    np.testing.assert_array_equal(loaded["support"], [2, 3])
+    np.testing.assert_array_equal(loaded["beta_snp_path"][0], np.zeros(2))
+    np.testing.assert_allclose(loaded["beta_snp_path"][1], [0.2, -0.1])
+    assert loaded["selected_lam_ratio"] == pytest.approx(0.25)
 
 
 def test_validation_selected_path_materializes_alpha_used_downstream():
@@ -521,168 +470,61 @@ def test_sparse_dense_h2_is_invariant_to_phenotype_rescaling():
     assert np.isclose(h2, h2_rescaled, rtol=2e-6, atol=2e-6)
 
 
-def test_raw_lasso_plugin_is_chive_first_term_without_calibration():
+def test_chive_is_squared_fitted_mean_plus_residual_correction():
     rng = np.random.RandomState(1617)
     z_active = rng.standard_normal((100, 5))
     beta = rng.standard_normal(5) * 0.2
     y = z_active @ beta + rng.standard_normal(100)
 
-    q_chive, q_lasso_plugin, correction = SPARSE._chive_q_hat_given_active(
+    q_chive, q_squared_mean, correction = SPARSE._chive_q_hat_given_active(
         z_active,
         y,
         beta,
     )
 
-    expected_plugin = float(np.mean(np.square(z_active @ beta)))
-    assert np.isclose(q_lasso_plugin, expected_plugin)
-    assert np.isclose(q_chive, q_lasso_plugin + correction)
+    expected_squared_mean = float(np.mean(np.square(z_active @ beta)))
+    assert np.isclose(q_squared_mean, expected_squared_mean)
+    assert np.isclose(q_chive, q_squared_mean + correction)
 
 
-def test_four_estimator_h2_uses_lasso_ml_and_reml_branches():
-    values = SPARSE._four_estimator_h2_from_branches(
-        q_lasso_plugin=0.07,
-        q_lasso_calibrated=0.13,
-        q_selected_span_plugin=0.19,
-        q_selected_span_trace=0.11,
-        lasso_ml_background_variance=0.17,
-        lasso_ml_residual_variance=0.71,
-        selected_span_reml_background_variance=0.43,
-        selected_span_reml_residual_variance=0.29,
-    )
-
-    assert np.isclose(
-        values["h2_lasso_plugin"],
-        SPARSE._sparse_dense_h2(0.07, 0.17, 0.71),
-    )
-    assert np.isclose(
-        values["h2_chive"],
-        SPARSE._sparse_dense_h2(0.13, 0.17, 0.71),
-    )
-    assert np.isclose(
-        values["h2_ss_gls_plugin"],
-        SPARSE._sparse_dense_h2(0.19, 0.43, 0.29),
-    )
-    assert np.isclose(
-        values["h2_ss_gls_df_corrected"],
-        SPARSE._sparse_dense_h2(0.11, 0.43, 0.29),
-    )
-    assert not np.isclose(
-        values["h2_chive"],
-        SPARSE._sparse_dense_h2(0.13, 0.43, 0.29),
-    )
-
-
-def test_branch_guards_preserve_valid_lasso_when_refit_is_unavailable():
-    guards = SPARSE._sparse_estimator_branch_guards(
-        comparison_enabled=True,
+def test_coherit_guard_accepts_only_a_certified_finite_estimator():
+    guards = SPARSE._coherit_estimator_guard(
         alpha_theta_pair_certified=True,
         lasso_quadratics_available=True,
-        selected_span_refit_ok=True,
-        lasso_estimator_values=np.asarray([0.2, 0.3]),
-        selected_support_estimator_values=np.asarray([0.4, -0.1]),
+        h2_chive=0.3,
     )
     assert guards["lasso_branch_valid"] is True
-    assert guards["selected_support_refit_branch_valid"] is True
-    assert guards["all_four_estimators_valid"] is True
-    assert guards["combined_invalid_reasons"] == []
+    assert guards["lasso_outputs_finite"] is True
+    assert guards["lasso_branch_invalid_reasons"] == []
 
-    guards = SPARSE._sparse_estimator_branch_guards(
-        comparison_enabled=True,
-        alpha_theta_pair_certified=True,
-        lasso_quadratics_available=True,
-        selected_span_refit_ok=False,
-        lasso_estimator_values=np.asarray([0.2, 0.3]),
-        selected_support_estimator_values=np.asarray([np.nan, np.nan]),
-    )
-    assert guards["lasso_branch_valid"] is True
-    assert guards["selected_support_refit_branch_valid"] is False
-    assert guards["all_four_estimators_valid"] is False
-    assert "selected_support_reml_gls_unavailable" in guards[
-        "selected_support_refit_branch_invalid_reasons"
-    ]
-    assert "nonfinite_selected_support_estimator" in guards[
-        "selected_support_refit_branch_invalid_reasons"
-    ]
-
-
-def test_invalid_lasso_branch_invalidates_downstream_refit_branch():
-    guards = SPARSE._sparse_estimator_branch_guards(
-        comparison_enabled=True,
+    uncertified = SPARSE._coherit_estimator_guard(
         alpha_theta_pair_certified=False,
         lasso_quadratics_available=True,
-        selected_span_refit_ok=True,
-        lasso_estimator_values=np.asarray([0.2, 0.3]),
-        selected_support_estimator_values=np.asarray([0.4, 0.5]),
+        h2_chive=0.3,
     )
-    assert guards["lasso_branch_valid"] is False
-    assert guards["selected_support_refit_branch_valid"] is False
-    assert "penalized_alpha_theta_pair_not_certified" in guards[
+    assert uncertified["lasso_branch_valid"] is False
+    assert "penalized_alpha_theta_pair_not_certified" in uncertified[
         "lasso_branch_invalid_reasons"
     ]
-    assert "lasso_support_branch_not_valid" in guards[
-        "selected_support_refit_branch_invalid_reasons"
+
+    nonfinite = SPARSE._coherit_estimator_guard(
+        alpha_theta_pair_certified=True,
+        lasso_quadratics_available=True,
+        h2_chive=np.nan,
+    )
+    assert nonfinite["lasso_branch_valid"] is False
+    assert "nonfinite_lasso_estimator" in nonfinite[
+        "lasso_branch_invalid_reasons"
     ]
 
 
-def test_coherit_only_guard_does_not_require_unrequested_comparators():
-    guards = SPARSE._sparse_estimator_branch_guards(
-        comparison_enabled=False,
-        alpha_theta_pair_certified=True,
-        lasso_quadratics_available=True,
-        selected_span_refit_ok=False,
-        lasso_estimator_values=np.asarray([0.3]),
-        selected_support_estimator_values=np.asarray([np.nan, np.nan]),
-    )
-    assert guards["lasso_branch_valid"] is True
-    assert guards["selected_support_refit_branch_valid"] is False
-    assert guards["all_requested_estimators_valid"] is True
-    assert guards["all_requested_outputs_finite"] is True
-    assert guards["combined_invalid_reasons"] == []
+def test_sparse_output_contract_is_coherit_only():
+    contract = SPARSE._sparse_output_contract()
 
-
-def test_estimator_guard_requires_mode_specific_output_count():
-    coherit = SPARSE._sparse_estimator_branch_guards(
-        comparison_enabled=False,
-        alpha_theta_pair_certified=True,
-        lasso_quadratics_available=True,
-        selected_span_refit_ok=False,
-        lasso_estimator_values=np.asarray([0.2, 0.3]),
-        selected_support_estimator_values=np.asarray([np.nan, np.nan]),
-    )
-    comparison = SPARSE._sparse_estimator_branch_guards(
-        comparison_enabled=True,
-        alpha_theta_pair_certified=True,
-        lasso_quadratics_available=True,
-        selected_span_refit_ok=True,
-        lasso_estimator_values=np.asarray([0.3]),
-        selected_support_estimator_values=np.asarray([0.4, 0.5]),
-    )
-    assert coherit["lasso_branch_valid"] is False
-    assert comparison["lasso_branch_valid"] is False
-
-
-def test_sparse_output_contract_hides_comparison_fields_by_default():
-    default = SPARSE._sparse_output_contract(False)
-    comparison = SPARSE._sparse_output_contract(True)
-
-    assert default["sparse_output_schema_version"] == 7
-    assert default["estimator_mode"] == "coherit"
-    assert default["computed_estimators"] == ["h2_chive"]
-    assert default["selected_snp_columns"][-1] == "beta_lasso"
-    assert "beta_gls_reml" not in default["selected_snp_columns"]
-
-    assert comparison["sparse_output_schema_version"] == 7
-    assert comparison["estimator_mode"] == "four_estimator_comparison"
-    assert comparison["computed_estimators"] == [
-        "h2_lasso_plugin",
-        "h2_chive",
-        "h2_ss_gls_plugin",
-        "h2_ss_gls_df_corrected",
-    ]
-    assert comparison["selected_snp_columns"][-2:] == [
-        "beta_gls_reml",
-        "selected_span_basis",
-    ]
+    assert contract["sparse_output_schema_version"] == 7
+    assert contract["estimator_mode"] == "coherit"
+    assert contract["computed_estimators"] == ["h2_chive"]
+    assert contract["selected_snp_columns"][-1] == "beta_lasso"
 
 
 def test_fitted_mean_convergence_allows_equivalent_support_swaps():
@@ -861,8 +703,8 @@ def test_lasso_path_warm_start_is_reused_for_any_basis_overlap():
     )
 
 
-def test_partitioned_signed_kkt_distinguishes_candidate_and_outside_failures():
-    signed_pass = SPARSE._partitioned_lasso_kkt_from_scores(
+def test_candidate_signed_kkt_distinguishes_inside_and_outside_failures():
+    signed_pass = SPARSE._candidate_lasso_kkt_from_scores(
         score=np.asarray([0.5, -0.5, 0.49]),
         candidate=np.asarray([0, 1]),
         beta_candidate=np.asarray([0.2, -0.1]),
@@ -874,7 +716,7 @@ def test_partitioned_signed_kkt_distinguishes_candidate_and_outside_failures():
     assert signed_pass["full_certificate"]["passed"] is True
     assert signed_pass["outside_violators"].size == 0
 
-    inside_failure = SPARSE._partitioned_lasso_kkt_from_scores(
+    inside_failure = SPARSE._candidate_lasso_kkt_from_scores(
         score=np.asarray([0.45, 0.49, 0.49]),
         candidate=np.asarray([0, 1]),
         beta_candidate=np.asarray([0.2, 0.0]),
@@ -886,7 +728,7 @@ def test_partitioned_signed_kkt_distinguishes_candidate_and_outside_failures():
     assert inside_failure["full_certificate"]["passed"] is False
     assert inside_failure["outside_violators"].size == 0
 
-    outside_failure = SPARSE._partitioned_lasso_kkt_from_scores(
+    outside_failure = SPARSE._candidate_lasso_kkt_from_scores(
         score=np.asarray([0.5, 0.49, -0.51]),
         candidate=np.asarray([0, 1]),
         beta_candidate=np.asarray([0.2, 0.0]),
@@ -905,26 +747,26 @@ def test_outer_convergence_uses_absolute_coherit_h2_change():
     converged, change = SPARSE._heritability_converged(
         0.701,
         None,
-        abs_tol=1e-3,
+        abs_tol=1e-2,
     )
     assert converged is False
     assert np.isinf(change)
 
     converged, change = SPARSE._heritability_converged(
-        0.701,
+        0.710,
         0.700,
-        abs_tol=1e-3,
+        abs_tol=1e-2,
     )
     assert converged is True
-    assert np.isclose(change, 1e-3)
+    assert np.isclose(change, 1e-2)
 
     converged, change = SPARSE._heritability_converged(
-        0.701001,
+        0.710001,
         0.700,
-        abs_tol=1e-3,
+        abs_tol=1e-2,
     )
     assert converged is False
-    assert change > 1e-3
+    assert change > 1e-2
 
 
 def test_outer_coherit_h2_matches_final_chive_functional():
@@ -965,11 +807,11 @@ def test_outer_coherit_h2_matches_final_chive_functional():
     assert np.isclose(observed_h2, expected_h2)
 
 
-def test_partitioned_kkt_rejects_nonfinite_outside_score_with_empty_support():
+def test_candidate_kkt_rejects_nonfinite_outside_score_with_empty_support():
     with np.testing.assert_raises_regex(
         ValueError, "Full-p KKT inputs must be finite"
     ):
-        SPARSE._partitioned_lasso_kkt_from_scores(
+        SPARSE._candidate_lasso_kkt_from_scores(
             score=np.asarray([np.nan]),
             candidate=np.empty((0,), dtype=np.int64),
             beta_candidate=np.empty((0,), dtype=np.float64),
@@ -988,7 +830,8 @@ def test_sparse_defaults_use_twenty_outer_rounds_and_pcg_scaled_kkt_floor(
     default_args = SPARSE.parse_args()
     default_floor = max(1e-4, 2.0 * default_args.pcg_tol)
     assert default_args.outer_max == 20
-    assert np.isclose(default_args.h2_abs_tol, 1e-3)
+    assert np.isclose(default_args.h2_abs_tol, 1e-2)
+    assert np.isclose(default_args.effect_rel_tol, 5e-2)
     assert np.isclose(default_args.kkt_tol, default_floor)
     assert np.isclose(default_args.kkt_rel_tol, default_floor)
 
@@ -1279,15 +1122,6 @@ def test_complete_path_failure_does_not_fall_back_to_valid_null(monkeypatch):
         )
 
 
-def test_marker_score_probes_are_skipped_only_for_a_declining_adaptive_layer():
-    assert SPARSE._validation_allows_marker_score(None, None)
-    assert SPARSE._validation_allows_marker_score(0.2, 0.2)
-    assert SPARSE._validation_allows_marker_score(0.21, 0.2)
-    assert not SPARSE._validation_allows_marker_score(0.19, 0.2)
-    with np.testing.assert_raises_regex(ValueError, "requires validation R2"):
-        SPARSE._validation_allows_marker_score(None, 0.2)
-
-
 def test_covariate_contrast_reml_passes_full_design_without_rescaling():
     marker = SimpleNamespace(
         var_components=REML.jnp.asarray(
@@ -1523,134 +1357,9 @@ def test_covariate_contrast_reml_core_is_invariant_to_nuisance_shift():
 def test_empty_support_reduces_to_background_only_heritability():
     background, residual = 0.28, 0.62
     expected = background / (background + residual)
-    penalized = SPARSE._sparse_dense_h2(0.0, background, residual)
-    post_gls = SPARSE._sparse_dense_h2(0.0, background, residual)
+    h2 = SPARSE._sparse_dense_h2(0.0, background, residual)
 
-    assert np.isclose(penalized, expected)
-    assert np.isclose(post_gls, expected)
-
-
-def test_same_sample_ols_refit_makes_chive_cross_term_vanish():
-    """Locks in why the post-selection GLS/OLS result is diagnostic only."""
-    rng = np.random.RandomState(2718)
-    z_active = rng.standard_normal((90, 6))
-    y = rng.standard_normal(90)
-    beta_ols = np.linalg.solve(z_active.T @ z_active, z_active.T @ y)
-
-    q_hat, term1, term2 = SPARSE._chive_q_hat_given_active(
-        z_active, y, beta_ols
-    )
-
-    assert np.isclose(term2, 0.0, atol=1e-12)
-    assert np.isclose(q_hat, term1, atol=1e-12)
-    assert q_hat > 0.0
-
-
-def test_selected_span_gls_df_correction_matches_fixed_span_formula():
-    rng = np.random.RandomState(1618)
-    n, k = 70, 4
-    z_active = rng.standard_normal((n, k))
-    z_active -= z_active.mean(axis=0)
-    w = rng.standard_normal((n, n))
-    v = w @ w.T / n + 0.7 * np.eye(n)
-    vinv = np.linalg.inv(v)
-    y = z_active @ rng.standard_normal(k) + rng.multivariate_normal(np.zeros(n), v)
-
-    out = SPARSE._selected_span_gls_quadratics(
-        y=y,
-        covar=None,
-        z_active=z_active,
-        Hinv_y=vinv @ y,
-        Hinv_covar=None,
-        Hinv_z_active=vinv @ z_active,
-    )
-
-    gram_inv = np.linalg.inv(z_active.T @ vinv @ z_active)
-    sparse_gram = z_active.T @ z_active / n
-    expected_df = np.trace(sparse_gram @ gram_inv)
-    expected_plugin = float(np.mean(np.square(z_active @ out["beta_active_basis"])))
-
-    assert np.isclose(out["df_correction"], expected_df)
-    assert np.isclose(out["q_plugin"], expected_plugin)
-    assert np.isclose(
-        out["q_df_corrected"],
-        expected_plugin - expected_df,
-    )
-
-
-def test_selected_span_gls_uses_independent_basis_for_duplicate_markers():
-    rng = np.random.RandomState(2719)
-    n = 60
-    z1 = rng.standard_normal(n)
-    z1 -= z1.mean()
-    z_active = np.column_stack([z1, z1])
-    covar = np.ones((n, 1))
-    v = np.eye(n)
-    y = 0.4 * z1 + rng.standard_normal(n)
-
-    out = SPARSE._selected_span_gls_quadratics(
-        y=y,
-        covar=covar,
-        z_active=z_active,
-        Hinv_y=y,
-        Hinv_covar=covar,
-        Hinv_z_active=z_active,
-    )
-
-    assert len(out["active_basis_idx"]) == 1
-    assert np.isfinite(out["q_df_corrected"])
-
-    beta_full = SPARSE._expand_selected_basis_coefficients(
-        support_size=z_active.shape[1],
-        basis_positions=out["active_basis_idx"],
-        basis_coefficients=out["beta_active_basis"],
-    )
-    fitted = z_active @ beta_full
-    assert np.count_nonzero(beta_full) == 1
-    assert np.isclose(
-        np.mean(np.square(fitted)),
-        out["q_plugin"],
-        rtol=1e-12,
-        atol=1e-12,
-    )
-
-
-def test_selected_span_gls_recovers_covariates_with_empty_support():
-    rng = np.random.RandomState(2720)
-    n = 50
-    covar = np.ones((n, 1), dtype=np.float64)
-    y = 1.25 + rng.standard_normal(n)
-    z_active = np.empty((n, 0), dtype=np.float64)
-
-    out = SPARSE._selected_span_gls_quadratics(
-        y=y,
-        covar=covar,
-        z_active=z_active,
-        Hinv_y=y,
-        Hinv_covar=covar,
-        Hinv_z_active=z_active,
-    )
-
-    assert out["beta_cov"].shape == (1,)
-    assert out["beta_active_basis"].shape == (0,)
-    assert out["active_basis_idx"].shape == (0,)
-    assert out["q_plugin"] == 0.0
-    assert out["q_df_corrected"] == 0.0
-
-
-def test_selected_span_basis_expansion_rejects_invalid_positions():
-    with np.testing.assert_raises(ValueError):
-        SPARSE._expand_selected_basis_coefficients(
-            support_size=3,
-            basis_positions=np.asarray([1, 1]),
-            basis_coefficients=np.asarray([0.2, 0.3]),
-        )
-    with np.testing.assert_raises(ValueError):
-        SPARSE._expand_selected_basis_coefficients(
-            support_size=3,
-            basis_positions=np.asarray([3]),
-            basis_coefficients=np.asarray([0.2]),
-        )
+    assert np.isclose(h2, expected)
 
 
 def test_reml_backtracking_reuses_the_accepted_state_warm_anchor(

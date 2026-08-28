@@ -81,10 +81,10 @@ def predict_sparse_branch(
     """Predict with one branch's own mean, residual and covariance estimate."""
     y = np.asarray(y_train, dtype=np.float64).reshape(-1)
     n_train = int(y.size)
-    if not fitter.streamers or int(fitter.streamers[0].n) != n_train:
+    if len(fitter.streamers) != 1 or int(fitter.streamers[0].n) != n_train:
         raise ValueError("Training phenotype and genotype row counts do not match.")
-    if not test_fitter.streamers:
-        raise ValueError("Prediction requires an initialized test fitter.")
+    if len(test_fitter.streamers) != 1:
+        raise ValueError("Sparse prediction requires exactly one test GRM.")
     n_test = int(test_fitter.streamers[0].n)
     c_train = _as_design(train_covar, n_rows=n_train, name="train_covar")
     c_test = _as_design(test_covar, n_rows=n_test, name="test_covar")
@@ -115,11 +115,10 @@ def predict_sparse_branch(
         )
 
     ops = fitter._assemble_reml_operators()
-    if theta.size != len(ops.K_mvs) + 1:
+    if len(ops.K_mvs) != 1 or theta.size != 2:
         raise ValueError(
-            "theta length mismatch: expected "
-            f"{len(ops.K_mvs) + 1}, got {theta.size}."
-    )
+            "Single-GRM sparse prediction requires [genetic, residual] theta."
+        )
     residual = y - c_train @ beta_cov - z_train @ beta_active
     theta_dev = jnp.asarray(theta, dtype=jnp.float32)
     fitter._ensure_projected_core_precond_ready(
@@ -150,9 +149,7 @@ def predict_sparse_branch(
     effects = EffectEstimates(
         fixed_effects=jnp.asarray(fixed, dtype=jnp.float32),
         random_effect=zeros_train,
-        random_effect_components=tuple(
-            zeros_train for _ in range(len(ops.K_mvs))
-        ),
+        random_effect_components=(zeros_train,),
         snp_effects=snp_effects,
         pcg_rel_res=rel,
         pcg_iters=int(iters),
@@ -222,7 +219,7 @@ def _pack_effect_path_by_call(streamer, effect_path: np.ndarray) -> jnp.ndarray:
     effects = np.asarray(effect_path, dtype=np.float32)
     if effects.ndim != 2 or int(effects.shape[0]) != int(streamer.m):
         raise ValueError(
-            "effect_path must contain one row per partitioned-stream marker."
+            "effect_path must contain one row per single-GRM marker."
         )
     n_path = int(effects.shape[1])
     packed = np.zeros(
@@ -242,7 +239,7 @@ def _pack_effect_path_by_call(streamer, effect_path: np.ndarray) -> jnp.ndarray:
     return jax.device_put(jnp.asarray(packed), streamer.dev)
 
 
-def predict_sparse_path_partitioned(
+def predict_sparse_path_single_grm(
     *,
     fitter,
     test_fitter,
@@ -262,12 +259,17 @@ def predict_sparse_path_partitioned(
     Path points share a fixed covariance estimate.  This is the inexpensive
     validation scan used to select ``lambda / lambda_max`` before a full refit.
     """
-    train_streamer = getattr(fitter, "_partitioned_streamer", None)
-    test_streamer = getattr(test_fitter, "_partitioned_streamer", None)
-    if train_streamer is None or test_streamer is None:
+    if len(fitter.streamers) != 1 or len(test_fitter.streamers) != 1:
         raise ValueError(
-            "Sparse path prediction requires a single-source component partition."
+            "Sparse path prediction requires one training and one test GRM."
         )
+    train_streamer = fitter.streamers[0]
+    test_streamer = test_fitter.streamers[0]
+    if (
+        int(getattr(train_streamer, "n_components", 1)) != 1
+        or int(getattr(test_streamer, "n_components", 1)) != 1
+    ):
+        raise ValueError("Sparse path prediction does not accept GRM partitions.")
     _validate_dense_prediction_streamers(
         fitter.streamers, test_fitter.streamers
     )
@@ -311,12 +313,12 @@ def predict_sparse_path_partitioned(
 
     theta = np.asarray(theta, dtype=np.float64).reshape(-1)
     if (
-        theta.shape != (int(train_streamer.n_components) + 1,)
+        theta.shape != (2,)
         or not np.all(np.isfinite(theta))
         or np.any(theta[:-1] < 0.0)
         or theta[-1] <= 0.0
     ):
-        raise ValueError("theta is incompatible with the partition.")
+        raise ValueError("theta is incompatible with a single GRM.")
 
     nuisance_train = c_train @ beta_cov_path.T
     fixed_train = z_train @ beta_candidate_path.T
@@ -357,22 +359,17 @@ def predict_sparse_path_partitioned(
     expected_xt_shape = (int(train_streamer.m), n_path)
     if xt_dual.shape != expected_xt_shape:
         raise RuntimeError(
-            "Partitioned X'V^-1 residual path has the wrong shape: "
+            "Single-GRM X'V^-1 residual path has the wrong shape: "
             f"{xt_dual.shape} != {expected_xt_shape}."
         )
-    random_effect_path = np.zeros_like(xt_dual, dtype=np.float32)
-    for component_index in range(int(train_streamer.n_components)):
-        start = int(train_streamer._component_snp_offsets[component_index])
-        stop = int(train_streamer._component_snp_offsets[component_index + 1])
-        effective_m = float(
-            train_streamer._component_eff_m_host[component_index]
-        )
-        if effective_m > 0.0:
-            random_effect_path[start:stop, :] = (
-                float(theta[component_index])
-                / effective_m
-                * xt_dual[start:stop, :]
-            )
+    effective_m = float(
+        np.asarray(jax.device_get(train_streamer._eff_m_const))
+    )
+    if not np.isfinite(effective_m) or effective_m <= 0.0:
+        raise ValueError("Single-GRM effective marker count must be positive.")
+    random_effect_path = (
+        float(theta[0]) / effective_m * xt_dual
+    ).astype(np.float32, copy=False)
 
     from .kv_impl import zxb_impl_same_stream_multi
 
@@ -464,19 +461,13 @@ def write_sparse_prediction_outputs(
     *,
     out_prefix: str,
     sample_ids: Sequence[str],
-    lasso: SparseBranchPrediction | None,
-    selected_span: SparseBranchPrediction | None,
+    lasso: SparseBranchPrediction,
     metadata: Mapping[str, object],
 ) -> dict[str, str]:
-    """Write every available sparse branch to one aligned prediction table."""
+    """Write the sole COHERIT Lasso prediction to one aligned table."""
     n = len(sample_ids)
-    branches = (
-        ("lasso", lasso),
-        ("selected_span", selected_span),
-    )
-    available = [(prefix, branch) for prefix, branch in branches if branch is not None]
-    if not available:
-        raise ValueError("At least one valid sparse prediction branch is required.")
+    if lasso is None:
+        raise ValueError("A valid COHERIT Lasso prediction is required.")
     suffixes = (
         "fixed_snp_score",
         "background_blup",
@@ -484,19 +475,16 @@ def write_sparse_prediction_outputs(
         "nuisance_fixed_score",
         "phenotype_prediction",
     )
-    arrays: list[np.ndarray] = []
-    columns = ["sample_index", "iid"]
-    for prefix, branch in available:
-        columns.extend(f"{prefix}_{suffix}" for suffix in suffixes)
-        arrays.extend(
-            (
-                branch.fixed_snp_score,
-                branch.background_blup,
-                branch.genetic_score,
-                branch.nuisance_fixed_score,
-                branch.phenotype_prediction,
-            )
-        )
+    columns = ["sample_index", "iid"] + [
+        f"lasso_{suffix}" for suffix in suffixes
+    ]
+    arrays = [
+        lasso.fixed_snp_score,
+        lasso.background_blup,
+        lasso.genetic_score,
+        lasso.nuisance_fixed_score,
+        lasso.phenotype_prediction,
+    ]
     if any(np.asarray(arr).size != n for arr in arrays):
         raise ValueError(
             "Sparse prediction arrays and sample IDs have different lengths."

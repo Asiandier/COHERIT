@@ -119,33 +119,21 @@ selection. Because that ratio is already fixed, each final-refit LASSO block
 solves only the lambda-max warm-start point and the exact target point, rather
 than recomputing the unused validation grid. The run stops with this
 covariance-aligned LASSO pair and reports
-the COHERIT estimator. A secondary four-estimator comparison can be requested with
-`--compare-four-estimators`; only in that mode is the selected span frozen and
-one separate REML--GLS refit performed.  That refit is not fed back into the
-LASSO.
+the COHERIT estimator.
 
-The end-to-end sparse path has two partition modes with the same inner
-validation-lambda contract:
-
-- `fixed_k_validation_lambda`: freeze a supplied component spec (or use K=1),
-  select lambda by validation prediction inside every alpha/theta iteration,
-  then freeze the selected lambda ratio for the train+validation refit. The
-  orchestrator is `gpu-reml-sparse-fixed`.
-- `adaptive_k_validation_lambda`: start at K=1, fully converge the same
-  validation-selected sparse model at each K, split every GRM by exact 1D
-  two-means signal score and within-bin LD median, and stop at the first
-  validation-R2 decline along K=1,4,...,1024. The orchestrator is
-  `gpu-reml-sparse-adaptive`. A layer that already falls below the preceding
-  validation R2 skips the otherwise unused marker-information probes.
-
-The validation set therefore selects lambda in both modes and additionally
-selects K only in Adaptive mode. The test phenotype remains isolated until the
-partition and lambda ratio are frozen.
+The sparse path deliberately supports one model:
+`single_grm_validation_r2`. It uses one whole-genome GRM, selects lambda by
+held-out validation R² inside every alpha/theta outer iteration, and exposes no
+GRM partition, Adaptive-K, or covariance-tree interface. The
+`gpu-reml-sparse-validation` orchestrator then freezes the selected
+lambda/lambda-max ratio and automatically warm-starts a train+validation final
+refit before evaluating the held-out test samples. The test phenotype is never
+used for lambda selection.
 
 Sparse-run output semantics are deliberately explicit:
 
-- By default, `estimator_mode` is `coherit` and `computed_estimators` contains
-  only `h2_chive`.  No selected-support REML--GLS refit is run.
+- `estimator_mode` is `coherit` and `computed_estimators` contains only
+  `h2_chive`.
 - New sparse runs use output schema version 7. Raw/standardized duplicate
   estimator fields and downstream phenotype-scale conversions no longer exist.
 - `var_components_lasso_ml` exposes the variance components used by COHERIT.
@@ -154,48 +142,21 @@ Sparse-run output semantics are deliberately explicit:
   `var_components_lasso_ml` background and residual components.
 - `h2_chive_guarded` is the validated counterpart of `h2_chive`
   and equals the top-level `h2` field whenever the COHERIT branch is valid.
-- `q_chive_components` retains the Lasso plug-in and residual-correction terms
+- `q_chive_components` retains the squared fitted-mean and residual-correction terms
   that together form the COHERIT sparse
-  variance contribution; the plug-in term is not exposed as a standalone
-  heritability estimator in the default mode.
-- Sparse prediction emits only the `lasso_*` branch by default: the Lasso
+  variance contribution; the squared fitted-mean term is not exposed as a
+  standalone heritability estimator.
+- Sparse prediction emits only the `lasso_*` branch: the Lasso
   fixed-SNP score plus its matched background BLUP.
-- With `--compare-four-estimators`, `estimator_mode` becomes
-  `four_estimator_comparison`, and the following secondary outputs are added:
-  `var_components_selected_span_reml`, `h2_lasso_plugin`,
-  `h2_ss_gls_plugin`, and `h2_ss_gls_df_corrected`.
-- `h2_background_selected_span_reml` is background-only once SNPs enter the
-  fixed-effect design; it is not total heritability.
-- `h2_lasso_plugin` combines the uncorrected squared penalized-LASSO score
-  with the covariate-contrast REML variance components from the LASSO branch.
-- `h2_ss_gls_plugin` is the uncorrected fitted-score plug-in after the
-  selected-span REML variance refit and final GLS coefficient recovery; its
-  guarded counterpart is `h2_ss_gls_plugin_guarded`.
-  `h2_ss_gls_df_corrected` subtracts the analytic fixed-span
-  estimation-noise trace term before adding the background; its guarded
-  counterpart is `h2_ss_gls_df_guarded`. Here `df` names the analytic trace
-  correction, but the quantity has phenotype-variance units and is
-  not generally a dimension count.  The trace correction does not remove
-  same-sample selection bias, so this is a secondary estimator.
-- Estimators 3 and 4 and `beta_gls_reml` in
-  `selected_snps.tsv` use exactly the same full-rank selected-marker basis.
-  Numerically dependent selected columns receive coefficient zero and the
-  `selected_span_basis` column identifies retained basis markers.
 - Every sparse quadratic and variance component is already on the one analysis
   scale established by input phenotype standardization. The summary retains
   only the input normalization metadata needed to transform external outcomes.
-- `lasso_branch_valid` validates the default COHERIT output and, in comparison
-  mode, estimators 1 and 2;
-  `selected_support_refit_branch_valid` validates estimators 3 and 4.  A
-  failed selected-support refit therefore does not erase valid Lasso/CHIVE
-  estimates.  An invalid branch has JSON `null` in its guarded fields.
+- `lasso_branch_valid` validates the COHERIT output. An invalid branch has
+  JSON `null` in its guarded fields.
 - Ordinary REML is a separate baseline and is never substituted into any
-  sparse estimator. `all_requested_estimators_valid` refers only to outputs
-  enabled by the selected mode.
-- Sparse prediction follows the same mode contract. A valid default run emits
-  only `lasso_*` scores. In comparison mode, `selected_span_*` scores are added
-  only for a valid refit. The prediction metadata lists the actual
-  `emitted_branches`, with no baseline substitution.
+  sparse estimator.
+- Sparse prediction follows the same contract. A valid run emits only
+  `lasso_*` scores, with no baseline substitution.
 - In REML history, `accepted` refers to the current line-search candidate.
   A terminal `ll_down` rejects that candidate and returns the most recent
   accepted variance vector; an intermediate BCD variance block records this
@@ -363,33 +324,23 @@ gpu-reml \
   --out-prefix out/smile_multi
 ```
 
-Sparse REML plus LASSO with lambda selected inside every outer iteration:
+Single-GRM sparse COHERIT with validation-R² lambda selection and an automatic
+train+validation final refit:
 
 ```bash
-gpu-reml-sparse \
+gpu-reml-sparse-validation \
+  --case-id trait_1 \
   --bed-prefix /path/to/data \
-  --component-spec single_grm.npz \
-  --pheno-txt pheno.txt \
+  --train-pheno-txt train.pheno \
+  --fit-pheno-txt train_plus_validation.pheno \
+  --validation-pheno-txt validation.pheno \
+  --test-pheno-txt test.pheno \
   --covar-txt covar.txt \
-  --prediction-bed-prefix /path/to/data \
-  --prediction-covar-txt covar.txt \
-  --prediction-keep-path validation.keep \
-  --sparsity-validation-pheno-txt validation.pheno \
-  --sparsity-validation-out out/validation_path.json \
-  --out-prefix out/sparse_single
-```
-
-After selection, refit on the combined training and validation samples with
-the frozen ratio:
-
-```bash
-gpu-reml-sparse \
-  --bed-prefix /path/to/data \
-  --component-spec selected_components.npz \
-  --pheno-txt fit.pheno \
-  --covar-txt covar.txt \
-  --lasso-fixed-lam-ratio 0.2940048064 \
-  --out-prefix out/final_refit
+  --train-keep train.keep \
+  --validation-keep validation.keep \
+  --fit-keep train_plus_validation.keep \
+  --test-keep test.keep \
+  --out-dir out/sparse_single
 ```
 
 Continuous-trait marginal GWAS:
@@ -527,14 +478,8 @@ fit lifecycle.
 - `--sparsity-validation-pheno-txt` and `--sparsity-validation-out`: required
   together for model selection. The complete lambda path is evaluated on the
   validation samples inside every alpha/theta outer iteration.
-- `--lasso-fixed-lam-ratio`: marks the final refit stage and is mutually
-  exclusive with validation selection inputs.
-- `--compare-four-estimators`: opt in to the secondary four-estimator and
-  selected-span prediction comparison.  Without it, sparse runs compute only
-  COHERIT and, when prediction inputs are supplied, only the matched Lasso
-  fixed-score plus background-BLUP prediction.
 - `--effect-rel-tol`: relative tolerance for change in the complete fitted
-  fixed mean; the default is `1e-2`.
+  fixed mean; the default is `5e-2`.
 
 The startup report labels the pinned streaming ring as `Host memory plan (CPU
 RAM, not GPU VRAM)`. A line such as `streaming_ring=35.4GiB` therefore describes

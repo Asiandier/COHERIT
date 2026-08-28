@@ -27,9 +27,7 @@ FitConfig = REML_MODEL.FitConfig
 InfinitesimalREMLFitter = REML_MODEL.InfinitesimalREMLFitter
 SparseBranchPrediction = SPARSE_PRED.SparseBranchPrediction
 predict_sparse_branch = SPARSE_PRED.predict_sparse_branch
-predict_sparse_path_partitioned = (
-    SPARSE_PRED.predict_sparse_path_partitioned
-)
+predict_sparse_path_single_grm = SPARSE_PRED.predict_sparse_path_single_grm
 write_sparse_prediction_outputs = SPARSE_PRED.write_sparse_prediction_outputs
 write_sparse_prediction_status = SPARSE_PRED.write_sparse_prediction_status
 load_pheno_covar_aligned_with_transform = (
@@ -94,54 +92,13 @@ def test_prediction_cli_keep_options(monkeypatch):
     assert args.prediction_pgen_prefix == "test"
     assert args.prediction_covar_txt == "test.covar"
     assert args.prediction_keep_path == "test.keep"
-    assert args.compare_four_estimators is False
-
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["gpu-reml-sparse", "--compare-four-estimators"],
-    )
-    assert RUN_SPARSE.parse_args().compare_four_estimators is True
-
-
-def test_sparse_prediction_branches_follow_estimator_validity():
-    branch_names = RUN_SPARSE._sparse_prediction_branch_names
-    assert branch_names(
-        comparison_enabled=False,
-        lasso_branch_valid=False,
-        selected_support_refit_branch_valid=False,
-    ) == []
-    assert branch_names(
-        comparison_enabled=False,
-        lasso_branch_valid=True,
-        selected_support_refit_branch_valid=False,
-    ) == ["lasso"]
-    assert branch_names(
-        comparison_enabled=True,
-        lasso_branch_valid=True,
-        selected_support_refit_branch_valid=True,
-    ) == ["lasso", "selected_span"]
-    with pytest.raises(ValueError, match="requires a valid Lasso"):
-        branch_names(
-            comparison_enabled=True,
-            lasso_branch_valid=False,
-            selected_support_refit_branch_valid=True,
-        )
-
-    # A downstream refit cannot leak into the default COHERIT prediction.
-    assert branch_names(
-        comparison_enabled=False,
-        lasso_branch_valid=True,
-        selected_support_refit_branch_valid=True,
-    ) == ["lasso"]
-
 
 def test_remove_sparse_prediction_outputs_clears_reused_prefix(tmp_path):
     prefix = str(tmp_path / "sparse")
     table = tmp_path / "sparse.sparse_prediction.tsv"
     metadata = tmp_path / "sparse.sparse_prediction_metadata.json"
     unrelated = tmp_path / "sparse.summary.json"
-    table.write_text("stale selected-span table\n", encoding="utf-8")
+    table.write_text("stale prediction table\n", encoding="utf-8")
     metadata.write_text("{}\n", encoding="utf-8")
     unrelated.write_text("{}\n", encoding="utf-8")
 
@@ -185,204 +142,26 @@ def _standardize_from_training(
     )
 
 
-def test_partitioned_one_component_matches_unpartitioned_sparse_coordinates():
-    """A one-component spec must be only a covariance representation change."""
-    genotype = np.asarray(
-        [
-            [0, 0, 1, 2, 0, 1],
-            [1, 0, 2, 1, 1, 0],
-            [2, 1, 0, 0, 2, 1],
-            [0, 2, 1, 1, 0, 2],
-            [1, 1, 2, 0, 1, 2],
-            [2, 2, 0, 2, 2, 0],
-        ],
-        dtype=np.int8,
-    )
-    source_indices = np.arange(genotype.shape[1] - 1, -1, -1, dtype=np.int64)
-    ordinary = InfinitesimalREMLFitter(
-        FitConfig(
-            sources=[_ArraySource(genotype)],
-            call_width=2,
-            keep_host_stats=True,
-            precond_rank=0,
-            verbose=False,
-        )
-    )
-    partitioned = InfinitesimalREMLFitter(
-        FitConfig(
-            sources=[_ArraySource(genotype)],
-            component_variant_indices=[source_indices],
-            call_width=2,
-            keep_host_stats=True,
-            precond_rank=0,
-            verbose=False,
-        )
-    )
-    try:
-        ordinary_index = RUN_SPARSE.MultiGRMIndex(ordinary.streamers)
-        partitioned_index = RUN_SPARSE.MultiGRMIndex(
-            partitioned.streamers,
-            component_variant_indices=[source_indices],
-        )
-        cache_indices = np.arange(genotype.shape[1], dtype=np.int64)
-        np.testing.assert_array_equal(
-            partitioned_index.source_variant_indices(cache_indices),
-            cache_indices,
-        )
-        np.testing.assert_allclose(
-            partitioned_index.extract_standardized_columns(cache_indices),
-            ordinary_index.extract_standardized_columns(cache_indices),
-            rtol=0.0,
-            atol=0.0,
-        )
-
-        vector = jnp.asarray(
-            np.linspace(-0.75, 0.9, genotype.shape[0]), dtype=jnp.float32
-        )
-        np.testing.assert_allclose(
-            partitioned_index.xtv_all(vector),
-            ordinary_index.xtv_all(vector),
-            rtol=1e-6,
-            atol=1e-6,
-        )
-        ordinary_k = ordinary._assemble_reml_operators().K_mvs[0](vector)
-        partitioned_k = partitioned._assemble_reml_operators().K_mvs[0](vector)
-        np.testing.assert_allclose(
-            np.asarray(partitioned_k),
-            np.asarray(ordinary_k),
-            rtol=1e-6,
-            atol=1e-6,
-        )
-    finally:
-        ordinary.close()
-        partitioned.close()
-
-
-def test_partitioned_sparse_source_ids_and_bim_rows_follow_streamer_mapping(
-    tmp_path,
-):
-    """Selected cache coordinates must resolve to the SNP actually decoded."""
-    genotype = np.asarray(
-        [
-            [0, 0, 1, 2, 0, 1],
-            [1, 0, 2, 1, 1, 0],
-            [2, 1, 0, 0, 2, 1],
-            [0, 2, 1, 1, 0, 2],
-            [1, 1, 2, 0, 1, 2],
-            [2, 2, 0, 2, 2, 0],
-        ],
-        dtype=np.int8,
-    )
-    # Deliberately unsorted within each component.  The streamer canonicalizes
-    # these memberships, so output mapping must be read back from the streamer
-    # instead of concatenating the raw component specification.
-    groups = [
-        np.asarray([4, 0, 2], dtype=np.int64),
-        np.asarray([5, 3, 1], dtype=np.int64),
-    ]
-    fitter = InfinitesimalREMLFitter(
-        FitConfig(
-            sources=[_ArraySource(genotype)],
-            component_variant_indices=groups,
-            call_width=2,
-            keep_host_stats=True,
-            precond_rank=0,
-            verbose=False,
-        )
-    )
-    try:
-        index = RUN_SPARSE.MultiGRMIndex(
-            fitter.streamers,
-            component_variant_indices=groups,
-        )
-        expected_source_order = np.asarray([0, 2, 4, 1, 3, 5], dtype=np.int64)
-        cache_indices = np.arange(expected_source_order.size, dtype=np.int64)
-        np.testing.assert_array_equal(
-            index.source_variant_indices(cache_indices),
-            expected_source_order,
-        )
-
-        standardized, _ = _standardize_from_training(genotype, genotype)
-        np.testing.assert_allclose(
-            index.extract_standardized_columns(cache_indices),
-            standardized[:, expected_source_order],
-            rtol=2e-5,
-            atol=2e-5,
-        )
-        score_vector = jnp.asarray(
-            np.linspace(-0.6, 0.8, genotype.shape[0]), dtype=jnp.float32
-        )
-        np.testing.assert_allclose(
-            index.xtv_all(score_vector),
-            standardized[:, expected_source_order].T
-            @ np.asarray(score_vector, dtype=np.float64),
-            rtol=2e-5,
-            atol=2e-5,
-        )
-
-        prefix = tmp_path / "markers"
-        prefix.with_suffix(".bim").write_text(
-            "".join(
-                f"1 rs{source_idx} 0 {1000 + source_idx} A G\n"
-                for source_idx in range(genotype.shape[1])
-            ),
-            encoding="utf-8",
-        )
-        rows = index.lookup_bim_rows(
-            [str(prefix)], np.asarray([0, 3, 4, 5], dtype=np.int64)
-        )
-        assert rows[0][1] == "rs0"
-        assert rows[3][1] == "rs1"
-        assert rows[4][1] == "rs3"
-        assert rows[5][1] == "rs5"
-
-        with pytest.raises(IndexError, match="Global SNP indices"):
-            index.source_variant_indices(np.asarray([-1], dtype=np.int64))
-        with pytest.raises(IndexError, match="Global SNP indices"):
-            index.extract_standardized_columns(
-                np.asarray([genotype.shape[1]], dtype=np.int64)
-            )
-    finally:
-        fitter.close()
-
-
-def test_partitioned_sparse_prediction_uses_matching_source_coordinates():
-    """Fixed-score and multi-GRM BLUP prediction must share one SNP mapping."""
+def test_single_grm_path_prediction_matches_pointwise_branches():
     x_train = np.asarray(
         [
-            [0, 0, 1, 2, 0, 1],
-            [1, 0, 2, 1, 1, 0],
-            [2, 1, 0, 0, 2, 1],
-            [0, 2, 1, 1, 0, 2],
-            [1, 1, 2, 0, 1, 2],
-            [2, 2, 0, 2, 2, 0],
-            [0, 1, 1, 0, 2, 2],
-            [1, 2, 0, 1, 0, 1],
-            [2, 0, 2, 2, 1, 0],
-            [0, 2, 0, 1, 2, 1],
-            [1, 0, 1, 2, 0, 2],
-            [2, 1, 2, 0, 1, 1],
+            [0, 0, 1, 2], [1, 0, 2, 1], [2, 1, 0, 0],
+            [0, 2, 1, 1], [1, 1, 2, 0], [2, 2, 0, 2],
+            [0, 1, 1, 0], [1, 2, 0, 1], [2, 0, 2, 2],
+            [0, 2, 0, 1], [1, 0, 1, 2], [2, 1, 2, 0],
         ],
         dtype=np.int8,
     )
     x_test = np.asarray(
         [
-            [2, 2, 0, 0, 2, 1],
-            [0, 1, 2, 2, 0, 0],
-            [1, 2, 1, 0, 1, 2],
-            [2, 0, 2, 1, 2, 0],
-            [0, 0, 0, 2, 1, 2],
+            [2, 2, 0, 0], [0, 1, 2, 2], [1, 2, 1, 0],
+            [2, 0, 2, 1], [0, 0, 0, 2],
         ],
         dtype=np.int8,
     )
-    groups = [
-        np.asarray([4, 0, 2], dtype=np.int64),
-        np.asarray([5, 3, 1], dtype=np.int64),
-    ]
     train = InfinitesimalREMLFitter(
         FitConfig(
             sources=[_ArraySource(x_train)],
-            component_variant_indices=groups,
             call_width=2,
             keep_host_stats=True,
             precond_rank=0,
@@ -392,7 +171,6 @@ def test_partitioned_sparse_prediction_uses_matching_source_coordinates():
     test = InfinitesimalREMLFitter(
         FitConfig(
             sources=[_ArraySource(x_test)],
-            component_variant_indices=groups,
             call_width=2,
             standardization_overrides=[
                 (
@@ -406,165 +184,60 @@ def test_partitioned_sparse_prediction_uses_matching_source_coordinates():
         )
     )
     try:
-        train_index = RUN_SPARSE.MultiGRMIndex(
-            train.streamers, component_variant_indices=groups
-        )
-        test_index = RUN_SPARSE.MultiGRMIndex(
-            test.streamers, component_variant_indices=groups
-        )
-        # Cache positions 0 and 4 are source SNPs 0 and 3 under the canonical
-        # component order [0,2,4 | 1,3,5].
-        support_cache = np.asarray([0, 4], dtype=np.int64)
-        np.testing.assert_array_equal(
-            train_index.source_variant_indices(support_cache),
-            np.asarray([0, 3], dtype=np.int64),
-        )
-        z_active_train = train_index.extract_standardized_columns(support_cache)
-        z_active_test = test_index.extract_standardized_columns(support_cache)
-
-        z_train_source, z_test_source = _standardize_from_training(
-            x_train, x_test
-        )
-        np.testing.assert_allclose(
-            z_active_train,
-            z_train_source[:, [0, 3]],
-            rtol=2e-5,
-            atol=2e-5,
-        )
-        np.testing.assert_allclose(
-            z_active_test,
-            z_test_source[:, [0, 3]],
-            rtol=2e-5,
-            atol=2e-5,
-        )
-
+        marker_idx = np.asarray([0, 2], dtype=np.int64)
+        train_index = RUN_SPARSE.SingleGRMIndex(train.streamers)
+        test_index = RUN_SPARSE.SingleGRMIndex(test.streamers)
+        z_train = train_index.extract_standardized_columns(marker_idx)
+        z_test = test_index.extract_standardized_columns(marker_idx)
         c_train = np.ones((x_train.shape[0], 1), dtype=np.float64)
         c_test = np.ones((x_test.shape[0], 1), dtype=np.float64)
-        beta_cov = np.asarray([0.4], dtype=np.float64)
-        beta_active = np.asarray([0.35, -0.2], dtype=np.float64)
-        theta = np.asarray([0.24, 0.31, 0.45], dtype=np.float64)
+        beta_cov_path = np.asarray([[0.2], [0.35]], dtype=np.float64)
+        beta_path = np.asarray(
+            [[0.0, 0.0], [0.3, -0.15]], dtype=np.float64
+        )
+        theta = np.asarray([0.3, 0.7], dtype=np.float64)
         y = (
-            c_train @ beta_cov
-            + z_active_train @ beta_active
-            + np.linspace(-0.3, 0.35, x_train.shape[0])
+            0.25
+            + z_train @ np.asarray([0.2, -0.1])
+            + np.linspace(-0.2, 0.25, x_train.shape[0])
         )
-        prediction = predict_sparse_branch(
-            name="lasso",
+
+        path = predict_sparse_path_single_grm(
             fitter=train,
             test_fitter=test,
             y_train=y,
             train_covar=c_train,
             test_covar=c_test,
-            train_active_geno=z_active_train,
-            test_active_geno=z_active_test,
-            beta_cov=beta_cov,
-            beta_active=beta_active,
-            theta=theta,
-            pcg_tol=1e-7,
-            max_pcg_iters=1000,
-        )
-
-        residual = y - c_train @ beta_cov - z_active_train @ beta_active
-        canonical_groups = (
-            np.asarray([0, 2, 4], dtype=np.int64),
-            np.asarray([1, 3, 5], dtype=np.int64),
-        )
-        covariance = theta[-1] * np.eye(x_train.shape[0])
-        for component_idx, source_group in enumerate(canonical_groups):
-            z_group = z_train_source[:, source_group]
-            covariance += (
-                theta[component_idx]
-                * (z_group @ z_group.T)
-                / float(source_group.size)
-            )
-        dual = np.linalg.solve(covariance, residual)
-        expected_components = []
-        for component_idx, source_group in enumerate(canonical_groups):
-            expected_components.append(
-                theta[component_idx]
-                * z_test_source[:, source_group]
-                @ (z_train_source[:, source_group].T @ dual)
-                / float(source_group.size)
-            )
-        expected_background = np.sum(expected_components, axis=0)
-
-        np.testing.assert_allclose(
-            prediction.fixed_snp_score,
-            z_test_source[:, [0, 3]] @ beta_active,
-            rtol=2e-5,
-            atol=2e-5,
-        )
-        np.testing.assert_allclose(
-            prediction.background_blup,
-            expected_background,
-            rtol=5e-4,
-            atol=5e-4,
-        )
-        for observed, expected in zip(
-            prediction.background_components, expected_components
-        ):
-            np.testing.assert_allclose(
-                observed,
-                expected,
-                rtol=5e-4,
-                atol=5e-4,
-            )
-
-        beta_cov_path = np.stack([beta_cov, beta_cov + 0.1], axis=0)
-        beta_active_path = np.stack(
-            [beta_active, 0.5 * beta_active], axis=0
-        )
-        path_prediction = predict_sparse_path_partitioned(
-            fitter=train,
-            test_fitter=test,
-            y_train=y,
-            train_covar=c_train,
-            test_covar=c_test,
-            train_candidate_geno=z_active_train,
-            test_candidate_geno=z_active_test,
+            train_candidate_geno=z_train,
+            test_candidate_geno=z_test,
             beta_cov_path=beta_cov_path,
-            beta_candidate_path=beta_active_path,
+            beta_candidate_path=beta_path,
             theta=theta,
-            pcg_tol=1e-7,
+            pcg_tol=1e-6,
             max_pcg_iters=1000,
         )
-        for path_index in range(beta_active_path.shape[0]):
-            branch = predict_sparse_branch(
+        for path_index in range(beta_path.shape[0]):
+            point = predict_sparse_branch(
                 name=f"path_{path_index}",
                 fitter=train,
                 test_fitter=test,
                 y_train=y,
                 train_covar=c_train,
                 test_covar=c_test,
-                train_active_geno=z_active_train,
-                test_active_geno=z_active_test,
+                train_active_geno=z_train,
+                test_active_geno=z_test,
                 beta_cov=beta_cov_path[path_index],
-                beta_active=beta_active_path[path_index],
+                beta_active=beta_path[path_index],
                 theta=theta,
-                pcg_tol=1e-7,
+                pcg_tol=1e-6,
                 max_pcg_iters=1000,
             )
             np.testing.assert_allclose(
-                path_prediction.residual[:, path_index],
-                branch.residual,
-                rtol=5e-5,
-                atol=5e-5,
+                path.residual[:, path_index], point.residual, atol=5e-5
             )
             np.testing.assert_allclose(
-                path_prediction.fixed_snp_score[:, path_index],
-                branch.fixed_snp_score,
-                rtol=5e-5,
-                atol=5e-5,
-            )
-            np.testing.assert_allclose(
-                path_prediction.background_blup[:, path_index],
-                branch.background_blup,
-                rtol=5e-4,
-                atol=5e-4,
-            )
-            np.testing.assert_allclose(
-                path_prediction.phenotype_prediction[:, path_index],
-                branch.phenotype_prediction,
+                path.phenotype_prediction[:, path_index],
+                point.phenotype_prediction,
                 rtol=5e-4,
                 atol=5e-4,
             )
@@ -588,7 +261,7 @@ def _manual_background(z_train, z_test, residual, theta):
     )
 
 
-def test_sparse_predictors_use_branch_matched_mean_and_theta():
+def test_sparse_predictor_uses_lasso_mean_and_theta():
     x_train = np.asarray(
         [
             [0, 0, 1, 2, 0, 1],
@@ -679,90 +352,56 @@ def test_sparse_predictors_use_branch_matched_mean_and_theta():
             - 0.25 * z_train[:, 4]
             + np.linspace(-0.25, 0.35, x_train.shape[0])
         )
-        branch_specs = {
-            "lasso": (
-                np.asarray([0.4, -0.2]),
-                np.asarray([0.35, -0.10]),
-                np.asarray([0.28, 0.72]),
-            ),
-            "selected_span": (
-                np.asarray([0.55, -0.05]),
-                np.asarray([0.42, -0.04]),
-                np.asarray([0.48, 0.52]),
-            ),
-        }
-        predictions = {}
-        for name, (beta_cov, beta_active, theta) in branch_specs.items():
-            predictions[name] = predict_sparse_branch(
-                name=name,
-                fitter=train,
-                test_fitter=test,
-                y_train=y,
-                train_covar=c_train,
-                test_covar=c_test,
-                train_active_geno=z_train[:, support],
-                test_active_geno=z_test[:, support],
-                beta_cov=beta_cov,
-                beta_active=beta_active,
-                theta=theta,
-                pcg_tol=1e-7,
-                max_pcg_iters=1000,
-            )
-            residual = (
-                y - c_train @ beta_cov - z_train[:, support] @ beta_active
-            )
-            expected_background = _manual_background(
-                z_train, z_test, residual, theta
-            )
-            np.testing.assert_allclose(
-                predictions[name].residual,
-                residual,
-                rtol=1e-7,
-                atol=1e-7,
-            )
-            np.testing.assert_allclose(
-                predictions[name].nuisance_fixed_score,
-                c_test @ beta_cov,
-                rtol=2e-5,
-                atol=2e-5,
-            )
-            np.testing.assert_allclose(
-                predictions[name].fixed_snp_score,
-                z_test[:, support] @ beta_active,
-                rtol=2e-5,
-                atol=2e-5,
-            )
-            np.testing.assert_allclose(
-                predictions[name].background_blup,
-                expected_background,
-                rtol=3e-4,
-                atol=3e-4,
-            )
-            np.testing.assert_allclose(
-                predictions[name].phenotype_prediction,
-                c_test @ beta_cov
-                + z_test[:, support] @ beta_active
-                + expected_background,
-                rtol=3e-4,
-                atol=3e-4,
-            )
-
-        lasso_beta_cov, lasso_beta_active, _ = branch_specs["lasso"]
-        selected_theta = branch_specs["selected_span"][2]
-        lasso_residual = (
-            y - c_train @ lasso_beta_cov - z_train[:, support] @ lasso_beta_active
+        beta_cov = np.asarray([0.4, -0.2])
+        beta_active = np.asarray([0.35, -0.10])
+        theta = np.asarray([0.28, 0.72])
+        prediction = predict_sparse_branch(
+            name="lasso",
+            fitter=train,
+            test_fitter=test,
+            y_train=y,
+            train_covar=c_train,
+            test_covar=c_test,
+            train_active_geno=z_train[:, support],
+            test_active_geno=z_test[:, support],
+            beta_cov=beta_cov,
+            beta_active=beta_active,
+            theta=theta,
+            pcg_tol=1e-7,
+            max_pcg_iters=1000,
         )
-        incorrectly_mixed = _manual_background(
-            z_train,
-            z_test,
-            lasso_residual,
-            selected_theta,
+        residual = y - c_train @ beta_cov - z_train[:, support] @ beta_active
+        expected_background = _manual_background(
+            z_train, z_test, residual, theta
         )
-        assert not np.allclose(
-            predictions["lasso"].background_blup,
-            incorrectly_mixed,
-            rtol=1e-3,
-            atol=1e-3,
+        np.testing.assert_allclose(
+            prediction.residual, residual, rtol=1e-7, atol=1e-7
+        )
+        np.testing.assert_allclose(
+            prediction.nuisance_fixed_score,
+            c_test @ beta_cov,
+            rtol=2e-5,
+            atol=2e-5,
+        )
+        np.testing.assert_allclose(
+            prediction.fixed_snp_score,
+            z_test[:, support] @ beta_active,
+            rtol=2e-5,
+            atol=2e-5,
+        )
+        np.testing.assert_allclose(
+            prediction.background_blup,
+            expected_background,
+            rtol=3e-4,
+            atol=3e-4,
+        )
+        np.testing.assert_allclose(
+            prediction.phenotype_prediction,
+            c_test @ beta_cov
+            + z_test[:, support] @ beta_active
+            + expected_background,
+            rtol=3e-4,
+            atol=3e-4,
         )
     finally:
         train.close()
@@ -786,48 +425,31 @@ def _toy_branch(name: str, offset: float) -> SparseBranchPrediction:
     )
 
 
-def test_sparse_prediction_writer_supports_independent_branches(tmp_path):
+def test_sparse_prediction_writer_emits_only_lasso_branch(tmp_path):
     prefix = str(tmp_path / "pred" / "fit")
     paths = write_sparse_prediction_outputs(
         out_prefix=prefix,
         sample_ids=["i1", "i2"],
         lasso=_toy_branch("lasso", 0.0),
-        selected_span=_toy_branch("selected_span", 10.0),
-        metadata={"test_phenotype_used": False},
-    )
-    with open(paths["prediction"], encoding="utf-8") as handle:
-        header = handle.readline().strip().split("\t")
-    assert "lasso_genetic_score" in header
-    assert "selected_span_genetic_score" in header
-    with open(paths["metadata"], encoding="utf-8") as handle:
-        metadata = json.load(handle)
-    assert metadata["status"] == "emitted"
-    assert metadata["test_phenotype_used"] is False
-
-    lasso_only = write_sparse_prediction_outputs(
-        out_prefix=prefix,
-        sample_ids=["i1", "i2"],
-        lasso=_toy_branch("lasso", 0.0),
-        selected_span=None,
         metadata={
             "test_phenotype_used": False,
             "emitted_branches": ["lasso"],
         },
     )
-    with open(lasso_only["prediction"], encoding="utf-8") as handle:
-        lasso_header = handle.readline().strip().split("\t")
-    assert "lasso_genetic_score" in lasso_header
-    assert not any(column.startswith("selected_span_") for column in lasso_header)
-    with open(lasso_only["metadata"], encoding="utf-8") as handle:
-        lasso_metadata = json.load(handle)
-    assert lasso_metadata["emitted_branches"] == ["lasso"]
+    with open(paths["prediction"], encoding="utf-8") as handle:
+        header = handle.readline().strip().split("\t")
+    assert "lasso_genetic_score" in header
+    with open(paths["metadata"], encoding="utf-8") as handle:
+        metadata = json.load(handle)
+    assert metadata["status"] == "emitted"
+    assert metadata["test_phenotype_used"] is False
+    assert metadata["emitted_branches"] == ["lasso"]
 
-    with pytest.raises(ValueError, match="At least one valid"):
+    with pytest.raises(ValueError, match="valid COHERIT Lasso"):
         write_sparse_prediction_outputs(
             out_prefix=prefix,
             sample_ids=["i1", "i2"],
             lasso=None,
-            selected_span=None,
             metadata={"test_phenotype_used": False},
         )
 
