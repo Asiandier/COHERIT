@@ -63,6 +63,7 @@ _pcg_mod = importlib.import_module(f"{pkg_name}.pcg")
 _precond_mod = importlib.import_module(f"{pkg_name}.precond")
 _common_mod = importlib.import_module(f"{pkg_name}.pipeline_common")
 _io_utils_mod = importlib.import_module(f"{pkg_name}.io_utils")
+_component_spec_mod = importlib.import_module(f"{pkg_name}.component_spec")
 _sparse_prediction_mod = importlib.import_module(
     f"{pkg_name}.sparse_prediction"
 )
@@ -82,7 +83,11 @@ make_lambda_sequence = _lasso_mod.make_lambda_sequence
 compute_projected_hinv_vector = _lasso_mod.compute_projected_hinv_vector
 fit_weighted_lasso_with_covariates = _lasso_mod.fit_weighted_lasso_with_covariates
 pcg_solve = _pcg_mod.pcg_solve
+load_component_specs = _component_spec_mod.load_component_specs
 predict_sparse_branch = _sparse_prediction_mod.predict_sparse_branch
+predict_sparse_path_partitioned = (
+    _sparse_prediction_mod.predict_sparse_path_partitioned
+)
 predict_sparse_path_single_grm = (
     _sparse_prediction_mod.predict_sparse_path_single_grm
 )
@@ -130,13 +135,55 @@ def _bed_count(path: str, attr: str) -> int:
             close()
 
 
+def _load_component_variant_indices(path: str) -> list[np.ndarray]:
+    """Load source-variant memberships in declared component order."""
+    return [
+        np.asarray(spec.variant_indices, dtype=np.int64).reshape(-1)
+        for spec in load_component_specs(path)
+    ]
+
+
+def _validate_component_partition(
+    groups: list[np.ndarray], *, n_markers: int
+) -> list[np.ndarray]:
+    """Require a nonempty, disjoint, exhaustive source-marker partition."""
+    if not groups:
+        return []
+    normalized: list[np.ndarray] = []
+    for component_idx, group in enumerate(groups):
+        values = np.asarray(group, dtype=np.int64).reshape(-1)
+        if values.size == 0:
+            raise ValueError(
+                f"Component {component_idx} is empty; every GRM must contain SNPs."
+            )
+        unique = np.unique(values)
+        if unique.size != values.size:
+            raise ValueError(f"Component {component_idx} contains duplicate SNPs.")
+        if np.any((unique < 0) | (unique >= int(n_markers))):
+            raise ValueError(
+                f"Component {component_idx} contains an index outside "
+                f"[0, {int(n_markers)})."
+            )
+        normalized.append(unique)
+    assigned = np.concatenate(normalized)
+    if assigned.size != int(n_markers) or np.unique(assigned).size != int(
+        n_markers
+    ):
+        raise ValueError(
+            "--component-spec must assign every source SNP exactly once "
+            "across mutually exclusive components."
+        )
+    return normalized
+
+
 def _load_lasso_warm_state(
     path: str,
     *,
-    n_markers: int,
+    grm_index=None,
+    n_markers: int | None = None,
     target_lam_ratio: float,
 ) -> dict[str, object]:
-    """Load the selected K=1 alpha as a warm start for the final refit."""
+    """Load selected alpha and map stable source rows to this cache order."""
     target_ratio = _canonical_fixed_lam_ratio(float(target_lam_ratio))
     with np.load(path, allow_pickle=False) as payload:
         required = {
@@ -160,14 +207,24 @@ def _load_lasso_warm_state(
             float(np.asarray(payload["selected_lam_ratio"]).reshape(()))
         )
 
-    if schema_version != 1:
+    if schema_version not in {1, 2}:
         raise ValueError(
             f"Unsupported Lasso warm-state schema: {schema_version}."
         )
+    marker_count = (
+        int(grm_index.m_total)
+        if grm_index is not None
+        else int(n_markers) if n_markers is not None else -1
+    )
+    if marker_count < 0:
+        raise ValueError("A GRM index or marker count is required.")
     if (
         marker_indices.size != selected_beta.size
         or np.unique(marker_indices).size != marker_indices.size
-        or np.any((marker_indices < 0) | (marker_indices >= int(n_markers)))
+        or np.any(
+            (marker_indices < 0)
+            | (marker_indices >= marker_count)
+        )
         or not np.all(np.isfinite(selected_beta))
     ):
         raise ValueError("Lasso warm-state marker coefficients are invalid.")
@@ -181,8 +238,13 @@ def _load_lasso_warm_state(
             "Lasso warm state does not match the frozen lambda ratio."
         )
 
-    order = np.argsort(marker_indices)
-    candidate = marker_indices[order]
+    candidate_unsorted = (
+        marker_indices
+        if schema_version == 1 or grm_index is None
+        else grm_index.cache_variant_indices(marker_indices)
+    )
+    order = np.argsort(candidate_unsorted)
+    candidate = candidate_unsorted[order]
     selected_beta = selected_beta[order]
     beta_path = (
         selected_beta.reshape(1, -1)
@@ -194,12 +256,18 @@ def _load_lasso_warm_state(
         "support": candidate.copy(),
         "beta_snp_path": beta_path,
         "selected_lam_ratio": selected_ratio,
+        "coordinate_system": (
+            "single_grm_marker_index"
+            if schema_version == 1
+            else "source_variant_index"
+        ),
     }
 
 
 def _write_lasso_warm_state(
     path: str,
     *,
+    grm_index=None,
     candidate: np.ndarray,
     support: np.ndarray,
     selected_beta_snp: np.ndarray,
@@ -238,14 +306,24 @@ def _write_lasso_warm_state(
             "Lasso warm-state support is not contained in the candidate set."
         ) from exc
     support_beta = selected_beta[support_positions]
+    source_support = (
+        support_indices.copy()
+        if grm_index is None
+        else grm_index.source_variant_indices(support_indices)
+    )
+    source_order = np.argsort(source_support)
+    source_support = source_support[source_order]
+    support_beta = support_beta[source_order]
 
     ensure_parent_dir(path)
     temporary = f"{path}.tmp.{os.getpid()}"
     with open(temporary, "wb") as handle:
         np.savez(
             handle,
-            lasso_warm_state_schema_version=np.asarray(1, dtype=np.int64),
-            marker_indices=support_indices,
+            lasso_warm_state_schema_version=np.asarray(
+                1 if grm_index is None else 2, dtype=np.int64
+            ),
+            marker_indices=source_support,
             selected_beta_snp=support_beta.astype(np.float32),
             selected_lam_ratio=np.asarray(selected_ratio, dtype=np.float64),
         )
@@ -255,61 +333,118 @@ def _write_lasso_warm_state(
         "path": os.path.abspath(path),
         "marker_count": int(support_indices.size),
         "selected_lam_ratio": selected_ratio,
-        "coordinate_system": "single_grm_marker_index",
+        "coordinate_system": (
+            "single_grm_marker_index"
+            if grm_index is None
+            else "source_variant_index"
+        ),
         "reuse_contract": "selection_to_final_refit_only",
     }
 
 # ---------------------------------------------------------------------------
+# Sparse marker-coordinate index
 # ---------------------------------------------------------------------------
-# Single-GRM sparse marker index
-# ---------------------------------------------------------------------------
 
-class SingleGRMIndex:
-    """Validated marker access for the one whole-genome sparse GRM."""
+class MultiGRMIndex:
+    """Map the sparse cache order to component-local and source coordinates.
 
-    def __init__(self, streamers):
-        if len(streamers) != 1:
-            raise ValueError(
-                "The sparse pipeline supports exactly one whole-genome GRM."
-            )
-        self.streamer = streamers[0]
-        if bool(getattr(self.streamer, "has_component_partition", False)):
-            raise ValueError(
-                "Component-partitioned genotype streams are not supported "
-                "by the single-GRM sparse pipeline."
-            )
-        if int(getattr(self.streamer, "n_components", 1)) != 1:
-            raise ValueError(
-                "The sparse genotype stream must expose exactly one component."
-            )
-        self.n_grm = 1
-        self.m_total = int(self.streamer.m)
-        self.m_per_grm = np.asarray([self.m_total], dtype=np.int64)
-        self.offsets = np.asarray([0, self.m_total], dtype=np.int64)
+    A component-partitioned source is physically cached as the concatenation
+    of its components.  Sparse optimization works in that cache order, while
+    BIM/PVAR reporting must use original source-variant rows.  This class is
+    the single authority for translating between the two coordinate systems.
+    """
 
-    def _validated_indices(self, marker_idx: np.ndarray) -> np.ndarray:
-        idx = np.asarray(marker_idx, dtype=np.int64)
+    def __init__(self, streamers, component_variant_indices=None):
+        self.streamers = tuple(streamers)
+        if len(self.streamers) != 1:
+            raise ValueError(
+                "Sparse fitting accepts exactly one physical genotype source."
+            )
+        self.streamer = self.streamers[0]
+        self._partitioned_single_streamer = component_variant_indices is not None
+        self._source_variant_indices: np.ndarray | None = None
+
+        if self._partitioned_single_streamer:
+            streamer = self.streamer
+            if not bool(getattr(streamer, "has_component_partition", False)):
+                raise ValueError(
+                    "component_variant_indices were supplied, but the genotype "
+                    "streamer is not component-partitioned."
+                )
+            requested_groups = [
+                np.asarray(group, dtype=np.int64).reshape(-1)
+                for group in component_variant_indices
+            ]
+            self.n_grm = int(streamer.n_components)
+            component_offsets = np.asarray(
+                streamer._component_snp_offsets, dtype=np.int64
+            ).reshape(-1)
+            if component_offsets.shape != (self.n_grm + 1,):
+                raise ValueError("Invalid component offsets in partitioned streamer.")
+            self.m_per_grm = np.diff(component_offsets)
+            cache_to_source = np.asarray(
+                streamer._cache_to_source_variant_indices, dtype=np.int64
+            ).reshape(-1)
+            if cache_to_source.size != int(streamer.m):
+                raise ValueError(
+                    "Partitioned streamer's cache-to-source SNP map has the "
+                    "wrong length."
+                )
+            if not np.array_equal(
+                np.sort(cache_to_source),
+                np.arange(int(streamer.m), dtype=np.int64),
+            ):
+                raise ValueError(
+                    "Sparse component partitions must cover every source SNP "
+                    "exactly once."
+                )
+            if len(requested_groups) != self.n_grm:
+                raise ValueError(
+                    "Component count mismatch between component spec and "
+                    "genotype streamer."
+                )
+            for component_idx, requested in enumerate(requested_groups):
+                start = int(component_offsets[component_idx])
+                stop = int(component_offsets[component_idx + 1])
+                actual = cache_to_source[start:stop]
+                if not np.array_equal(actual, np.unique(requested)):
+                    raise ValueError(
+                        "Component SNP mapping mismatch between component spec "
+                        f"and genotype streamer for component {component_idx}."
+                    )
+            self._source_variant_indices = cache_to_source.copy()
+        else:
+            self.n_grm = 1
+            self.m_per_grm = np.asarray([int(self.streamer.m)], dtype=np.int64)
+
+        self.offsets = np.zeros(self.n_grm + 1, dtype=np.int64)
+        np.cumsum(self.m_per_grm, out=self.offsets[1:])
+        self.m_total = int(self.offsets[-1])
+
+    def _validated_global_indices(self, global_idx: np.ndarray) -> np.ndarray:
+        idx = np.asarray(global_idx, dtype=np.int64)
         if idx.ndim != 1:
-            raise ValueError("Marker indices must be one-dimensional.")
+            raise ValueError("Global SNP indices must be one-dimensional.")
         if np.any((idx < 0) | (idx >= self.m_total)):
             raise IndexError(
-                f"Marker indices must lie in [0, {self.m_total})."
+                f"Global SNP indices must lie in [0, {self.m_total})."
             )
         return idx
 
     def global_to_local(
-        self, marker_idx: np.ndarray
+        self, global_idx: np.ndarray
     ) -> list[tuple[int, np.ndarray, np.ndarray]]:
-        idx = self._validated_indices(marker_idx)
-        if idx.size == 0:
-            return []
-        return [
-            (
-                0,
-                idx.copy(),
-                np.arange(idx.size, dtype=np.int64),
-            )
-        ]
+        idx = self._validated_global_indices(global_idx)
+        grm_ids = np.searchsorted(self.offsets[1:], idx, side="right")
+        grm_ids = np.clip(grm_ids, 0, self.n_grm - 1)
+        groups: list[tuple[int, np.ndarray, np.ndarray]] = []
+        for grm_idx in range(self.n_grm):
+            positions = np.flatnonzero(grm_ids == grm_idx)
+            if positions.size == 0:
+                continue
+            local = idx[positions] - int(self.offsets[grm_idx])
+            groups.append((grm_idx, local, positions))
+        return groups
 
     def xtv_all(self, u_jax: jnp.ndarray, normalize: bool = False) -> np.ndarray:
         return np.asarray(
@@ -318,20 +453,66 @@ class SingleGRMIndex:
         )
 
     def extract_standardized_columns(
-        self, marker_idx: np.ndarray
+        self, global_idx: np.ndarray
     ) -> np.ndarray:
-        return self.streamer.extract_standardized_columns(
-            self._validated_indices(marker_idx)
-        )
+        idx = self._validated_global_indices(global_idx)
+        return self.streamer.extract_standardized_columns(idx)
 
-    def source_variant_indices(self, marker_idx: np.ndarray) -> np.ndarray:
-        return self._validated_indices(marker_idx).copy()
+    def source_variant_indices(self, global_idx: np.ndarray) -> np.ndarray:
+        idx = self._validated_global_indices(global_idx)
+        if self._source_variant_indices is None:
+            return idx.copy()
+        return self._source_variant_indices[idx].copy()
+
+    def cache_variant_indices(self, source_idx: np.ndarray) -> np.ndarray:
+        """Translate original source rows to the current concatenated cache."""
+        source = np.asarray(source_idx, dtype=np.int64).reshape(-1)
+        if self._source_variant_indices is None:
+            return self._validated_global_indices(source).copy()
+        if np.any((source < 0) | (source >= self.m_total)):
+            raise IndexError(
+                f"Source SNP indices must lie in [0, {self.m_total})."
+            )
+        source_to_cache = np.empty(self.m_total, dtype=np.int64)
+        source_to_cache[self._source_variant_indices] = np.arange(
+            self.m_total, dtype=np.int64
+        )
+        return source_to_cache[source]
+
+    def lookup_bim_rows(
+        self, bed_prefixes: list[str], global_idx: np.ndarray
+    ) -> dict[int, tuple[str, str, str, str, str, str]]:
+        idx = self._validated_global_indices(global_idx)
+        result: dict[int, tuple[str, str, str, str, str, str]] = {}
+        source_idx = self.source_variant_indices(idx)
+        source_rows = _lookup_bim_rows(bed_prefixes[0] + ".bim", source_idx)
+        for global_snp, source_snp in zip(idx.tolist(), source_idx.tolist()):
+            if int(source_snp) in source_rows:
+                result[int(global_snp)] = source_rows[int(source_snp)]
+        return result
+
+
+class SingleGRMIndex(MultiGRMIndex):
+    """Compatibility wrapper for callers that explicitly require K=1."""
+
+    def __init__(self, streamers):
+        if len(streamers) != 1:
+            raise ValueError(
+                "The sparse pipeline supports exactly one whole-genome GRM."
+            )
+        streamer = streamers[0]
+        if bool(getattr(streamer, "has_component_partition", False)) or int(
+            getattr(streamer, "n_components", 1)
+        ) != 1:
+            raise ValueError(
+                "The single-GRM index does not accept component partitions."
+            )
+        super().__init__(streamers)
 
     def lookup_bim_rows(
         self, bed_prefix: str, marker_idx: np.ndarray
     ) -> dict[int, tuple[str, str, str, str, str, str]]:
-        idx = self._validated_indices(marker_idx)
-        return _lookup_bim_rows(bed_prefix + ".bim", idx)
+        return super().lookup_bim_rows([bed_prefix], marker_idx)
 
 def _lookup_bim_rows(bim_path: str, snp_indices: np.ndarray) -> dict[int, tuple[str, str, str, str, str, str]]:
     idx = np.asarray(snp_indices, dtype=np.int64)
@@ -389,7 +570,7 @@ class _PredictionFitContext:
     """Prediction genotype/covariate state shared by iterative validation."""
 
     fitter: object
-    grm_index: SingleGRMIndex
+    grm_index: MultiGRMIndex
     covar: np.ndarray | None
     sample_ids: list[str]
     dropped_ids: list[str]
@@ -415,10 +596,11 @@ def _build_prediction_fit_context(
     cpu_threads: int,
     gpu_budget_bytes: float,
     ring_depth: int,
+    component_variant_indices: list[np.ndarray],
 ) -> _PredictionFitContext:
     """Build prediction state using training-only genotype standardization."""
     if len(training_fitter.streamers) != 1:
-        raise RuntimeError("Sparse prediction requires exactly one training GRM.")
+        raise RuntimeError("Sparse prediction requires exactly one genotype source.")
     training_streamer = training_fitter.streamers[0]
     if (
         training_streamer._means_host is None
@@ -486,6 +668,7 @@ def _build_prediction_fit_context(
         device=args.device,
         sample_mask=prediction_sample_mask,
         standardization_overrides=standardization_overrides,
+        component_variant_indices=component_variant_indices or None,
         call_width=call_width,
         keep_host_stats=True,
         cpu_threads=cpu_threads,
@@ -516,7 +699,10 @@ def _build_prediction_fit_context(
     close_callback = prediction_fitter.close
     atexit.register(close_callback)
     try:
-        prediction_grm_index = SingleGRMIndex(prediction_fitter.streamers)
+        prediction_grm_index = MultiGRMIndex(
+            prediction_fitter.streamers,
+            component_variant_indices=component_variant_indices or None,
+        )
     except Exception:
         atexit.unregister(close_callback)
         close_callback()
@@ -534,15 +720,27 @@ def _build_prediction_fit_context(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run sparse REML + LASSO pipeline on real genotype data.")
-    # Exactly one single-GRM genotype source must be supplied.
+    # Exactly one genotype source must be supplied. It may be partitioned into
+    # disjoint GRM components by --component-spec.
     p.add_argument("--bed-prefix", default=env("BED_PREFIX", ""),
                    help="One PLINK1 BED file prefix (no extension).")
     p.add_argument("--pgen-prefix", default=env("PGEN_PREFIX", ""),
                    help="PLINK2 PGEN file prefix (direct read, no conversion needed)")
     p.add_argument(
+        "--component-spec",
+        default=env("COMPONENT_SPEC", ""),
+        help=(
+            "Optional JSON/NPZ component spec partitioning every source SNP "
+            "into one disjoint GRM. Omit for one whole-genome GRM."
+        ),
+    )
+    p.add_argument(
         "--variance-components-init",
         default="",
-        help=argparse.SUPPRESS,
+        help=(
+            "Internal final-refit warm start: JSON array with one value per "
+            "GRM followed by residual variance."
+        ),
     )
     p.add_argument(
         "--lasso-warm-state-in",
@@ -1365,7 +1563,12 @@ def _evaluate_lasso_path_on_validation(
         prediction_context.grm_index.extract_standardized_columns(candidate)
         .astype(np.float32, copy=False)
     )
-    path_prediction = predict_sparse_path_single_grm(
+    path_predictor = (
+        predict_sparse_path_partitioned
+        if prediction_context.grm_index.n_grm > 1
+        else predict_sparse_path_single_grm
+    )
+    path_prediction = path_predictor(
         fitter=fitter,
         test_fitter=prediction_context.fitter,
         y_train=y_train,
@@ -1437,7 +1640,7 @@ def _write_iterative_validation_output(
     selection_trace: list[dict[str, object]],
     final_lasso: dict,
     final_candidate: np.ndarray,
-    grm_index: SingleGRMIndex,
+    grm_index: MultiGRMIndex,
     theta: np.ndarray,
     outer_converged: bool,
     outer_stop_reason: str,
@@ -1935,7 +2138,7 @@ def _top_scored_markers_outside(
 def _fit_complete_weighted_lasso_path_basil(
     *,
     args,
-    grm_index: SingleGRMIndex,
+    grm_index: MultiGRMIndex,
     hv,
     precond,
     y: np.ndarray,
@@ -2918,6 +3121,8 @@ def _complete_path_kkt_expansion_budget(
 
 def _parse_variance_components_init(
     value: str,
+    *,
+    n_grm: int,
 ) -> np.ndarray:
     try:
         parsed = json.loads(value)
@@ -2926,10 +3131,12 @@ def _parse_variance_components_init(
             "--variance-components-init must be a JSON array."
         ) from error
     theta = np.asarray(parsed, dtype=np.float64).reshape(-1)
-    if theta.shape != (2,):
+    expected = int(n_grm) + 1
+    if theta.shape != (expected,):
         raise ValueError(
-            "--variance-components-init must be "
-            "[genetic_variance, residual_variance]."
+            "--variance-components-init must contain one value per GRM "
+            f"followed by residual variance; expected {expected}, "
+            f"got {int(theta.size)}."
         )
     if (
         not np.all(np.isfinite(theta))
@@ -2937,7 +3144,7 @@ def _parse_variance_components_init(
         or theta[-1] <= 0.0
     ):
         raise ValueError(
-            "Initial genetic variance must be nonnegative and "
+            "Initial genetic variance components must be nonnegative and "
             "the residual component must be positive."
         )
     return theta
@@ -3084,14 +3291,23 @@ def main() -> None:
     bed_prefix = args.bed_prefix.strip()
     if "," in bed_prefix:
         raise SystemExit(
-            "Sparse fitting supports exactly one GRM; supply one BED prefix."
+            "Sparse fitting accepts one genotype source; supply one BED prefix."
         )
     bed_list = [bed_prefix] if bed_prefix else []
     pgen_prefix = args.pgen_prefix.strip()
+    component_spec_source = args.component_spec.strip()
+    try:
+        component_variant_indices = (
+            _load_component_variant_indices(component_spec_source)
+            if component_spec_source
+            else []
+        )
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"Invalid --component-spec: {exc}") from exc
     prediction_bed_prefix = args.prediction_bed_prefix.strip()
     if "," in prediction_bed_prefix:
         raise SystemExit(
-            "Sparse prediction supports exactly one GRM; supply one BED prefix."
+            "Sparse prediction accepts one genotype source; supply one BED prefix."
         )
     prediction_bed_list = (
         [prediction_bed_prefix] if prediction_bed_prefix else []
@@ -3217,10 +3433,24 @@ def main() -> None:
         p_list = [src.m for src in sources]
     else:
         p_list = [_bed_count(pref + ".bed", "sid_count") for pref in bed_list]
+    try:
+        component_variant_indices = _validate_component_partition(
+            component_variant_indices,
+            n_markers=int(p_list[0]),
+        )
+    except ValueError as exc:
+        raise SystemExit(f"Invalid --component-spec: {exc}") from exc
+    planned_n_grm = (
+        len(component_variant_indices) if component_variant_indices else 1
+    )
     plan = run_planner(
         n_samples=y_np.shape[0], p_list=p_list,
-        n_grm=1,
-        component_block_sizes=None,
+        n_grm=planned_n_grm,
+        component_block_sizes=(
+            [int(group.size) for group in component_variant_indices]
+            if component_variant_indices
+            else None
+        ),
         gpu_free=gpu_free,
         gpu_budget=(args.gpu_budget_gib * 1024**3) if args.gpu_budget_gib > 0 else None,
         n_covar=n_covar,
@@ -3235,7 +3465,7 @@ def main() -> None:
             if pgen_prefix
             else None
         ),
-        arbitrary_component_partition=False,
+        arbitrary_component_partition=bool(component_variant_indices),
         requested_call_width=(args.call_width if args.call_width > 0 else None),
     )
     call_width = plan.call_width
@@ -3265,9 +3495,17 @@ def main() -> None:
     )
     logger.info("[INFO] cpu_threads=%s (source=%s)", cpu_threads, cpu_threads_src)
     logger.info("jax devices: %s", jax.devices())
+    if component_variant_indices:
+        logger.info(
+            "[INFO] component partition: spec=%s n_grm=%s sizes=%s",
+            component_spec_source,
+            planned_n_grm,
+            [int(group.size) for group in component_variant_indices],
+        )
     if sources is not None:
         fit_cfg = FitConfig(
             sources=sources, sample_mask=sample_mask, device=args.device,
+            component_variant_indices=component_variant_indices or None,
             call_width=call_width,
             cpu_threads=cpu_threads,
             keep_host_stats=True,
@@ -3287,6 +3525,7 @@ def main() -> None:
         fit_cfg = FitConfig(
             bed_prefix=bed_list, device=args.device,
             sample_mask=sample_mask,
+            component_variant_indices=component_variant_indices or None,
             call_width=call_width,
             cpu_threads=cpu_threads,
             keep_host_stats=True,
@@ -3313,16 +3552,24 @@ def main() -> None:
     close_fitter = fitter.close
     atexit.register(close_fitter)
     ops = fitter._assemble_reml_operators()
-    grm_index = SingleGRMIndex(fitter.streamers)
+    grm_index = MultiGRMIndex(
+        fitter.streamers,
+        component_variant_indices=component_variant_indices or None,
+    )
     logger.info(
-        "[INFO] sparse GRM: K=1, markers=%s",
+        "[INFO] sparse GRM: K=%s markers_per_grm=%s total=%s",
+        grm_index.n_grm,
+        grm_index.m_per_grm.tolist(),
         grm_index.m_total,
     )
 
     y_jax = jnp.asarray(y_np, dtype=jnp.float32)
     n_grm = len(ops.K_mvs)
-    if n_grm != 1:
-        raise RuntimeError("Sparse fitting must assemble exactly one GRM operator.")
+    if n_grm != grm_index.n_grm:
+        raise RuntimeError(
+            "Sparse covariance/operator mismatch: "
+            f"{n_grm} operators for {grm_index.n_grm} components."
+        )
 
     def _background_h2(theta_values: np.ndarray) -> float:
         theta_arr = np.asarray(theta_values, dtype=np.float64).reshape(-1)
@@ -3334,12 +3581,13 @@ def main() -> None:
         theta_arr = np.asarray(theta_values, dtype=np.float64).reshape(-1)
         return float(np.sum(theta_arr[:n_grm]))
 
-    # Every standardized GRM is modeled with unit mean diagonal.  Finite-sample
+    # Every standardized GRM is modeled with unit mean diagonal. Finite-sample
     # deviations from one are intentionally not propagated as scale factors.
     h2_init_default = 0.5
     if supplied_theta_init:
         theta = _parse_variance_components_init(
             supplied_theta_init,
+            n_grm=n_grm,
         )
         theta_init_source = "command_line_json"
     else:
@@ -3396,6 +3644,7 @@ def main() -> None:
             cpu_threads=cpu_threads,
             gpu_budget_bytes=gpu_budget_bytes,
             ring_depth=plan.ring_depth,
+            component_variant_indices=component_variant_indices,
         )
         validation_outcome = read_phenotype_aligned(
             args.sparsity_validation_pheno_txt,
@@ -3516,7 +3765,7 @@ def main() -> None:
     if args.lasso_warm_state_in:
         warm_state = _load_lasso_warm_state(
             args.lasso_warm_state_in,
-            n_markers=grm_index.m_total,
+            grm_index=grm_index,
             target_lam_ratio=float(args.lasso_fixed_lam_ratio),
         )
         state_candidate = np.asarray(
@@ -3536,7 +3785,7 @@ def main() -> None:
             "selected_lam_ratio": float(
                 warm_state["selected_lam_ratio"]
             ),
-            "coordinate_system": "single_grm_marker_index",
+            "coordinate_system": str(warm_state["coordinate_system"]),
         }
         sparse_path_performance["final_refit_marker_state_reused"] = True
         sparse_path_performance["final_refit_warm_marker_count"] = int(
@@ -5261,6 +5510,7 @@ def main() -> None:
             )
         lasso_warm_state_out_summary = _write_lasso_warm_state(
             args.lasso_warm_state_out,
+            grm_index=(grm_index if component_variant_indices else None),
             candidate=final_candidate,
             support=support,
             selected_beta_snp=np.asarray(
@@ -5393,6 +5643,7 @@ def main() -> None:
                     cpu_threads=cpu_threads,
                     gpu_budget_bytes=gpu_budget_bytes,
                     ring_depth=plan.ring_depth,
+                    component_variant_indices=component_variant_indices,
                 )
             prediction_fitter = prediction_context.fitter
             prediction_grm_index = prediction_context.grm_index
@@ -5483,7 +5734,15 @@ def main() -> None:
         "n_snps_total": grm_index.m_total,
         "n_grms": grm_index.n_grm,
         "m_per_grm": grm_index.m_per_grm.tolist(),
-        "sparse_grm_mode": "single_whole_genome_grm",
+        "component_spec": component_spec_source or None,
+        "component_partition_mode": (
+            "source_variant_index" if component_variant_indices else None
+        ),
+        "sparse_grm_mode": (
+            "component_partitioned_multi_grm"
+            if component_variant_indices
+            else "single_whole_genome_grm"
+        ),
         "grm_variance_scale": "unit_mean_diagonal",
         "lambda_selection_method": (
             str(final_lasso["selection_method"])
@@ -5644,7 +5903,7 @@ def main() -> None:
             if beta_val != 0.0:
                 beta_map[int(snp_idx)] = float(beta_val)
     if sources is None:
-        bim_rows = grm_index.lookup_bim_rows(bed_list[0], support)
+        bim_rows = grm_index.lookup_bim_rows(bed_list, support)
     elif support.size > 0 and pgen_prefix:
         source_support = grm_index.source_variant_indices(support)
         source_rows = _lookup_pvar_rows(pgen_prefix + ".pvar", source_support)

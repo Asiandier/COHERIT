@@ -105,7 +105,8 @@ def predict_sparse_branch(
         raise ValueError("Branch coefficient and design widths do not match.")
     theta = np.asarray(theta, dtype=np.float64).reshape(-1)
     if (
-        not np.all(np.isfinite(theta))
+        theta.size < 1
+        or not np.all(np.isfinite(theta))
         or np.any(theta[:-1] < 0.0)
         or theta[-1] <= 0.0
     ):
@@ -115,9 +116,10 @@ def predict_sparse_branch(
         )
 
     ops = fitter._assemble_reml_operators()
-    if len(ops.K_mvs) != 1 or theta.size != 2:
+    if theta.size != len(ops.K_mvs) + 1:
         raise ValueError(
-            "Single-GRM sparse prediction requires [genetic, residual] theta."
+            "theta length mismatch: expected "
+            f"{len(ops.K_mvs) + 1}, got {theta.size}."
         )
     residual = y - c_train @ beta_cov - z_train @ beta_active
     theta_dev = jnp.asarray(theta, dtype=jnp.float32)
@@ -149,7 +151,9 @@ def predict_sparse_branch(
     effects = EffectEstimates(
         fixed_effects=jnp.asarray(fixed, dtype=jnp.float32),
         random_effect=zeros_train,
-        random_effect_components=(zeros_train,),
+        random_effect_components=tuple(
+            zeros_train for _ in range(len(ops.K_mvs))
+        ),
         snp_effects=snp_effects,
         pcg_rel_res=rel,
         pcg_iters=int(iters),
@@ -219,7 +223,7 @@ def _pack_effect_path_by_call(streamer, effect_path: np.ndarray) -> jnp.ndarray:
     effects = np.asarray(effect_path, dtype=np.float32)
     if effects.ndim != 2 or int(effects.shape[0]) != int(streamer.m):
         raise ValueError(
-            "effect_path must contain one row per single-GRM marker."
+            "effect_path must contain one row per streamed marker."
         )
     n_path = int(effects.shape[1])
     packed = np.zeros(
@@ -239,10 +243,15 @@ def _pack_effect_path_by_call(streamer, effect_path: np.ndarray) -> jnp.ndarray:
     return jax.device_put(jnp.asarray(packed), streamer.dev)
 
 
-def predict_sparse_path_single_grm(
+def _predict_sparse_path(
     *,
     fitter,
-    test_fitter,
+    train_streamer,
+    test_streamer,
+    component_offsets: np.ndarray,
+    component_effective_m: np.ndarray,
+    theta_error: str,
+    xt_shape_label: str,
     y_train: np.ndarray,
     train_covar: np.ndarray | None,
     test_covar: np.ndarray | None,
@@ -254,31 +263,10 @@ def predict_sparse_path_single_grm(
     pcg_tol: float,
     max_pcg_iters: int,
 ) -> SparsePathPrediction:
-    """Predict an entire Lasso path in one PCG and one genotype pass.
-
-    Path points share a fixed covariance estimate.  This is the inexpensive
-    validation scan used to select ``lambda / lambda_max`` before a full refit.
-    """
-    if len(fitter.streamers) != 1 or len(test_fitter.streamers) != 1:
-        raise ValueError(
-            "Sparse path prediction requires one training and one test GRM."
-        )
-    train_streamer = fitter.streamers[0]
-    test_streamer = test_fitter.streamers[0]
-    if (
-        int(getattr(train_streamer, "n_components", 1)) != 1
-        or int(getattr(test_streamer, "n_components", 1)) != 1
-    ):
-        raise ValueError("Sparse path prediction does not accept GRM partitions.")
-    _validate_dense_prediction_streamers(
-        fitter.streamers, test_fitter.streamers
-    )
-    _copy_training_standardization_to_test_streamer(
-        train_streamer, test_streamer
-    )
-
     y = np.asarray(y_train, dtype=np.float64).reshape(-1)
     n_train = int(y.size)
+    if int(train_streamer.n) != n_train:
+        raise ValueError("Training phenotype and genotype row counts do not match.")
     n_test = int(test_streamer.n)
     c_train = _as_design(train_covar, n_rows=n_train, name="train_covar")
     c_test = _as_design(test_covar, n_rows=n_test, name="test_covar")
@@ -311,20 +299,37 @@ def predict_sparse_path_single_grm(
         raise ValueError("Covariate and candidate coefficient paths differ in length.")
     n_path = int(beta_candidate_path.shape[0])
 
+    offsets = np.asarray(component_offsets, dtype=np.int64).reshape(-1)
+    effective_m = np.asarray(
+        component_effective_m, dtype=np.float64
+    ).reshape(-1)
+    n_components = int(effective_m.size)
+    if (
+        offsets.shape != (n_components + 1,)
+        or offsets[0] != 0
+        or offsets[-1] != int(train_streamer.m)
+        or np.any(np.diff(offsets) < 0)
+    ):
+        raise RuntimeError("Sparse path component marker layout is invalid.")
     theta = np.asarray(theta, dtype=np.float64).reshape(-1)
     if (
-        theta.shape != (2,)
+        theta.shape != (n_components + 1,)
         or not np.all(np.isfinite(theta))
         or np.any(theta[:-1] < 0.0)
         or theta[-1] <= 0.0
     ):
-        raise ValueError("theta is incompatible with a single GRM.")
+        raise ValueError(theta_error)
 
     nuisance_train = c_train @ beta_cov_path.T
     fixed_train = z_train @ beta_candidate_path.T
     residual = y[:, None] - nuisance_train - fixed_train
 
     ops = fitter._assemble_reml_operators()
+    if len(ops.K_mvs) != n_components:
+        raise RuntimeError(
+            "Sparse path covariance/component mismatch: "
+            f"{len(ops.K_mvs)} operators for {n_components} components."
+        )
     theta_dev = jnp.asarray(theta, dtype=jnp.float32)
     fitter._ensure_projected_core_precond_ready(
         ops, var_components_init=theta_dev
@@ -359,17 +364,24 @@ def predict_sparse_path_single_grm(
     expected_xt_shape = (int(train_streamer.m), n_path)
     if xt_dual.shape != expected_xt_shape:
         raise RuntimeError(
-            "Single-GRM X'V^-1 residual path has the wrong shape: "
+            f"{xt_shape_label} X'V^-1 residual path has the wrong shape: "
             f"{xt_dual.shape} != {expected_xt_shape}."
         )
-    effective_m = float(
-        np.asarray(jax.device_get(train_streamer._eff_m_const))
-    )
-    if not np.isfinite(effective_m) or effective_m <= 0.0:
-        raise ValueError("Single-GRM effective marker count must be positive.")
-    random_effect_path = (
-        float(theta[0]) / effective_m * xt_dual
-    ).astype(np.float32, copy=False)
+    if not np.all(np.isfinite(effective_m)) or np.any(effective_m < 0.0):
+        raise ValueError(
+            "Component effective marker counts must be finite and nonnegative."
+        )
+    random_effect_path = np.zeros_like(xt_dual, dtype=np.float32)
+    for component_index in range(n_components):
+        start = int(offsets[component_index])
+        stop = int(offsets[component_index + 1])
+        count = float(effective_m[component_index])
+        if count > 0.0:
+            random_effect_path[start:stop, :] = (
+                float(theta[component_index])
+                / count
+                * xt_dual[start:stop, :]
+            )
 
     from .kv_impl import zxb_impl_same_stream_multi
 
@@ -421,6 +433,132 @@ def predict_sparse_path_single_grm(
         phenotype_prediction=phenotype,
         pcg_rel_res=rel,
         pcg_iters=int(iters),
+    )
+
+
+def predict_sparse_path_partitioned(
+    *,
+    fitter,
+    test_fitter,
+    y_train: np.ndarray,
+    train_covar: np.ndarray | None,
+    test_covar: np.ndarray | None,
+    train_candidate_geno: np.ndarray,
+    test_candidate_geno: np.ndarray,
+    beta_cov_path: np.ndarray,
+    beta_candidate_path: np.ndarray,
+    theta: np.ndarray,
+    pcg_tol: float,
+    max_pcg_iters: int,
+) -> SparsePathPrediction:
+    """Predict a Lasso path for one source partitioned into multiple GRMs."""
+    train_streamer = getattr(fitter, "_partitioned_streamer", None)
+    test_streamer = getattr(test_fitter, "_partitioned_streamer", None)
+    if train_streamer is None or test_streamer is None:
+        raise ValueError(
+            "Sparse path prediction requires a single-source component partition."
+        )
+    _validate_dense_prediction_streamers(
+        fitter.streamers, test_fitter.streamers
+    )
+    _copy_training_standardization_to_test_streamer(
+        train_streamer, test_streamer
+    )
+    return _predict_sparse_path(
+        fitter=fitter,
+        train_streamer=train_streamer,
+        test_streamer=test_streamer,
+        component_offsets=np.asarray(
+            train_streamer._component_snp_offsets, dtype=np.int64
+        ),
+        component_effective_m=np.asarray(
+            train_streamer._component_eff_m_host, dtype=np.float64
+        ),
+        theta_error="theta is incompatible with the partition.",
+        xt_shape_label="Partitioned",
+        y_train=y_train,
+        train_covar=train_covar,
+        test_covar=test_covar,
+        train_candidate_geno=train_candidate_geno,
+        test_candidate_geno=test_candidate_geno,
+        beta_cov_path=beta_cov_path,
+        beta_candidate_path=beta_candidate_path,
+        theta=theta,
+        pcg_tol=pcg_tol,
+        max_pcg_iters=max_pcg_iters,
+    )
+
+
+def predict_sparse_path_single_grm(
+    *,
+    fitter,
+    test_fitter,
+    y_train: np.ndarray,
+    train_covar: np.ndarray | None,
+    test_covar: np.ndarray | None,
+    train_candidate_geno: np.ndarray,
+    test_candidate_geno: np.ndarray,
+    beta_cov_path: np.ndarray,
+    beta_candidate_path: np.ndarray,
+    theta: np.ndarray,
+    pcg_tol: float,
+    max_pcg_iters: int,
+) -> SparsePathPrediction:
+    """Predict an entire Lasso path in one PCG and one genotype pass.
+
+    Path points share a fixed covariance estimate.  This is the inexpensive
+    validation scan used to select ``lambda / lambda_max`` before a full refit.
+    """
+    if len(fitter.streamers) != 1 or len(test_fitter.streamers) != 1:
+        raise ValueError(
+            "Sparse path prediction requires one training and one test GRM."
+        )
+    train_streamer = fitter.streamers[0]
+    test_streamer = test_fitter.streamers[0]
+    if (
+        int(getattr(train_streamer, "n_components", 1)) != 1
+        or int(getattr(test_streamer, "n_components", 1)) != 1
+    ):
+        raise ValueError("Sparse path prediction does not accept GRM partitions.")
+    _validate_dense_prediction_streamers(
+        fitter.streamers, test_fitter.streamers
+    )
+    _copy_training_standardization_to_test_streamer(
+        train_streamer, test_streamer
+    )
+    theta_arr = np.asarray(theta, dtype=np.float64).reshape(-1)
+    if (
+        theta_arr.shape != (2,)
+        or not np.all(np.isfinite(theta_arr))
+        or np.any(theta_arr[:-1] < 0.0)
+        or theta_arr[-1] <= 0.0
+    ):
+        raise ValueError("theta is incompatible with a single GRM.")
+    effective_m = float(
+        np.asarray(jax.device_get(train_streamer._eff_m_const))
+    )
+    if not np.isfinite(effective_m) or effective_m <= 0.0:
+        raise ValueError("Single-GRM effective marker count must be positive.")
+    return _predict_sparse_path(
+        fitter=fitter,
+        train_streamer=train_streamer,
+        test_streamer=test_streamer,
+        component_offsets=np.asarray(
+            [0, int(train_streamer.m)], dtype=np.int64
+        ),
+        component_effective_m=np.asarray([effective_m], dtype=np.float64),
+        theta_error="theta is incompatible with a single GRM.",
+        xt_shape_label="Single-GRM",
+        y_train=y_train,
+        train_covar=train_covar,
+        test_covar=test_covar,
+        train_candidate_geno=train_candidate_geno,
+        test_candidate_geno=test_candidate_geno,
+        beta_cov_path=beta_cov_path,
+        beta_candidate_path=beta_candidate_path,
+        theta=theta_arr,
+        pcg_tol=pcg_tol,
+        max_pcg_iters=max_pcg_iters,
     )
 
 

@@ -121,11 +121,14 @@ than recomputing the unused validation grid. The run stops with this
 covariance-aligned LASSO pair and reports
 the COHERIT estimator.
 
-The sparse path deliberately supports one model:
-`single_grm_validation_r2`. It uses one whole-genome GRM, selects lambda by
-held-out validation R² inside every alpha/theta outer iteration, and exposes no
-GRM partition, Adaptive-K, or covariance-tree interface. The
-`gpu-reml-sparse-validation` orchestrator then freezes the selected
+The sparse runner supports one fixed covariance model per run. With no
+`--component-spec` it uses one whole-genome GRM; with a component spec it uses
+that exhaustive, mutually exclusive single-source partition (for example LD2
+or LD4). It does not perform Adaptive-K or covariance-tree search. In either
+case held-out validation R² selects lambda inside every alpha/theta outer
+iteration. The existing `gpu-reml-sparse-validation` orchestrator is the
+single-GRM convenience workflow; lower-level partitioned runs pass the same
+component spec to both stages. The workflow then freezes the selected
 lambda/lambda-max ratio and automatically warm-starts a train+validation final
 refit before evaluating the held-out test samples. The test phenotype is never
 used for lambda selection.
@@ -136,7 +139,9 @@ Sparse-run output semantics are deliberately explicit:
   `h2_chive`.
 - New sparse runs use output schema version 7. Raw/standardized duplicate
   estimator fields and downstream phenotype-scale conversions no longer exist.
-- `var_components_lasso_ml` exposes the variance components used by COHERIT.
+- `var_components_lasso_ml` contains one variance contribution per fixed GRM
+  followed by the residual variance. Standardized component GRMs use the
+  unit-mean-diagonal sparse-COHERIT contract.
 - `h2` is the primary total estimate. For a valid covariance-aligned LASSO
   pair it combines the calibrated LASSO quadratic with the
   `var_components_lasso_ml` background and residual components.
@@ -342,6 +347,30 @@ gpu-reml-sparse-validation \
   --test-keep test.keep \
   --out-dir out/sparse_single
 ```
+
+For a fixed multi-GRM sparse run, add the same exhaustive component spec to
+the selection and frozen-ratio refit invocations of
+`run_sparse_reml_pipeline.py`:
+
+```bash
+python run_sparse_reml_pipeline.py \
+  --bed-prefix /path/to/data \
+  --component-spec components_ld4.npz \
+  --pheno-txt train.pheno \
+  --covar-txt covar.txt \
+  --keep-path train.keep \
+  --prediction-bed-prefix /path/to/data \
+  --prediction-covar-txt covar.txt \
+  --prediction-keep-path validation.keep \
+  --sparsity-validation-pheno-txt validation.pheno \
+  --sparsity-validation-out out/ld4.validation.json \
+  --lasso-warm-state-out out/ld4.warm.npz \
+  --out-prefix out/ld4.selection
+```
+
+The final-refit invocation uses the same `--component-spec`, the selected
+`--lasso-fixed-lam-ratio`, the G+1 `--variance-components-init`, and the
+emitted `--lasso-warm-state-in`.
 
 Continuous-trait marginal GWAS:
 

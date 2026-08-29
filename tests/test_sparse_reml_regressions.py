@@ -22,6 +22,111 @@ REML = importlib.import_module(f"{PKG}.reml")
 LASSO = importlib.import_module(f"{PKG}.lasso_cd")
 
 
+class _PartitionIndexStreamer:
+    def __init__(self, cache_to_source, component_sizes):
+        self._cache_to_source_variant_indices = np.asarray(
+            cache_to_source, dtype=np.int64
+        )
+        self._component_snp_offsets = np.concatenate(
+            [
+                np.asarray([0], dtype=np.int64),
+                np.cumsum(component_sizes, dtype=np.int64),
+            ]
+        )
+        self.n_components = len(component_sizes)
+        self.has_component_partition = True
+        self.m = int(self._cache_to_source_variant_indices.size)
+        self.n = 3
+        self._columns = np.arange(self.n * self.m, dtype=np.float32).reshape(
+            self.n, self.m
+        )
+
+    def extract_standardized_columns(self, indices):
+        return self._columns[:, np.asarray(indices, dtype=np.int64)]
+
+
+def test_multi_grm_index_preserves_cache_and_source_coordinates():
+    streamer = _PartitionIndexStreamer(
+        cache_to_source=[0, 2, 5, 1, 3, 4],
+        component_sizes=[3, 3],
+    )
+    index = SPARSE.MultiGRMIndex(
+        [streamer],
+        component_variant_indices=[np.asarray([5, 0, 2]), np.asarray([4, 1, 3])],
+    )
+
+    assert index.n_grm == 2
+    np.testing.assert_array_equal(index.m_per_grm, [3, 3])
+    np.testing.assert_array_equal(
+        index.source_variant_indices(np.asarray([0, 3, 5])), [0, 1, 4]
+    )
+    np.testing.assert_array_equal(
+        index.cache_variant_indices(np.asarray([4, 0, 1])), [5, 0, 3]
+    )
+    groups = index.global_to_local(np.asarray([5, 1, 3]))
+    assert [(g, local.tolist(), pos.tolist()) for g, local, pos in groups] == [
+        (0, [1], [1]),
+        (1, [2, 0], [0, 2]),
+    ]
+    np.testing.assert_array_equal(
+        index.extract_standardized_columns(np.asarray([5, 1, 3])),
+        streamer._columns[:, [5, 1, 3]],
+    )
+
+
+def test_k1_component_spec_index_matches_unpartitioned_coordinates():
+    partitioned = _PartitionIndexStreamer(
+        cache_to_source=[0, 1, 2, 3], component_sizes=[4]
+    )
+    indexed = SPARSE.MultiGRMIndex(
+        [partitioned],
+        component_variant_indices=[np.arange(4, dtype=np.int64)],
+    )
+    unpartitioned = SimpleNamespace(
+        m=4,
+        n=3,
+        has_component_partition=False,
+        n_components=1,
+        extract_standardized_columns=partitioned.extract_standardized_columns,
+    )
+    plain = SPARSE.MultiGRMIndex([unpartitioned])
+    marker_indices = np.asarray([3, 0, 2], dtype=np.int64)
+
+    np.testing.assert_array_equal(
+        indexed.source_variant_indices(marker_indices),
+        plain.source_variant_indices(marker_indices),
+    )
+    np.testing.assert_array_equal(
+        indexed.extract_standardized_columns(marker_indices),
+        plain.extract_standardized_columns(marker_indices),
+    )
+
+
+def test_multi_grm_theta_parser_uses_unit_variance_contributions():
+    theta = SPARSE._parse_variance_components_init(
+        "[0.2, 0.3, 0.4]", n_grm=2
+    )
+    assert SPARSE._sparse_dense_h2(
+        0.1, float(np.sum(theta[:-1])), float(theta[-1])
+    ) == pytest.approx(
+        0.6
+    )
+    with pytest.raises(ValueError, match="expected 3"):
+        SPARSE._parse_variance_components_init("[0.2, 0.8]", n_grm=2)
+
+
+def test_component_spec_partition_must_be_exhaustive_and_disjoint():
+    valid = SPARSE._validate_component_partition(
+        [np.asarray([3, 1]), np.asarray([0, 2])], n_markers=4
+    )
+    np.testing.assert_array_equal(valid[0], [1, 3])
+    np.testing.assert_array_equal(valid[1], [0, 2])
+    with pytest.raises(ValueError, match="exactly once"):
+        SPARSE._validate_component_partition(
+            [np.asarray([0, 1]), np.asarray([1, 2])], n_markers=4
+        )
+
+
 def test_lasso_warm_state_reuses_selected_alpha_for_final_refit(tmp_path):
     state_path = tmp_path / "lasso_warm_state.npz"
     candidate = np.asarray([0, 2, 3], dtype=np.int64)

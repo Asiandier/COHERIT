@@ -27,6 +27,7 @@ FitConfig = REML_MODEL.FitConfig
 InfinitesimalREMLFitter = REML_MODEL.InfinitesimalREMLFitter
 SparseBranchPrediction = SPARSE_PRED.SparseBranchPrediction
 predict_sparse_branch = SPARSE_PRED.predict_sparse_branch
+predict_sparse_path_partitioned = SPARSE_PRED.predict_sparse_path_partitioned
 predict_sparse_path_single_grm = SPARSE_PRED.predict_sparse_path_single_grm
 write_sparse_prediction_outputs = SPARSE_PRED.write_sparse_prediction_outputs
 write_sparse_prediction_status = SPARSE_PRED.write_sparse_prediction_status
@@ -140,6 +141,315 @@ def _standardize_from_training(
         (train.astype(np.float64) - mean) * inv_sd,
         (test.astype(np.float64) - mean) * inv_sd,
     )
+
+
+def _partitioned_prediction_genotypes() -> tuple[np.ndarray, np.ndarray]:
+    train = np.asarray(
+        [
+            [0, 0, 1, 2, 0, 1],
+            [1, 0, 2, 1, 1, 0],
+            [2, 1, 0, 0, 2, 1],
+            [0, 2, 1, 1, 0, 2],
+            [1, 1, 2, 0, 1, 2],
+            [2, 2, 0, 2, 2, 0],
+            [0, 1, 1, 0, 2, 2],
+            [1, 2, 0, 1, 0, 1],
+            [2, 0, 2, 2, 1, 0],
+            [0, 2, 0, 1, 2, 1],
+            [1, 0, 1, 2, 0, 2],
+            [2, 1, 2, 0, 1, 1],
+        ],
+        dtype=np.int8,
+    )
+    test = np.asarray(
+        [
+            [2, 2, 0, 0, 2, 1],
+            [0, 1, 2, 2, 0, 0],
+            [1, 2, 1, 0, 1, 2],
+            [2, 0, 2, 1, 2, 0],
+            [0, 0, 0, 2, 1, 2],
+        ],
+        dtype=np.int8,
+    )
+    return train, test
+
+
+def test_partitioned_sparse_source_mapping_and_blup_match_dense_algebra():
+    x_train, x_test = _partitioned_prediction_genotypes()
+    groups = [
+        np.asarray([4, 0, 2], dtype=np.int64),
+        np.asarray([5, 3, 1], dtype=np.int64),
+    ]
+    train = InfinitesimalREMLFitter(
+        FitConfig(
+            sources=[_ArraySource(x_train)],
+            component_variant_indices=groups,
+            call_width=2,
+            keep_host_stats=True,
+            precond_rank=0,
+            verbose=False,
+        )
+    )
+    test = InfinitesimalREMLFitter(
+        FitConfig(
+            sources=[_ArraySource(x_test)],
+            component_variant_indices=groups,
+            call_width=2,
+            standardization_overrides=[
+                (
+                    train.streamers[0]._means_host,
+                    train.streamers[0]._inv_sds_host,
+                )
+            ],
+            keep_host_stats=True,
+            precond_rank=0,
+            verbose=False,
+        )
+    )
+    try:
+        train_streamer = train.streamers[0]
+        test_streamer = test.streamers[0]
+        source_order = np.asarray([0, 2, 4, 1, 3, 5], dtype=np.int64)
+        np.testing.assert_array_equal(
+            train_streamer._cache_to_source_variant_indices, source_order
+        )
+        np.testing.assert_array_equal(
+            train_streamer.component_source_variant_indices(0),
+            source_order[:3],
+        )
+        np.testing.assert_array_equal(
+            train_streamer.component_source_variant_indices(1),
+            source_order[3:],
+        )
+
+        z_train_source, z_test_source = _standardize_from_training(
+            x_train, x_test
+        )
+        cache_indices = np.arange(x_train.shape[1], dtype=np.int64)
+        z_train_cache = train_streamer.extract_standardized_columns(
+            cache_indices
+        )
+        z_test_cache = test_streamer.extract_standardized_columns(cache_indices)
+        np.testing.assert_allclose(
+            z_train_cache,
+            z_train_source[:, source_order],
+            rtol=2e-5,
+            atol=2e-5,
+        )
+        np.testing.assert_allclose(
+            z_test_cache,
+            z_test_source[:, source_order],
+            rtol=2e-5,
+            atol=2e-5,
+        )
+
+        support_cache = np.asarray([0, 4], dtype=np.int64)
+        z_active_train = z_train_cache[:, support_cache]
+        z_active_test = z_test_cache[:, support_cache]
+        c_train = np.ones((x_train.shape[0], 1), dtype=np.float64)
+        c_test = np.ones((x_test.shape[0], 1), dtype=np.float64)
+        beta_cov = np.asarray([0.4], dtype=np.float64)
+        beta_active = np.asarray([0.35, -0.2], dtype=np.float64)
+        theta = np.asarray([0.24, 0.31, 0.45], dtype=np.float64)
+        y = (
+            c_train @ beta_cov
+            + z_active_train @ beta_active
+            + np.linspace(-0.3, 0.35, x_train.shape[0])
+        )
+
+        prediction = predict_sparse_branch(
+            name="partitioned",
+            fitter=train,
+            test_fitter=test,
+            y_train=y,
+            train_covar=c_train,
+            test_covar=c_test,
+            train_active_geno=z_active_train,
+            test_active_geno=z_active_test,
+            beta_cov=beta_cov,
+            beta_active=beta_active,
+            theta=theta,
+            pcg_tol=1e-6,
+            max_pcg_iters=1000,
+        )
+
+        residual = y - c_train @ beta_cov - z_active_train @ beta_active
+        covariance = theta[-1] * np.eye(x_train.shape[0])
+        expected_components = []
+        for component_index in range(2):
+            start = int(train_streamer._component_snp_offsets[component_index])
+            stop = int(
+                train_streamer._component_snp_offsets[component_index + 1]
+            )
+            count = float(train_streamer._component_eff_m_host[component_index])
+            z_group_train = z_train_cache[:, start:stop]
+            covariance += (
+                theta[component_index]
+                * (z_group_train @ z_group_train.T)
+                / count
+            )
+        dual = np.linalg.solve(covariance, residual)
+        for component_index in range(2):
+            start = int(train_streamer._component_snp_offsets[component_index])
+            stop = int(
+                train_streamer._component_snp_offsets[component_index + 1]
+            )
+            count = float(train_streamer._component_eff_m_host[component_index])
+            expected_components.append(
+                theta[component_index]
+                * z_test_cache[:, start:stop]
+                @ (z_train_cache[:, start:stop].T @ dual)
+                / count
+            )
+        expected_background = np.sum(expected_components, axis=0)
+        np.testing.assert_allclose(
+            prediction.fixed_snp_score,
+            z_test_source[:, [0, 3]] @ beta_active,
+            rtol=2e-5,
+            atol=2e-5,
+        )
+        np.testing.assert_allclose(
+            prediction.background_blup,
+            expected_background,
+            rtol=7e-4,
+            atol=7e-4,
+        )
+        for observed, expected in zip(
+            prediction.background_components, expected_components
+        ):
+            np.testing.assert_allclose(
+                observed, expected, rtol=7e-4, atol=7e-4
+            )
+
+        beta_cov_path = np.stack([beta_cov, beta_cov + 0.1])
+        beta_active_path = np.stack([beta_active, 0.5 * beta_active])
+        path = predict_sparse_path_partitioned(
+            fitter=train,
+            test_fitter=test,
+            y_train=y,
+            train_covar=c_train,
+            test_covar=c_test,
+            train_candidate_geno=z_active_train,
+            test_candidate_geno=z_active_test,
+            beta_cov_path=beta_cov_path,
+            beta_candidate_path=beta_active_path,
+            theta=theta,
+            pcg_tol=1e-6,
+            max_pcg_iters=1000,
+        )
+        for path_index in range(beta_active_path.shape[0]):
+            point = predict_sparse_branch(
+                name=f"partitioned_{path_index}",
+                fitter=train,
+                test_fitter=test,
+                y_train=y,
+                train_covar=c_train,
+                test_covar=c_test,
+                train_active_geno=z_active_train,
+                test_active_geno=z_active_test,
+                beta_cov=beta_cov_path[path_index],
+                beta_active=beta_active_path[path_index],
+                theta=theta,
+                pcg_tol=1e-6,
+                max_pcg_iters=1000,
+            )
+            np.testing.assert_allclose(
+                path.background_blup[:, path_index],
+                point.background_blup,
+                rtol=7e-4,
+                atol=7e-4,
+            )
+            np.testing.assert_allclose(
+                path.phenotype_prediction[:, path_index],
+                point.phenotype_prediction,
+                rtol=7e-4,
+                atol=7e-4,
+            )
+    finally:
+        train.close()
+        test.close()
+
+
+def test_partitioned_path_one_component_matches_single_grm_api():
+    x_train, x_test = _partitioned_prediction_genotypes()
+    one_group = [np.arange(x_train.shape[1], dtype=np.int64)]
+    train = InfinitesimalREMLFitter(
+        FitConfig(
+            sources=[_ArraySource(x_train)],
+            component_variant_indices=one_group,
+            call_width=3,
+            keep_host_stats=True,
+            precond_rank=0,
+            verbose=False,
+        )
+    )
+    test = InfinitesimalREMLFitter(
+        FitConfig(
+            sources=[_ArraySource(x_test)],
+            component_variant_indices=one_group,
+            call_width=3,
+            standardization_overrides=[
+                (
+                    train.streamers[0]._means_host,
+                    train.streamers[0]._inv_sds_host,
+                )
+            ],
+            keep_host_stats=True,
+            precond_rank=0,
+            verbose=False,
+        )
+    )
+    try:
+        z_train = train.streamers[0].extract_standardized_columns(
+            np.asarray([1, 4], dtype=np.int64)
+        )
+        z_test = test.streamers[0].extract_standardized_columns(
+            np.asarray([1, 4], dtype=np.int64)
+        )
+        c_train = np.ones((x_train.shape[0], 1), dtype=np.float64)
+        c_test = np.ones((x_test.shape[0], 1), dtype=np.float64)
+        beta_cov_path = np.asarray([[0.2], [0.35]], dtype=np.float64)
+        beta_path = np.asarray(
+            [[0.0, 0.0], [0.3, -0.15]], dtype=np.float64
+        )
+        theta = np.asarray([0.3, 0.7], dtype=np.float64)
+        y = 0.25 + z_train @ np.asarray([0.2, -0.1]) + np.linspace(
+            -0.2, 0.25, x_train.shape[0]
+        )
+        kwargs = dict(
+            fitter=train,
+            test_fitter=test,
+            y_train=y,
+            train_covar=c_train,
+            test_covar=c_test,
+            train_candidate_geno=z_train,
+            test_candidate_geno=z_test,
+            beta_cov_path=beta_cov_path,
+            beta_candidate_path=beta_path,
+            theta=theta,
+            pcg_tol=1e-6,
+            max_pcg_iters=1000,
+        )
+        partitioned = predict_sparse_path_partitioned(**kwargs)
+        single = predict_sparse_path_single_grm(**kwargs)
+        for field in (
+            "residual",
+            "dual",
+            "nuisance_fixed_score",
+            "fixed_snp_score",
+            "background_blup",
+            "genetic_score",
+            "phenotype_prediction",
+        ):
+            np.testing.assert_allclose(
+                getattr(partitioned, field),
+                getattr(single, field),
+                rtol=2e-6,
+                atol=2e-6,
+            )
+    finally:
+        train.close()
+        test.close()
 
 
 def test_single_grm_path_prediction_matches_pointwise_branches():
