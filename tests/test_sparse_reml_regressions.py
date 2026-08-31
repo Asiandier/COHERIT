@@ -156,6 +156,92 @@ def test_lasso_warm_state_reuses_selected_alpha_for_final_refit(tmp_path):
     assert loaded["selected_lam_ratio"] == pytest.approx(0.25)
 
 
+def test_lasso_warm_state_reuses_certified_path_across_partitions(tmp_path):
+    parent_streamer = _PartitionIndexStreamer(
+        cache_to_source=[0, 2, 5, 1, 3, 4], component_sizes=[3, 3]
+    )
+    parent = SPARSE.MultiGRMIndex(
+        [parent_streamer],
+        component_variant_indices=[
+            np.asarray([0, 2, 5]),
+            np.asarray([1, 3, 4]),
+        ],
+    )
+    child_streamer = _PartitionIndexStreamer(
+        cache_to_source=[1, 2, 4, 0, 3, 5], component_sizes=[3, 3]
+    )
+    child = SPARSE.MultiGRMIndex(
+        [child_streamer],
+        component_variant_indices=[
+            np.asarray([1, 2, 4]),
+            np.asarray([0, 3, 5]),
+        ],
+    )
+    state_path = tmp_path / "validation_path_state.npz"
+    candidate = np.asarray([0, 1, 3, 5], dtype=np.int64)
+    support = np.asarray([1, 5], dtype=np.int64)
+    selected_beta = np.asarray([0.0, 0.2, 0.0, -0.1])
+    beta_path = np.asarray(
+        [
+            [0.0, 0.0, 0.0, 0.0],
+            [0.1, 0.2, 0.0, -0.1],
+            [0.3, 0.4, -0.2, -0.5],
+        ]
+    )
+    ratios = np.asarray([1.0, 0.5, 0.25])
+
+    emitted = SPARSE._write_lasso_warm_state(
+        str(state_path),
+        grm_index=parent,
+        candidate=candidate,
+        support=support,
+        selected_beta_snp=selected_beta,
+        selected_lam_ratio=0.5,
+        beta_snp_path=beta_path,
+        path_lam_ratios=ratios,
+    )
+    loaded = SPARSE._load_lasso_warm_state(
+        str(state_path),
+        grm_index=child,
+        target_path_lam_ratios=ratios,
+    )
+
+    assert emitted["path_rows"] == 3
+    assert loaded["reuse_mode"] == "certified_path_prefix_for_validation"
+    # Parent candidate source rows are [0, 2, 1, 4]. In the child cache they
+    # become [3, 1, 0, 2], sorted to [0, 1, 2, 3].
+    np.testing.assert_array_equal(loaded["candidate"], [0, 1, 2, 3])
+    np.testing.assert_array_equal(loaded["support"], [1, 2])
+    np.testing.assert_allclose(
+        loaded["beta_snp_path"], beta_path[:, [2, 1, 3, 0]]
+    )
+
+
+def test_legacy_selected_alpha_is_safe_validation_path_fallback(tmp_path):
+    state_path = tmp_path / "legacy_state.npz"
+    with open(state_path, "wb") as handle:
+        np.savez(
+            handle,
+            lasso_warm_state_schema_version=np.asarray(2),
+            marker_indices=np.asarray([1, 3]),
+            selected_beta_snp=np.asarray([0.2, -0.1]),
+            selected_lam_ratio=np.asarray(0.25),
+        )
+    ratios = np.asarray([1.0, 0.5, 0.25, 0.125])
+
+    loaded = SPARSE._load_lasso_warm_state(
+        str(state_path), n_markers=4, target_path_lam_ratios=ratios
+    )
+
+    assert loaded["reuse_mode"] == "selected_alpha_broadcast_for_validation"
+    np.testing.assert_array_equal(loaded["candidate"], [1, 3])
+    np.testing.assert_array_equal(loaded["beta_snp_path"][0], [0.0, 0.0])
+    np.testing.assert_allclose(
+        loaded["beta_snp_path"][1:],
+        np.asarray([[0.2, -0.1]] * 3),
+    )
+
+
 def test_validation_selected_path_materializes_alpha_used_downstream():
     lasso_path = {
         "beta_snp": np.asarray([0.0, 0.0]),
@@ -1465,6 +1551,69 @@ def test_empty_support_reduces_to_background_only_heritability():
     h2 = SPARSE._sparse_dense_h2(0.0, background, residual)
 
     assert np.isclose(h2, expected)
+
+
+def test_prediction_emitter_uses_the_already_fitted_pair(
+    monkeypatch,
+):
+    calls = {"closed": False}
+    prediction = SimpleNamespace(pcg_rel_res=1e-4, pcg_iters=3)
+
+    class _Index:
+        def extract_standardized_columns(self, indices):
+            np.testing.assert_array_equal(indices, [1, 3])
+            return np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+
+    context = SimpleNamespace(
+        fitter=object(),
+        grm_index=_Index(),
+        covar=np.ones((2, 1), dtype=np.float32),
+        sample_ids=["i1", "i2"],
+        close=lambda: calls.__setitem__("closed", True),
+    )
+    monkeypatch.setattr(
+        SPARSE,
+        "predict_sparse_branch",
+        lambda **kwargs: calls.setdefault("prediction_kwargs", kwargs)
+        and prediction,
+    )
+    monkeypatch.setattr(
+        SPARSE,
+        "write_sparse_prediction_status",
+        lambda **kwargs: calls.setdefault("status", kwargs),
+    )
+    monkeypatch.setattr(
+        SPARSE,
+        "write_sparse_prediction_outputs",
+        lambda **kwargs: calls.setdefault("outputs", kwargs)
+        and {"prediction": "second.sparse_prediction.tsv"},
+    )
+
+    result = SPARSE._emit_lasso_prediction(
+        out_prefix="second",
+        keep_path="v_cov.keep",
+        prediction_context=context,
+        prediction_bed_list=["geno"],
+        prediction_pgen_prefix="",
+        input_phenotype_mean=0.0,
+        input_phenotype_standard_deviation=1.0,
+        training_fitter=object(),
+        y_train=np.asarray([0.1, -0.1]),
+        train_covar=np.ones((2, 1)),
+        train_support=np.ones((2, 2)),
+        support_indices=np.asarray([1, 3]),
+        beta_cov=np.asarray([0.2]),
+        beta_active=np.asarray([0.3, 0.4]),
+        theta=np.asarray([0.5, 0.5]),
+        pcg_tol=5e-3,
+        max_pcg_iters=400,
+    )
+
+    assert calls["closed"] is True
+    assert calls["prediction_kwargs"]["theta"].tolist() == [0.5, 0.5]
+    assert calls["outputs"]["metadata"]["prediction_keep_path"] == "v_cov.keep"
+    assert result["status"] == "emitted"
+    assert result["n_samples"] == 2
 
 
 def test_reml_backtracking_reuses_the_accepted_state_warm_anchor(

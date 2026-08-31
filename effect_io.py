@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import dataclasses
 import json
+import os
+from pathlib import Path
 from typing import Sequence
 
 import numpy as np
 
 from .io_utils import write_joined_rows
 from .reml_model import EffectEstimates
+from .variant_io import VariantRecord
 
 
 def write_effect_outputs(
@@ -214,4 +218,141 @@ def write_effect_outputs(
     }
 
 
-__all__ = ["write_effect_outputs"]
+def write_sparse_effect_outputs(
+    *,
+    out_prefix: str,
+    background_effects: EffectEstimates,
+    nuisance_fixed_effects: Sequence[float],
+    sample_ids: Sequence[str],
+    variant_records: Sequence[VariantRecord],
+    support_source_variant_indices: Sequence[int],
+    sparse_effects: Sequence[float],
+    component_source_variant_indices: Sequence[Sequence[int]] | None = None,
+    component_names: Sequence[str] | None = None,
+    component_annotations: Sequence[dict[str, object] | None] | None = None,
+    component_provenance: Sequence[dict[str, object] | None] | None = None,
+) -> dict[str, str]:
+    """Write the complete sparse-alpha + background-BLUP effect model.
+
+    ``background_effects.snp_effects`` contains the infinitesimal effect for
+    each GRM component.  This function maps those values back to source SNP
+    order, adds the sparse fixed effect, and emits one directly usable total
+    effect per source variant.
+    """
+    nuisance = np.asarray(nuisance_fixed_effects, dtype=np.float64).reshape(-1)
+    effects_for_common_outputs = dataclasses.replace(
+        background_effects,
+        fixed_effects=nuisance,
+    )
+    common_paths = write_effect_outputs(
+        out_prefix=out_prefix,
+        effects=effects_for_common_outputs,
+        sample_ids=sample_ids,
+        component_source_variant_indices=component_source_variant_indices,
+        component_names=component_names,
+        component_annotations=component_annotations,
+        component_provenance=component_provenance,
+    )
+
+    background_components = [
+        np.asarray(component, dtype=np.float64).reshape(-1)
+        for component in background_effects.snp_effects
+    ]
+    if component_source_variant_indices is None:
+        if len(background_components) != 1:
+            raise ValueError(
+                "Multi-component sparse effects require source-variant maps."
+            )
+        marker_count = int(background_components[0].size)
+        source_groups = [np.arange(marker_count, dtype=np.int64)]
+    else:
+        source_groups = [
+            np.asarray(group, dtype=np.int64).reshape(-1)
+            for group in component_source_variant_indices
+        ]
+        if len(source_groups) != len(background_components):
+            raise ValueError("Sparse effect component maps and values differ in count.")
+        marker_count = int(sum(group.size for group in source_groups))
+    background = np.zeros(marker_count, dtype=np.float64)
+    component_index = np.full(marker_count, -1, dtype=np.int64)
+    for index, (source_group, values) in enumerate(
+        zip(source_groups, background_components, strict=True)
+    ):
+        if values.size != source_group.size:
+            raise ValueError(
+                f"Background component {index} has {values.size} values for "
+                f"{source_group.size} source variants."
+            )
+        if np.any((source_group < 0) | (source_group >= marker_count)):
+            raise ValueError("Sparse effect source index is outside the genotype range.")
+        if np.any(component_index[source_group] >= 0):
+            raise ValueError("Sparse effect component maps overlap.")
+        background[source_group] = values
+        component_index[source_group] = index
+    if np.any(component_index < 0):
+        raise ValueError("Sparse effect components do not cover every source variant.")
+
+    support = np.asarray(
+        support_source_variant_indices, dtype=np.int64
+    ).reshape(-1)
+    sparse_values = np.asarray(sparse_effects, dtype=np.float64).reshape(-1)
+    if (
+        support.size != sparse_values.size
+        or np.unique(support).size != support.size
+        or np.any((support < 0) | (support >= marker_count))
+        or not np.all(np.isfinite(sparse_values))
+    ):
+        raise ValueError("Sparse fixed effects are not valid source-order values.")
+    sparse = np.zeros(marker_count, dtype=np.float64)
+    sparse[support] = sparse_values
+    total = sparse + background
+
+    table_path = out_prefix + ".sparse_effects.tsv"
+    temporary_path = f"{table_path}.tmp.{os.getpid()}"
+    Path(table_path).parent.mkdir(parents=True, exist_ok=True)
+    record_count = 0
+    with open(temporary_path, "w", encoding="utf-8") as handle:
+        handle.write(
+            "source_snp_index\tcomponent_index\tchrom\tID\tcm\tbp\ta1\ta2"
+            "\tbeta_sparse\tbeta_background\tbeta_total\n"
+        )
+        for source_index, record in enumerate(variant_records):
+            if source_index >= marker_count:
+                raise ValueError("Variant metadata has more rows than genotype effects.")
+            handle.write(
+                f"{source_index}\t{int(component_index[source_index])}\t"
+                f"{record.chrom}\t{record.variant_id}\t{record.cm}\t{record.bp}\t"
+                f"{record.a1}\t{record.a2}\t{sparse[source_index]:.8e}\t"
+                f"{background[source_index]:.8e}\t{total[source_index]:.8e}\n"
+            )
+            record_count += 1
+    if record_count != marker_count:
+        os.remove(temporary_path)
+        raise ValueError(
+            f"Variant metadata has {record_count} rows; expected {marker_count}."
+        )
+    os.replace(temporary_path, table_path)
+
+    metadata_path = out_prefix + ".sparse_effect_metadata.json"
+    metadata = {
+        "schema_version": 1,
+        "analysis_scale": "standardized_input_phenotype",
+        "n_variants": marker_count,
+        "n_sparse_variants": int(support.size),
+        "n_components": len(background_components),
+        "effect_definition": "beta_total = beta_sparse + beta_background",
+        "pcg_rel_res": float(background_effects.pcg_rel_res),
+        "pcg_iters": int(background_effects.pcg_iters),
+        "files": {**common_paths, "sparse_effects": table_path},
+    }
+    with open(metadata_path, "w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    return {
+        **common_paths,
+        "sparse_effects": table_path,
+        "sparse_effect_metadata": metadata_path,
+    }
+
+
+__all__ = ["write_effect_outputs", "write_sparse_effect_outputs"]

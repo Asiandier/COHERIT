@@ -114,24 +114,29 @@ variance update.  Reaching the outer limit is reported as a warning and does
 not invalidate a finite final pair.  If that final update itself is unavailable,
 the most recent complete covariance-aligned pair is returned with a warning.
 The selected lambda/lambda-max ratio is then frozen before the combined
-train+validation refit; the held-out test phenotype is never used for lambda
-selection. Because that ratio is already fixed, each final-refit LASSO block
+train+validation refit. A prediction phenotype is never accepted or read.
+Because that ratio is already fixed, each final-refit LASSO block
 solves only the lambda-max warm-start point and the exact target point, rather
 than recomputing the unused validation grid. The run stops with this
 covariance-aligned LASSO pair and reports
 the COHERIT estimator.
 
-The sparse runner supports one fixed covariance model per run. With no
-`--component-spec` it uses one whole-genome GRM; with a component spec it uses
-that exhaustive, mutually exclusive single-source partition (for example LD2
-or LD4). It does not perform Adaptive-K or covariance-tree search. In either
-case held-out validation R² selects lambda inside every alpha/theta outer
-iteration. The existing `gpu-reml-sparse-validation` orchestrator is the
-single-GRM convenience workflow; lower-level partitioned runs pass the same
-component spec to both stages. The workflow then freezes the selected
-lambda/lambda-max ratio and automatically warm-starts a train+validation final
-refit before evaluating the held-out test samples. The test phenotype is never
-used for lambda selection.
+The production `gpu-reml-sparse` runner has exactly two modes. `fixed` uses one
+whole-genome GRM or an exhaustive user-supplied `--component-spec`. `adaptive`
+starts from K=1, freezes the converged K=1 sparse mean, and tests balanced
+boundaries along one deterministic LD-score ordering. A significant global
+parametric-bootstrap LD-CUSUM score adds the strongest boundary, followed by a
+covariance-only REML refit; this continues until the global split score is no
+longer significant. The selected endpoint partition then receives one full
+validation-lambda alpha/theta refit. Both modes finally freeze the selected
+lambda ratio and automatically warm-refit on training + validation samples.
+
+Adaptive mode accepts an aligned `--ld-score` table with `ID` and `ld_score`
+columns. If it is omitted, the workflow invokes PLINK2 on the training samples,
+computes the pilot-compatible `1 + sum(r²)` unphased-dosage score within the
+configured physical window (1 Mb by default), validates it by variant ID, and
+caches the compact score table. PLINK's large temporary pair table is removed
+after successful conversion.
 
 Sparse-run output semantics are deliberately explicit:
 
@@ -153,6 +158,8 @@ Sparse-run output semantics are deliberately explicit:
   standalone heritability estimator.
 - Sparse prediction emits only the `lasso_*` branch: the Lasso
   fixed-SNP score plus its matched background BLUP.
+- `--compute-effects` emits nuisance effects and one source-order SNP table
+  containing the sparse effect, matched background-BLUP effect, and their sum.
 - Every sparse quadratic and variance component is already on the one analysis
   scale established by input phenotype standardization. The summary retains
   only the input normalization metadata needed to transform external outcomes.
@@ -329,48 +336,61 @@ gpu-reml \
   --out-prefix out/smile_multi
 ```
 
-Single-GRM sparse COHERIT with validation-R² lambda selection and an automatic
-train+validation final refit:
+Fixed single-GRM sparse COHERIT with validation-R² lambda selection and an
+automatic train+validation final refit:
 
 ```bash
-gpu-reml-sparse-validation \
-  --case-id trait_1 \
+gpu-reml-sparse \
+  --mode fixed \
   --bed-prefix /path/to/data \
-  --train-pheno-txt train.pheno \
-  --fit-pheno-txt train_plus_validation.pheno \
+  --pheno-txt train.pheno \
   --validation-pheno-txt validation.pheno \
-  --test-pheno-txt test.pheno \
   --covar-txt covar.txt \
-  --train-keep train.keep \
-  --validation-keep validation.keep \
-  --fit-keep train_plus_validation.keep \
-  --test-keep test.keep \
-  --out-dir out/sparse_single
+  --keep-path train.keep \
+  --validation-keep-path validation.keep \
+  --prediction-bed-prefix /path/to/prediction_data \
+  --prediction-covar-txt prediction.covar \
+  --prediction-keep-path prediction.keep \
+  --compute-effects \
+  --out-prefix out/sparse_single
 ```
 
-For a fixed multi-GRM sparse run, add the same exhaustive component spec to
-the selection and frozen-ratio refit invocations of
-`run_sparse_reml_pipeline.py`:
+The combined phenotype and keep files are constructed automatically from the
+training and validation inputs. They may instead be supplied explicitly with
+`--fit-pheno-txt` and `--fit-keep-path`. A fixed multi-GRM run only adds an
+exhaustive component spec:
 
 ```bash
-python run_sparse_reml_pipeline.py \
+gpu-reml-sparse \
+  --mode fixed \
   --bed-prefix /path/to/data \
   --component-spec components_ld4.npz \
   --pheno-txt train.pheno \
+  --validation-pheno-txt validation.pheno \
   --covar-txt covar.txt \
   --keep-path train.keep \
-  --prediction-bed-prefix /path/to/data \
-  --prediction-covar-txt covar.txt \
-  --prediction-keep-path validation.keep \
-  --sparsity-validation-pheno-txt validation.pheno \
-  --sparsity-validation-out out/ld4.validation.json \
-  --lasso-warm-state-out out/ld4.warm.npz \
-  --out-prefix out/ld4.selection
+  --validation-keep-path validation.keep \
+  --out-prefix out/sparse_ld4
 ```
 
-The final-refit invocation uses the same `--component-spec`, the selected
-`--lasso-fixed-lam-ratio`, the G+1 `--variance-components-init`, and the
-emitted `--lasso-warm-state-in`.
+Adaptive K with an existing LD-score table:
+
+```bash
+gpu-reml-sparse \
+  --mode adaptive \
+  --bed-prefix /path/to/data \
+  --ld-score metadata/ldscore.tsv \
+  --pheno-txt train.pheno \
+  --validation-pheno-txt validation.pheno \
+  --covar-txt covar.txt \
+  --keep-path train.keep \
+  --validation-keep-path validation.keep \
+  --out-prefix out/sparse_adaptive
+```
+
+Omit `--ld-score` to calculate and cache it automatically. Use `--plink2` when
+the executable is not on `PATH`, and `--ld-window-kb` to change the default
+1-Mb physical window.
 
 Continuous-trait marginal GWAS:
 

@@ -964,12 +964,60 @@ def _solve_average_info_bound_qp(
     param_tol = max(float(bound_tol), 1e-10)
     active_mask = float(trial_alpha) * shifted_step <= param_tol
     shifted_step[active_mask] = 0.0
-    step_host = lower_host + shifted_step
-
-    kkt_residual = grad_host - solved_system @ step_host
-    free_mask = ~active_mask
     kkt_scale = max(1.0, float(np.max(np.abs(grad_host), initial=0.0)))
     kkt_tol = max(1e-7, 1e-6 * kkt_scale)
+
+    # ``nnls`` solves the factorized least-squares problem accurately, but the
+    # parameter-bound classification above is intentionally expressed on the
+    # trial step.  A very small positive NNLS coordinate can therefore be
+    # rounded onto the bound even when its dual residual is detectably
+    # positive.  Polish that active set against the original Fisher QP: solve
+    # the free KKT equations exactly, add nonpositive free coordinates to the
+    # bound, and release any bound coordinate with a positive dual violation.
+    # This preserves the certificate instead of weakening its tolerance.
+    for _polish_iteration in range(max(5 * n_param, 1)):
+        free_mask = ~active_mask
+        shifted_step.fill(0.0)
+        if np.any(free_mask):
+            free_system = solved_system[np.ix_(free_mask, free_mask)]
+            free_rhs = shifted_rhs[free_mask]
+            try:
+                free_chol = sla.cho_factor(
+                    free_system,
+                    lower=True,
+                    check_finite=False,
+                )
+                free_solution = sla.cho_solve(
+                    free_chol,
+                    free_rhs,
+                    check_finite=False,
+                )
+            except np.linalg.LinAlgError as error:
+                raise FloatingPointError(
+                    "Failed to polish the NNLS Fisher active set."
+                ) from error
+            shifted_step[free_mask] = free_solution
+            nonpositive_free = free_mask & (shifted_step <= 0.0)
+            if np.any(nonpositive_free):
+                active_mask[nonpositive_free] = True
+                continue
+
+        kkt_residual_shifted = shifted_rhs - solved_system @ shifted_step
+        violating_active = active_mask & (kkt_residual_shifted > kkt_tol)
+        if np.any(violating_active):
+            candidates = np.flatnonzero(violating_active)
+            release = int(candidates[np.argmax(kkt_residual_shifted[candidates])])
+            active_mask[release] = False
+            continue
+        break
+    else:
+        raise FloatingPointError(
+            "NNLS Fisher active-set polish did not converge."
+        )
+
+    step_host = lower_host + shifted_step
+    kkt_residual = grad_host - solved_system @ step_host
+    free_mask = ~active_mask
     free_error = float(np.max(np.abs(kkt_residual[free_mask]), initial=0.0))
     active_error = float(np.max(kkt_residual[active_mask], initial=0.0))
     if free_error > kkt_tol or active_error > kkt_tol:

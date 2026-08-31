@@ -311,6 +311,17 @@ def print_planner_info(
         )
 
 
+def effective_preconditioner_rank_contract(config, fitter) -> dict[str, int]:
+    """Report the rank actually constructed, not only the planner request."""
+    requested = int(getattr(config, "precond_rank", 0) or 0)
+    preconditioner = getattr(fitter, "precond_conf", None)
+    effective = int(getattr(preconditioner, "total_rank", 0) or 0)
+    return {
+        "requested_precond_rank": requested,
+        "precond_rank": effective,
+    }
+
+
 def log_runtime_gpu_memory(plan: PlanResult) -> Optional[dict[str, float]]:
     """Log allocator peaks and compare active use with the planner estimate.
 

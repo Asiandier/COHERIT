@@ -77,6 +77,7 @@ def predict_sparse_branch(
     theta: np.ndarray,
     pcg_tol: float,
     max_pcg_iters: int,
+    background_effects: EffectEstimates | None = None,
 ) -> SparseBranchPrediction:
     """Predict with one branch's own mean, residual and covariance estimate."""
     y = np.asarray(y_train, dtype=np.float64).reshape(-1)
@@ -123,29 +124,43 @@ def predict_sparse_branch(
         )
     residual = y - c_train @ beta_cov - z_train @ beta_active
     theta_dev = jnp.asarray(theta, dtype=jnp.float32)
-    fitter._ensure_projected_core_precond_ready(
-        ops, var_components_init=theta_dev
-    )
-    hv = fitter._make_hv(ops, theta_dev[:-1], theta_dev[-1])
-    precond = fitter._make_effect_precond(ops, theta_dev[:-1], theta_dev[-1])
-    rhs = jnp.asarray(residual[:, None], dtype=jnp.float32)
-    x0 = precond(rhs) if precond is not None else jnp.zeros_like(rhs)
-    sol, rel_res, iters = pcg_solve(
-        hv,
-        rhs,
-        M=precond,
-        tol=float(pcg_tol),
-        maxiter=int(max_pcg_iters),
-        X0=x0,
-    )
-    rel = float(np.asarray(jax.device_get(rel_res)))
-    if not np.isfinite(rel) or rel > float(pcg_tol) * 1.05:
-        raise RuntimeError(
-            f"{name} background-BLUP PCG did not converge: "
-            f"relative residual={rel:.3e}."
+    if background_effects is None:
+        fitter._ensure_projected_core_precond_ready(
+            ops, var_components_init=theta_dev
         )
-    dual = sol[:, 0]
-    snp_effects = fitter._estimate_snp_effects(dual, theta_dev[:-1])
+        hv = fitter._make_hv(ops, theta_dev[:-1], theta_dev[-1])
+        precond = fitter._make_effect_precond(ops, theta_dev[:-1], theta_dev[-1])
+        rhs = jnp.asarray(residual[:, None], dtype=jnp.float32)
+        x0 = precond(rhs) if precond is not None else jnp.zeros_like(rhs)
+        sol, rel_res, iters = pcg_solve(
+            hv,
+            rhs,
+            M=precond,
+            tol=float(pcg_tol),
+            maxiter=int(max_pcg_iters),
+            X0=x0,
+        )
+        rel = float(np.asarray(jax.device_get(rel_res)))
+        if not np.isfinite(rel) or rel > float(pcg_tol) * 1.05:
+            raise RuntimeError(
+                f"{name} background-BLUP PCG did not converge: "
+                f"relative residual={rel:.3e}."
+            )
+        iterations = int(iters)
+        dual = sol[:, 0]
+        snp_effects = fitter._estimate_snp_effects(dual, theta_dev[:-1])
+    else:
+        if len(background_effects.snp_effects) != len(ops.K_mvs):
+            raise ValueError(
+                "Reused background effect components do not match the covariance."
+            )
+        rel = float(background_effects.pcg_rel_res)
+        iterations = int(background_effects.pcg_iters)
+        if not np.isfinite(rel) or rel > float(pcg_tol) * 1.05:
+            raise RuntimeError(
+                f"{name} reused background effects lack a converged PCG solve."
+            )
+        snp_effects = background_effects.snp_effects
     fixed = np.concatenate([beta_cov, beta_active])
     zeros_train = jnp.zeros((n_train,), dtype=jnp.float32)
     effects = EffectEstimates(
@@ -156,7 +171,7 @@ def predict_sparse_branch(
         ),
         snp_effects=snp_effects,
         pcg_rel_res=rel,
-        pcg_iters=int(iters),
+        pcg_iters=iterations,
         y_mean=0.0,
         y_scale=1.0,
     )
@@ -199,7 +214,7 @@ def predict_sparse_branch(
         genetic_score=genetic,
         phenotype_prediction=phenotype,
         pcg_rel_res=rel,
-        pcg_iters=int(iters),
+        pcg_iters=iterations,
     )
 
 

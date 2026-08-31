@@ -63,6 +63,9 @@ cleanup_path = _common_mod.cleanup_path
 make_nonbed_input_fam = _common_mod.make_nonbed_input_fam
 compute_sample_mask = _common_mod.compute_sample_mask
 resolve_cpu_threads = _common_mod.resolve_cpu_threads
+effective_preconditioner_rank_contract = (
+    _common_mod.effective_preconditioner_rank_contract
+)
 
 from bed_reader import open_bed
 
@@ -851,6 +854,7 @@ def main():
                 {
                     "n_samples": int(y_np.shape[0]),
                     "n_covar": int(X_np.shape[1]) if X_np is not None else 0,
+                    **effective_preconditioner_rank_contract(cfg, model),
                     "n_components": n_components_meta,
                     "n_residual_components": (
                         int(admix_weights.shape[1])

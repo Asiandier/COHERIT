@@ -64,6 +64,8 @@ _precond_mod = importlib.import_module(f"{pkg_name}.precond")
 _common_mod = importlib.import_module(f"{pkg_name}.pipeline_common")
 _io_utils_mod = importlib.import_module(f"{pkg_name}.io_utils")
 _component_spec_mod = importlib.import_module(f"{pkg_name}.component_spec")
+_effect_io_mod = importlib.import_module(f"{pkg_name}.effect_io")
+_variant_io_mod = importlib.import_module(f"{pkg_name}.variant_io")
 _sparse_prediction_mod = importlib.import_module(
     f"{pkg_name}.sparse_prediction"
 )
@@ -84,6 +86,8 @@ compute_projected_hinv_vector = _lasso_mod.compute_projected_hinv_vector
 fit_weighted_lasso_with_covariates = _lasso_mod.fit_weighted_lasso_with_covariates
 pcg_solve = _pcg_mod.pcg_solve
 load_component_specs = _component_spec_mod.load_component_specs
+write_sparse_effect_outputs = _effect_io_mod.write_sparse_effect_outputs
+iter_variant_records_for_prefix = _variant_io_mod.iter_variant_records_for_prefix
 predict_sparse_branch = _sparse_prediction_mod.predict_sparse_branch
 predict_sparse_path_partitioned = (
     _sparse_prediction_mod.predict_sparse_path_partitioned
@@ -124,6 +128,9 @@ make_nonbed_input_fam = _common_mod.make_nonbed_input_fam
 compute_sample_mask = _common_mod.compute_sample_mask
 write_keep_file = _common_mod.write_keep_file
 resolve_cpu_threads = _common_mod.resolve_cpu_threads
+effective_preconditioner_rank_contract = (
+    _common_mod.effective_preconditioner_rank_contract
+)
 
 def _bed_count(path: str, attr: str) -> int:
     bed = open_bed(path)
@@ -181,10 +188,37 @@ def _load_lasso_warm_state(
     *,
     grm_index=None,
     n_markers: int | None = None,
-    target_lam_ratio: float,
+    target_lam_ratio: float | None = None,
+    target_path_lam_ratios: np.ndarray | None = None,
 ) -> dict[str, object]:
-    """Load selected alpha and map stable source rows to this cache order."""
-    target_ratio = _canonical_fixed_lam_ratio(float(target_lam_ratio))
+    """Map a certified sparse state into the current GRM cache order.
+
+    A frozen-ratio refit consumes the selected alpha only. A validation fit
+    may additionally reuse a previously certified path prefix, but every row
+    is re-optimized and globally KKT-certified under the new covariance.
+    """
+    if (target_lam_ratio is None) == (target_path_lam_ratios is None):
+        raise ValueError(
+            "Specify exactly one of target_lam_ratio and "
+            "target_path_lam_ratios."
+        )
+    target_ratio = (
+        _canonical_fixed_lam_ratio(float(target_lam_ratio))
+        if target_lam_ratio is not None
+        else None
+    )
+    target_path_ratios = None
+    if target_path_lam_ratios is not None:
+        target_path_ratios = np.asarray(
+            target_path_lam_ratios, dtype=np.float64
+        ).reshape(-1)
+        if (
+            target_path_ratios.size < 1
+            or not np.all(np.isfinite(target_path_ratios))
+            or np.any(target_path_ratios <= 0.0)
+            or np.any(target_path_ratios > 1.0)
+        ):
+            raise ValueError("Target Lasso path ratios are invalid.")
     with np.load(path, allow_pickle=False) as payload:
         required = {
             "lasso_warm_state_schema_version",
@@ -206,8 +240,30 @@ def _load_lasso_warm_state(
         selected_ratio = _canonical_fixed_lam_ratio(
             float(np.asarray(payload["selected_lam_ratio"]).reshape(()))
         )
+        path_marker_indices = None
+        beta_path_source = None
+        saved_path_ratios = None
+        if schema_version == 3:
+            path_required = {
+                "path_marker_indices",
+                "beta_snp_path",
+                "path_lam_ratios",
+            }
+            if not path_required.issubset(payload.files):
+                raise ValueError(
+                    "Schema-3 Lasso warm-state path is incomplete."
+                )
+            path_marker_indices = np.asarray(
+                payload["path_marker_indices"], dtype=np.int64
+            ).reshape(-1)
+            beta_path_source = np.asarray(
+                payload["beta_snp_path"], dtype=np.float64
+            )
+            saved_path_ratios = np.asarray(
+                payload["path_lam_ratios"], dtype=np.float64
+            ).reshape(-1)
 
-    if schema_version not in {1, 2}:
+    if schema_version not in {1, 2, 3}:
         raise ValueError(
             f"Unsupported Lasso warm-state schema: {schema_version}."
         )
@@ -228,11 +284,8 @@ def _load_lasso_warm_state(
         or not np.all(np.isfinite(selected_beta))
     ):
         raise ValueError("Lasso warm-state marker coefficients are invalid.")
-    if not math.isclose(
-        selected_ratio,
-        target_ratio,
-        rel_tol=1e-10,
-        abs_tol=1e-12,
+    if target_ratio is not None and not math.isclose(
+        selected_ratio, target_ratio, rel_tol=1e-10, abs_tol=1e-12
     ):
         raise ValueError(
             "Lasso warm state does not match the frozen lambda ratio."
@@ -246,14 +299,68 @@ def _load_lasso_warm_state(
     order = np.argsort(candidate_unsorted)
     candidate = candidate_unsorted[order]
     selected_beta = selected_beta[order]
-    beta_path = (
-        selected_beta.reshape(1, -1)
-        if math.isclose(target_ratio, 1.0, rel_tol=0.0, abs_tol=1e-12)
-        else np.vstack([np.zeros_like(selected_beta), selected_beta])
-    )
+    reuse_mode = "selected_alpha_for_fixed_ratio"
+    if target_ratio is not None:
+        beta_path = (
+            selected_beta.reshape(1, -1)
+            if math.isclose(target_ratio, 1.0, rel_tol=0.0, abs_tol=1e-12)
+            else np.vstack([np.zeros_like(selected_beta), selected_beta])
+        )
+    else:
+        # Old artifacts, and schema-3 artifacts from a different lambda grid,
+        # still provide a safe selected-alpha initialization. Coordinate
+        # descent and global KKT checks determine the actual new solutions.
+        beta_path = np.repeat(
+            selected_beta.reshape(1, -1),
+            int(target_path_ratios.size),
+            axis=0,
+        )
+        if math.isclose(
+            float(target_path_ratios[0]), 1.0, rel_tol=0.0, abs_tol=1e-12
+        ):
+            beta_path[0, :] = 0.0
+        reuse_mode = "selected_alpha_broadcast_for_validation"
+
+        if schema_version == 3:
+            if (
+                path_marker_indices is None
+                or beta_path_source is None
+                or saved_path_ratios is None
+                or beta_path_source.ndim != 2
+                or beta_path_source.shape
+                != (saved_path_ratios.size, path_marker_indices.size)
+                or np.unique(path_marker_indices).size
+                != path_marker_indices.size
+                or np.any(
+                    (path_marker_indices < 0)
+                    | (path_marker_indices >= marker_count)
+                )
+                or not np.all(np.isfinite(beta_path_source))
+                or not np.all(np.isfinite(saved_path_ratios))
+                or saved_path_ratios.size < 1
+                or saved_path_ratios.size > target_path_ratios.size
+            ):
+                raise ValueError("Schema-3 Lasso warm-state path is invalid.")
+            ratios_match = np.allclose(
+                saved_path_ratios,
+                target_path_ratios[: saved_path_ratios.size],
+                rtol=1e-10,
+                atol=1e-12,
+            )
+            if ratios_match:
+                path_candidate_unsorted = (
+                    path_marker_indices
+                    if grm_index is None
+                    else grm_index.cache_variant_indices(path_marker_indices)
+                )
+                path_order = np.argsort(path_candidate_unsorted)
+                candidate = path_candidate_unsorted[path_order]
+                beta_path = beta_path_source[:, path_order]
+                reuse_mode = "certified_path_prefix_for_validation"
+
     return {
         "candidate": candidate,
-        "support": candidate.copy(),
+        "support": candidate_unsorted[order].copy(),
         "beta_snp_path": beta_path,
         "selected_lam_ratio": selected_ratio,
         "coordinate_system": (
@@ -261,6 +368,7 @@ def _load_lasso_warm_state(
             if schema_version == 1
             else "source_variant_index"
         ),
+        "reuse_mode": reuse_mode,
     }
 
 
@@ -272,8 +380,10 @@ def _write_lasso_warm_state(
     support: np.ndarray,
     selected_beta_snp: np.ndarray,
     selected_lam_ratio: float,
+    beta_snp_path: np.ndarray | None = None,
+    path_lam_ratios: np.ndarray | None = None,
 ) -> dict[str, object]:
-    """Persist only marker coordinates and alpha needed by the final refit."""
+    """Persist selected alpha plus an optional certified path prefix."""
     candidate_indices = np.asarray(candidate, dtype=np.int64).reshape(-1)
     support_indices = np.sort(
         np.asarray(support, dtype=np.int64).reshape(-1)
@@ -315,30 +425,65 @@ def _write_lasso_warm_state(
     source_support = source_support[source_order]
     support_beta = support_beta[source_order]
 
+    full_beta_path = (
+        selected_beta.reshape(1, -1)
+        if beta_snp_path is None
+        else np.asarray(beta_snp_path, dtype=np.float64)
+    )
+    full_path_ratios = (
+        np.asarray([selected_ratio], dtype=np.float64)
+        if path_lam_ratios is None
+        else np.asarray(path_lam_ratios, dtype=np.float64).reshape(-1)
+    )
+    if (
+        full_beta_path.ndim != 2
+        or full_beta_path.shape
+        != (full_path_ratios.size, candidate_indices.size)
+        or full_path_ratios.size < 1
+        or not np.all(np.isfinite(full_beta_path))
+        or not np.all(np.isfinite(full_path_ratios))
+        or np.any(full_path_ratios <= 0.0)
+        or np.any(full_path_ratios > 1.0)
+    ):
+        raise ValueError("Cannot emit an invalid Lasso path warm state.")
+    source_candidate = (
+        candidate_indices.copy()
+        if grm_index is None
+        else grm_index.source_variant_indices(candidate_indices)
+    )
+    path_source_order = np.argsort(source_candidate)
+    source_candidate = source_candidate[path_source_order]
+    full_beta_path = full_beta_path[:, path_source_order]
+
     ensure_parent_dir(path)
     temporary = f"{path}.tmp.{os.getpid()}"
     with open(temporary, "wb") as handle:
         np.savez(
             handle,
             lasso_warm_state_schema_version=np.asarray(
-                1 if grm_index is None else 2, dtype=np.int64
+                3, dtype=np.int64
             ),
             marker_indices=source_support,
             selected_beta_snp=support_beta.astype(np.float32),
             selected_lam_ratio=np.asarray(selected_ratio, dtype=np.float64),
+            path_marker_indices=source_candidate,
+            beta_snp_path=full_beta_path.astype(np.float32),
+            path_lam_ratios=full_path_ratios,
         )
     os.replace(temporary, path)
     return {
         "status": "emitted",
         "path": os.path.abspath(path),
         "marker_count": int(support_indices.size),
+        "path_marker_count": int(candidate_indices.size),
+        "path_rows": int(full_path_ratios.size),
         "selected_lam_ratio": selected_ratio,
         "coordinate_system": (
             "single_grm_marker_index"
             if grm_index is None
             else "source_variant_index"
         ),
-        "reuse_contract": "selection_to_final_refit_only",
+        "reuse_contract": "cross_partition_validation_or_fixed_refit",
     }
 
 # ---------------------------------------------------------------------------
@@ -597,6 +742,7 @@ def _build_prediction_fit_context(
     gpu_budget_bytes: float,
     ring_depth: int,
     component_variant_indices: list[np.ndarray],
+    prediction_keep_path: str | None = None,
 ) -> _PredictionFitContext:
     """Build prediction state using training-only genotype standardization."""
     if len(training_fitter.streamers) != 1:
@@ -622,14 +768,19 @@ def _build_prediction_fit_context(
     else:
         prediction_fam_path = prediction_bed_list[0] + ".fam"
 
+    keep_path = (
+        args.prediction_keep_path
+        if prediction_keep_path is None
+        else prediction_keep_path
+    )
     requested_prediction_ids = None
-    if args.prediction_keep_path:
-        if not os.path.exists(args.prediction_keep_path):
+    if keep_path:
+        if not os.path.exists(keep_path):
             raise SystemExit(
                 "--prediction-keep-path does not exist: "
-                f"{args.prediction_keep_path}"
+                f"{keep_path}"
             )
-        requested_prediction_ids = read_keep_ids(args.prediction_keep_path)
+        requested_prediction_ids = read_keep_ids(keep_path)
     prediction_covar, prediction_ids, prediction_dropped = load_covar_aligned(
         prediction_fam_path,
         args.prediction_covar_txt or None,
@@ -718,6 +869,114 @@ def _build_prediction_fit_context(
     )
 
 
+def _emit_lasso_prediction(
+    *,
+    out_prefix: str,
+    keep_path: str,
+    prediction_context: _PredictionFitContext,
+    prediction_bed_list: list[str],
+    prediction_pgen_prefix: str,
+    input_phenotype_mean: float,
+    input_phenotype_standard_deviation: float,
+    training_fitter,
+    y_train: np.ndarray,
+    train_covar: np.ndarray | None,
+    train_support: np.ndarray,
+    support_indices: np.ndarray,
+    beta_cov: np.ndarray,
+    beta_active: np.ndarray,
+    theta: np.ndarray,
+    pcg_tol: float,
+    max_pcg_iters: int,
+    background_effects=None,
+) -> dict[str, object]:
+    """Predict one cohort from an already fitted alpha/theta pair."""
+    request_metadata = {
+        "estimator_mode": "coherit",
+        "genotype_standardization_source": "training_samples_only",
+        "covariate_transform_source": "training_samples_only",
+        "prediction_keep_path": keep_path or None,
+        "prediction_genotype": {
+            "format": "pgen" if prediction_pgen_prefix else "bed",
+            "prefixes": (
+                [prediction_pgen_prefix]
+                if prediction_pgen_prefix
+                else prediction_bed_list
+            ),
+        },
+        "input_phenotype_standardization": {
+            "mean": float(input_phenotype_mean),
+            "standard_deviation": float(input_phenotype_standard_deviation),
+        },
+    }
+    write_sparse_prediction_status(
+        out_prefix=out_prefix,
+        status="preparing",
+        metadata={
+            **request_metadata,
+            "branch_outputs_emitted": False,
+        },
+    )
+    prediction_ids = prediction_context.sample_ids
+    try:
+        prediction_support = (
+            prediction_context.grm_index.extract_standardized_columns(
+                support_indices
+            ).astype(np.float32, copy=False)
+        )
+        lasso_prediction = predict_sparse_branch(
+            name="lasso",
+            fitter=training_fitter,
+            test_fitter=prediction_context.fitter,
+            y_train=y_train,
+            train_covar=train_covar,
+            test_covar=prediction_context.covar,
+            train_active_geno=train_support,
+            test_active_geno=prediction_support,
+            beta_cov=beta_cov,
+            beta_active=beta_active,
+            theta=theta,
+            pcg_tol=pcg_tol,
+            max_pcg_iters=max_pcg_iters,
+            background_effects=background_effects,
+        )
+    finally:
+        prediction_context.close()
+
+    branch_metadata = {
+        "lasso": {
+            "estimator_valid": True,
+            "output_emitted": True,
+            "invalid_reasons": [],
+            "mean_estimator": "final_weighted_lasso",
+            "covariance_estimator": "lasso_covariate_contrast_reml",
+            "theta": np.asarray(theta, dtype=np.float64).tolist(),
+            "residual": "y-X_beta_cov_lasso-Z_support_beta_lasso",
+            "support_size": int(np.asarray(support_indices).size),
+            "pcg_rel_res": lasso_prediction.pcg_rel_res,
+            "pcg_iters": lasso_prediction.pcg_iters,
+        },
+    }
+    prediction_paths = write_sparse_prediction_outputs(
+        out_prefix=out_prefix,
+        sample_ids=prediction_ids,
+        lasso=lasso_prediction,
+        metadata={
+            **request_metadata,
+            "branch_outputs_emitted": True,
+            "emitted_branches": ["lasso"],
+            "branches": branch_metadata,
+        },
+    )
+    return {
+        "requested": True,
+        "status": "emitted",
+        "n_samples": len(prediction_ids),
+        "emitted_branches": ["lasso"],
+        "paths": prediction_paths,
+    }
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run sparse REML + LASSO pipeline on real genotype data.")
     # Exactly one genotype source must be supplied. It may be partitioned into
@@ -738,19 +997,26 @@ def parse_args() -> argparse.Namespace:
         "--variance-components-init",
         default="",
         help=(
-            "Internal final-refit warm start: JSON array with one value per "
-            "GRM followed by residual variance."
+            "Optional warm start: JSON array with one value per GRM followed "
+            "by residual variance."
         ),
     )
     p.add_argument(
         "--lasso-warm-state-in",
         default="",
-        help=argparse.SUPPRESS,
+        help=(
+            "Optional sparse-state warm start. Validation mode re-optimizes "
+            "and globally KKT-certifies every reused path point."
+        ),
     )
     p.add_argument(
         "--lasso-warm-state-out",
         default="",
-        help=argparse.SUPPRESS,
+        help=(
+            "Write the final globally KKT-certified sparse candidate/alpha "
+            "path state. This can warm-start later validation or frozen-"
+            "lambda fitting under a different GRM partition."
+        ),
     )
     p.add_argument("--pheno-txt", default=env("PHENO_TXT", ""))
     p.add_argument("--covar-txt", default=env("COVAR_TXT", ""))
@@ -775,6 +1041,14 @@ def parse_args() -> argparse.Namespace:
         "--prediction-keep-path",
         default=env("PREDICTION_KEEP_PATH", ""),
         help="Optional IID keep file selecting prediction samples.",
+    )
+    p.add_argument(
+        "--compute-effects",
+        action="store_true",
+        help=(
+            "After the final alpha/theta fit, write nuisance, background, "
+            "sparse-SNP, and total per-SNP effect sizes."
+        ),
     )
     p.add_argument("--keep-path", default=env("KEEP_PATH", ""))
     p.add_argument("--keep-out", default=env("KEEP_OUT", ""))
@@ -806,6 +1080,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--slq-samples", type=int, default=100)
     p.add_argument("--slq-m", type=int, default=int(env("SLQ_M", "50")))
     p.add_argument("--minq-iter", type=int, default=int(env("MINQ_ITER", "50")))
+    p.add_argument(
+        "--export-ai",
+        action="store_true",
+        help=(
+            "Export the last completed covariate-contrast REML average-"
+            "information matrix, score, and restricted log-likelihood in "
+            "the summary."
+        ),
+    )
     p.add_argument(
         "--reml-max-linesearch-trials",
         type=int,
@@ -856,7 +1139,7 @@ def parse_args() -> argparse.Namespace:
         default="",
         help=(
             "Phenotype for the prediction samples used to evaluate the full "
-            "Lasso lambda path. Never supply the held-out test phenotype."
+            "Lasso lambda path."
         ),
     )
     p.add_argument(
@@ -1668,7 +1951,6 @@ def _write_iterative_validation_output(
         "selection_metric": (
             "squared_pearson_correlation_total_phenotype_prediction"
         ),
-        "test_phenotype_used": False,
         "validation_phenotype_path": os.path.abspath(phenotype_path),
         "n_validation_samples": int(
             np.asarray(validation_outcome).reshape(-1).size
@@ -3230,14 +3512,6 @@ def main() -> None:
                 "lasso-fixed-lam-ratio must be at least "
                 "--lasso-lam-min-ratio so it lies on the fitted path."
             )
-    if args.lasso_warm_state_in and not fixed_ratio_refit:
-        raise SystemExit(
-            "--lasso-warm-state-in is valid only for the frozen-ratio final refit."
-        )
-    if args.lasso_warm_state_out and fixed_ratio_refit:
-        raise SystemExit(
-            "--lasso-warm-state-out is valid only for validation selection."
-        )
     supplied_theta_init = args.variance_components_init.strip()
     if fixed_ratio_refit and not (
         args.lasso_warm_state_in and supplied_theta_init
@@ -3245,12 +3519,7 @@ def main() -> None:
         raise SystemExit(
             "The frozen-ratio fit is an internal final-refit stage and "
             "requires both its validation-selected Lasso warm state and "
-            "variance-component warm start. Use gpu-reml-sparse-validation."
-        )
-    if iterative_validation_selection and supplied_theta_init:
-        raise SystemExit(
-            "Variance-component initialization is reserved for the automatic "
-            "final refit."
+            "variance-component warm start. Use gpu-reml-sparse."
         )
 
     sparsity_validation_requested = bool(
@@ -3316,7 +3585,6 @@ def main() -> None:
     prediction_active = bool(
         prediction_bed_list or prediction_pgen_prefix
     )
-
     _n_formats = sum(bool(x) for x in [bed_list, pgen_prefix])
     if _n_formats == 0:
         raise SystemExit(
@@ -3515,8 +3783,10 @@ def main() -> None:
             slq_samples=args.slq_samples, slq_m=args.slq_m,
             precond_rank=plan.precond_rank,
             reml_pcg_tol=args.pcg_tol,
+            effect_pcg_tol=args.pcg_tol,
             response_is_standardized=True,
             unit_variance_components=True,
+            capture_reml_diagnostics=bool(args.export_ai),
             strict_max_linesearch_trials=args.reml_max_linesearch_trials,
             max_pcg_iters=args.max_pcg_iters, pcg_ridge=args.pcg_ridge,
             verbose=args.verbose,
@@ -3535,8 +3805,10 @@ def main() -> None:
             slq_samples=args.slq_samples, slq_m=args.slq_m,
             precond_rank=plan.precond_rank,
             reml_pcg_tol=args.pcg_tol,
+            effect_pcg_tol=args.pcg_tol,
             response_is_standardized=True,
             unit_variance_components=True,
+            capture_reml_diagnostics=bool(args.export_ai),
             strict_max_linesearch_trials=args.reml_max_linesearch_trials,
             max_pcg_iters=args.max_pcg_iters, pcg_ridge=args.pcg_ridge,
             verbose=args.verbose,
@@ -3751,6 +4023,7 @@ def main() -> None:
     final_pair_source = "unavailable"
     final_alignment_warning = None
     last_aligned_pair = None
+    last_covariance_reml_diagnostics = None
     lasso_reml_stop_reason = ""
     penalized_failure_reason = None
 
@@ -3763,10 +4036,21 @@ def main() -> None:
     n_screen = B_screen_np.shape[1]
     lasso_warm_state_in_summary = None
     if args.lasso_warm_state_in:
+        warm_load_args = (
+            {
+                "target_path_lam_ratios": make_lambda_sequence(
+                    1.0,
+                    float(args.lasso_lam_min_ratio),
+                    int(args.lasso_n_lambda),
+                )
+            }
+            if iterative_validation_selection
+            else {"target_lam_ratio": float(args.lasso_fixed_lam_ratio)}
+        )
         warm_state = _load_lasso_warm_state(
             args.lasso_warm_state_in,
             grm_index=grm_index,
-            target_lam_ratio=float(args.lasso_fixed_lam_ratio),
+            **warm_load_args,
         )
         state_candidate = np.asarray(
             warm_state["candidate"], dtype=np.int64
@@ -3786,9 +4070,10 @@ def main() -> None:
                 warm_state["selected_lam_ratio"]
             ),
             "coordinate_system": str(warm_state["coordinate_system"]),
+            "reuse_mode": str(warm_state["reuse_mode"]),
         }
-        sparse_path_performance["final_refit_marker_state_reused"] = True
-        sparse_path_performance["final_refit_warm_marker_count"] = int(
+        sparse_path_performance["cross_fit_marker_state_reused"] = True
+        sparse_path_performance["cross_fit_warm_marker_count"] = int(
             state_candidate.size
         )
         logger.info(
@@ -3796,8 +4081,8 @@ def main() -> None:
             int(state_candidate.size),
         )
     else:
-        sparse_path_performance["final_refit_marker_state_reused"] = False
-        sparse_path_performance["final_refit_warm_marker_count"] = 0
+        sparse_path_performance["cross_fit_marker_state_reused"] = False
+        sparse_path_performance["cross_fit_warm_marker_count"] = 0
 
     final_kkt_certificate = {
         "passed": False,
@@ -5166,6 +5451,29 @@ def main() -> None:
                 expected_components=n_grm + 1,
                 stage=f"outer {outer} Lasso covariate-contrast REML block",
             )
+            if args.export_ai:
+                if (
+                    ml_res.final_ai is None
+                    or ml_res.final_grad is None
+                    or ml_res.final_loglik is None
+                ):
+                    raise RuntimeError(
+                        "--export-ai requested but the sparse covariance REML "
+                        "block did not capture final diagnostics."
+                    )
+                last_covariance_reml_diagnostics = {
+                    "theta": theta_new.tolist(),
+                    "score": np.asarray(
+                        jax.device_get(ml_res.final_grad), dtype=np.float64
+                    ).tolist(),
+                    "average_information_per_sample": np.asarray(
+                        jax.device_get(ml_res.final_ai), dtype=np.float64
+                    ).tolist(),
+                    "restricted_loglik_per_sample": float(
+                        ml_res.final_loglik
+                    ),
+                    "stop_reason": str(lasso_reml_stop_reason),
+                }
             # ``ll_down`` is a converged no-update block: its downhill
             # candidate is rejected and the previous theta is retained.
             variance_blocks_completed += 1
@@ -5517,6 +5825,13 @@ def main() -> None:
                 final_lasso["beta_snp"], dtype=np.float64
             ),
             selected_lam_ratio=float(final_lasso["selected_lam_ratio"]),
+            beta_snp_path=np.asarray(
+                final_lasso["beta_snp_path"], dtype=np.float64
+            ),
+            path_lam_ratios=np.asarray(
+                [row["lam_ratio"] for row in final_lasso["path"]],
+                dtype=np.float64,
+            ),
         )
         logger.info(
             "[Lasso warm] emitted selection state -> %s",
@@ -5530,6 +5845,82 @@ def main() -> None:
     # Preserve the candidate/outside, PCG-compatible KKT diagnostic. Non-finite
     # placeholders from an unavailable check become JSON null.
     final_kkt_certificate_summary = _json_safe_value(final_kkt_certificate)
+
+    # One background-effect solve serves both effect-size output and every
+    # prediction cohort.  The response has already had the fitted nuisance and
+    # sparse means removed, so this is exactly the branch-matched BLUP used by
+    # sparse prediction; no second PCG solve is needed.
+    background_effects = None
+    sparse_effect_summary: dict[str, object] = {
+        "requested": bool(args.compute_effects),
+        "status": "not_requested",
+    }
+    background_effects_requested = bool(args.compute_effects or prediction_active)
+    if lasso_branch_valid and background_effects_requested:
+        background_residual = np.asarray(y_np, dtype=np.float64).copy()
+        if covar_np is not None and beta_cov_lasso.size:
+            background_residual -= (
+                np.asarray(covar_np, dtype=np.float64) @ beta_cov_lasso
+            )
+        if Z_support.shape[1]:
+            background_residual -= (
+                np.asarray(Z_support, dtype=np.float64) @ beta_lasso_active
+            )
+        background_effects = fitter.estimate_effects(
+            jnp.asarray(background_residual, dtype=jnp.float32),
+            var_components=jnp.asarray(theta_lasso_ml, dtype=jnp.float32),
+            covar=None,
+        )
+
+    if args.compute_effects:
+        if not lasso_branch_valid or background_effects is None:
+            raise RuntimeError(
+                "--compute-effects requires a valid final sparse COHERIT branch."
+            )
+        effect_component_specs = (
+            load_component_specs(component_spec_source)
+            if component_spec_source
+            else []
+        )
+        effect_paths = write_sparse_effect_outputs(
+            out_prefix=out_prefix,
+            background_effects=background_effects,
+            nuisance_fixed_effects=beta_cov_lasso,
+            sample_ids=fam_keep,
+            variant_records=iter_variant_records_for_prefix(
+                pgen_prefix if pgen_prefix else bed_list[0],
+                "pgen" if pgen_prefix else "bed",
+            ),
+            support_source_variant_indices=grm_index.source_variant_indices(
+                support
+            ),
+            sparse_effects=beta_lasso_active,
+            component_source_variant_indices=(
+                [np.asarray(group, dtype=np.int64) for group in component_variant_indices]
+                if component_variant_indices
+                else None
+            ),
+            component_names=(
+                [str(spec.name) for spec in effect_component_specs]
+                if effect_component_specs
+                else None
+            ),
+            component_annotations=(
+                [spec.annotation for spec in effect_component_specs]
+                if effect_component_specs
+                else None
+            ),
+            component_provenance=(
+                [spec.provenance for spec in effect_component_specs]
+                if effect_component_specs
+                else None
+            ),
+        )
+        sparse_effect_summary = {
+            "requested": True,
+            "status": "emitted",
+            "paths": effect_paths,
+        }
 
     prediction_summary = {
         "requested": bool(prediction_active),
@@ -5567,7 +5958,6 @@ def main() -> None:
         emitted_branches = ["lasso"] if lasso_branch_valid else []
         prediction_request_metadata = {
             "estimator_mode": "coherit",
-            "test_phenotype_used": False,
             "genotype_standardization_source": "training_samples_only",
             "covariate_transform_source": "training_samples_only",
             "prediction_keep_path": args.prediction_keep_path or None,
@@ -5624,14 +6014,6 @@ def main() -> None:
                     "Lasso branch is invalid."
                 )
         else:
-            write_sparse_prediction_status(
-                out_prefix=out_prefix,
-                status="preparing",
-                metadata={
-                    **prediction_request_metadata,
-                    "branch_outputs_emitted": False,
-                },
-            )
             if prediction_context is None:
                 prediction_context = _build_prediction_fit_context(
                     args=args,
@@ -5645,66 +6027,28 @@ def main() -> None:
                     ring_depth=plan.ring_depth,
                     component_variant_indices=component_variant_indices,
                 )
-            prediction_fitter = prediction_context.fitter
-            prediction_grm_index = prediction_context.grm_index
-            prediction_covar = prediction_context.covar
-            prediction_ids = prediction_context.sample_ids
-            try:
-                prediction_support = (
-                    prediction_grm_index.extract_standardized_columns(
-                        support
-                    ).astype(np.float32, copy=False)
-                )
-                lasso_prediction = predict_sparse_branch(
-                    name="lasso",
-                    fitter=fitter,
-                    test_fitter=prediction_fitter,
-                    y_train=y_np,
-                    train_covar=covar_np,
-                    test_covar=prediction_covar,
-                    train_active_geno=Z_support,
-                    test_active_geno=prediction_support,
-                    beta_cov=beta_cov_lasso,
-                    beta_active=beta_lasso_active,
-                    theta=theta_lasso_ml,
-                    pcg_tol=args.pcg_tol,
-                    max_pcg_iters=args.max_pcg_iters,
-                )
-            finally:
-                prediction_context.close()
-
-            branch_metadata = {
-                "lasso": {
-                    "estimator_valid": True,
-                    "output_emitted": True,
-                    "invalid_reasons": [],
-                    "mean_estimator": "final_weighted_lasso",
-                    "covariance_estimator": "lasso_covariate_contrast_reml",
-                    "theta": theta_lasso_ml.tolist(),
-                    "residual": "y-X_beta_cov_lasso-Z_support_beta_lasso",
-                    "support_size": int(support.size),
-                    "pcg_rel_res": lasso_prediction.pcg_rel_res,
-                    "pcg_iters": lasso_prediction.pcg_iters,
-                },
-            }
-            prediction_paths = write_sparse_prediction_outputs(
+            prediction_summary = _emit_lasso_prediction(
                 out_prefix=out_prefix,
-                sample_ids=prediction_ids,
-                lasso=lasso_prediction,
-                metadata={
-                    **prediction_request_metadata,
-                    "branch_outputs_emitted": True,
-                    "emitted_branches": emitted_branches,
-                    "branches": branch_metadata,
-                },
+                keep_path=args.prediction_keep_path,
+                prediction_context=prediction_context,
+                prediction_bed_list=prediction_bed_list,
+                prediction_pgen_prefix=prediction_pgen_prefix,
+                input_phenotype_mean=input_phenotype_mean,
+                input_phenotype_standard_deviation=(
+                    input_phenotype_standard_deviation
+                ),
+                training_fitter=fitter,
+                y_train=y_np,
+                train_covar=covar_np,
+                train_support=Z_support,
+                support_indices=support,
+                beta_cov=beta_cov_lasso,
+                beta_active=beta_lasso_active,
+                theta=theta_lasso_ml,
+                pcg_tol=args.pcg_tol,
+                max_pcg_iters=args.max_pcg_iters,
+                background_effects=background_effects,
             )
-            prediction_summary = {
-                "requested": True,
-                "status": "emitted",
-                "n_samples": len(prediction_ids),
-                "emitted_branches": emitted_branches,
-                "paths": prediction_paths,
-            }
 
     output_contract = _sparse_output_contract()
     evaluated_path_kkt_certified = bool(
@@ -5734,6 +6078,7 @@ def main() -> None:
         "n_snps_total": grm_index.m_total,
         "n_grms": grm_index.n_grm,
         "m_per_grm": grm_index.m_per_grm.tolist(),
+        **effective_preconditioner_rank_contract(fit_cfg, fitter),
         "component_spec": component_spec_source or None,
         "component_partition_mode": (
             "source_variant_index" if component_variant_indices else None
@@ -5869,9 +6214,19 @@ def main() -> None:
         ),
         "final_kkt_certified": bool(final_kkt_certificate["passed"]),
         "outer_history": history,
+        "sparse_effects": sparse_effect_summary,
         "sparse_prediction": prediction_summary,
         "sparsity_validation": sparsity_validation_summary,
     }
+
+    if args.export_ai:
+        if last_covariance_reml_diagnostics is None:
+            raise RuntimeError(
+                "--export-ai requested but no covariance REML block completed."
+            )
+        summary["covariance_reml_diagnostics"] = (
+            last_covariance_reml_diagnostics
+        )
 
     if supplied_theta_init:
         summary["variance_components_initial"] = theta_initial.tolist()
