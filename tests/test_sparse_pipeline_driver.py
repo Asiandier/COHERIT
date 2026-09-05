@@ -13,6 +13,18 @@ RUN_SPARSE = importlib.import_module(f"{PKG.__name__}.run_sparse_pipeline")
 _prepare_combined_fit_inputs = RUN_SPARSE._prepare_combined_fit_inputs
 
 
+def test_resume_digest_detects_source_changes(monkeypatch, tmp_path: Path) -> None:
+    script = tmp_path / "run_sparse_pipeline.py"
+    script.write_text("# runner\n")
+    algorithm = tmp_path / "adaptive_ld.py"
+    algorithm.write_text("# first version\n")
+    monkeypatch.setattr(RUN_SPARSE, "__file__", str(script))
+    initial = RUN_SPARSE._algorithm_source_digest()
+    assert RUN_SPARSE._algorithm_source_digest() == initial
+    algorithm.write_text("# changed algorithm\n")
+    assert RUN_SPARSE._algorithm_source_digest() != initial
+
+
 def test_combined_fit_inputs_follow_source_sample_order(tmp_path: Path) -> None:
     prefix = tmp_path / "geno"
     (tmp_path / "geno.fam").write_text(

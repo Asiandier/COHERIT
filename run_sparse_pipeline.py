@@ -482,7 +482,7 @@ def _validate_summary(
 ) -> dict[str, Any]:
     path = Path(str(prefix) + ".summary.json")
     summary = read_json(path)
-    if int(summary.get("sparse_output_schema_version", -1)) != 8:
+    if int(summary.get("sparse_output_schema_version", -1)) != 9:
         raise ValueError(f"Unsupported sparse summary schema: {path}")
     if int(summary.get("n_grms", -1)) != int(expected_k):
         raise ValueError(f"Sparse summary K does not match expected K={expected_k}: {path}")
@@ -1018,6 +1018,15 @@ def _resolve_args(args: argparse.Namespace) -> argparse.Namespace:
     return args
 
 
+def _algorithm_source_digest() -> str:
+    """Do not resume old fits/scores after changing their implementation."""
+    digest = hashlib.sha256()
+    for source in sorted(Path(__file__).resolve().parent.glob("*.py")):
+        digest.update(source.name.encode() + b"\0")
+        digest.update(hashlib.sha256(source.read_bytes()).digest())
+    return digest.hexdigest()
+
+
 def _configuration(args: argparse.Namespace) -> dict[str, Any]:
     input_paths = {
         "pheno": args.pheno_txt,
@@ -1026,6 +1035,7 @@ def _configuration(args: argparse.Namespace) -> dict[str, Any]:
         "validation_keep": args.validation_keep_path,
         "fit_pheno": args.fit_pheno_txt,
         "fit_keep": args.fit_keep_path,
+        "low_level_pipeline": args.low_level_pipeline,
     }
     if args.covar_txt:
         input_paths["covar"] = args.covar_txt
@@ -1035,6 +1045,7 @@ def _configuration(args: argparse.Namespace) -> dict[str, Any]:
         input_paths["ld_score"] = args.ld_score
     return {
         "schema_version": 1,
+        "algorithm_source_digest": _algorithm_source_digest(),
         "mode": args.mode,
         "genotype": _genotype_signature(
             args.genotype_prefix, args.genotype_format

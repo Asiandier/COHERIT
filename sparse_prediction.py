@@ -277,6 +277,8 @@ def _predict_sparse_path(
     theta: np.ndarray,
     pcg_tol: float,
     max_pcg_iters: int,
+    hinv_residual_path: np.ndarray | None = None,
+    training_score_path: np.ndarray | None = None,
 ) -> SparsePathPrediction:
     y = np.asarray(y_train, dtype=np.float64).reshape(-1)
     n_train = int(y.size)
@@ -354,29 +356,54 @@ def _predict_sparse_path(
         ops, theta_dev[:-1], theta_dev[-1]
     )
     rhs = jnp.asarray(residual, dtype=jnp.float32)
-    x0 = precond(rhs) if precond is not None else jnp.zeros_like(rhs)
-    dual, rel_res, iters = pcg_solve(
-        hv,
-        rhs,
-        M=precond,
-        tol=float(pcg_tol),
-        maxiter=int(max_pcg_iters),
-        X0=x0,
-    )
-    rel = float(np.asarray(jax.device_get(rel_res)))
-    if not np.isfinite(rel) or rel > float(pcg_tol) * 1.05:
+    # BASIL has already formed V^-1 r and X'V^-1 r for the certified block.
+    # Linear combinations of approximate solves can lose precision, so check
+    # the actual residual and refine only columns that need another solve.
+    if training_score_path is not None and hinv_residual_path is None:
+        raise ValueError("Cached training scores require their matching dual path.")
+    limit = float(pcg_tol) * 1.05
+    if hinv_residual_path is None:
+        dual = precond(rhs) if precond is not None else jnp.zeros_like(rhs)
+        solve_columns = np.arange(n_path, dtype=np.int64)
+    else:
+        initial = np.asarray(hinv_residual_path, dtype=np.float32)
+        if initial.shape != residual.shape or not np.all(np.isfinite(initial)):
+            raise ValueError("Cached dual path must be finite and match the residual.")
+        dual = jnp.asarray(initial)
+        relative = _path_true_relative_residual(hv, dual, rhs)
+        solve_columns = np.flatnonzero(relative > limit)
+    iters = 0
+    if solve_columns.size:
+        refined, reported, iterations = pcg_solve(
+            hv, rhs[:, solve_columns], M=precond, tol=float(pcg_tol),
+            maxiter=int(max_pcg_iters), X0=dual[:, solve_columns],
+        )
+        if not np.isfinite(float(np.asarray(jax.device_get(reported)))):
+            raise RuntimeError("Sparse path background-BLUP PCG returned a non-finite residual.")
+        dual = dual.at[:, solve_columns].set(refined)
+        iters = int(np.asarray(jax.device_get(iterations)))
+    relative = _path_true_relative_residual(hv, dual, rhs) if solve_columns.size else relative
+    rel = float(np.max(relative))
+    if not np.isfinite(rel) or rel > limit:
         raise RuntimeError(
             "Sparse path background-BLUP PCG did not converge: "
             f"relative residual={rel:.3e}."
         )
 
-    xt_dual = np.asarray(
-        jax.device_get(
-            train_streamer.xtv(dual, normalize=False)
-        ),
-        dtype=np.float32,
-    )
     expected_xt_shape = (int(train_streamer.m), n_path)
+    if training_score_path is None:
+        xt_dual = np.asarray(
+            jax.device_get(train_streamer.xtv(dual, normalize=False)), dtype=np.float32
+        )
+    else:
+        xt_dual = np.asarray(training_score_path, dtype=np.float32).copy()
+        if xt_dual.shape != expected_xt_shape or not np.all(np.isfinite(xt_dual)):
+            raise ValueError("Cached training scores must be finite and match the marker/path layout.")
+        if solve_columns.size:
+            xt_dual[:, solve_columns] = np.asarray(
+                jax.device_get(train_streamer.xtv(dual[:, solve_columns], normalize=False)),
+                dtype=np.float32,
+            )
     if xt_dual.shape != expected_xt_shape:
         raise RuntimeError(
             f"{xt_shape_label} X'V^-1 residual path has the wrong shape: "
@@ -451,6 +478,17 @@ def _predict_sparse_path(
     )
 
 
+def _path_true_relative_residual(hv, dual, rhs) -> np.ndarray:
+    error = hv(dual) - rhs
+    relative = jnp.linalg.norm(error, axis=0) / jnp.maximum(
+        jnp.linalg.norm(rhs, axis=0), jnp.finfo(rhs.dtype).tiny
+    )
+    values = np.asarray(jax.device_get(relative), dtype=np.float64)
+    if not np.all(np.isfinite(values)):
+        raise RuntimeError("Non-finite true residual in sparse path prediction.")
+    return values
+
+
 def predict_sparse_path_partitioned(
     *,
     fitter,
@@ -465,6 +503,8 @@ def predict_sparse_path_partitioned(
     theta: np.ndarray,
     pcg_tol: float,
     max_pcg_iters: int,
+    hinv_residual_path: np.ndarray | None = None,
+    training_score_path: np.ndarray | None = None,
 ) -> SparsePathPrediction:
     """Predict a Lasso path for one source partitioned into multiple GRMs."""
     train_streamer = getattr(fitter, "_partitioned_streamer", None)
@@ -501,6 +541,8 @@ def predict_sparse_path_partitioned(
         theta=theta,
         pcg_tol=pcg_tol,
         max_pcg_iters=max_pcg_iters,
+        hinv_residual_path=hinv_residual_path,
+        training_score_path=training_score_path,
     )
 
 
@@ -518,6 +560,8 @@ def predict_sparse_path_single_grm(
     theta: np.ndarray,
     pcg_tol: float,
     max_pcg_iters: int,
+    hinv_residual_path: np.ndarray | None = None,
+    training_score_path: np.ndarray | None = None,
 ) -> SparsePathPrediction:
     """Predict an entire Lasso path in one PCG and one genotype pass.
 
@@ -574,6 +618,8 @@ def predict_sparse_path_single_grm(
         theta=theta_arr,
         pcg_tol=pcg_tol,
         max_pcg_iters=max_pcg_iters,
+        hinv_residual_path=hinv_residual_path,
+        training_score_path=training_score_path,
     )
 
 

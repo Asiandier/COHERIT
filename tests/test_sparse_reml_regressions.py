@@ -712,7 +712,7 @@ def test_coherit_guard_accepts_only_a_certified_finite_estimator():
 def test_sparse_output_contract_is_coherit_only():
     contract = SPARSE._sparse_output_contract()
 
-    assert contract["sparse_output_schema_version"] == 8
+    assert contract["sparse_output_schema_version"] == 9
     assert contract["estimator_mode"] == "coherit"
     assert contract["computed_estimators"] == ["h2_chive"]
     assert contract["selected_snp_columns"][-1] == "beta_lasso"
@@ -958,6 +958,26 @@ def test_outer_convergence_uses_absolute_coherit_h2_change():
     )
     assert converged is False
     assert change > 1e-2
+
+
+@pytest.mark.parametrize(
+    "provisional,h2_stable,effect_stable,outer,expected",
+    [
+        (True, True, True, 3, "converged"),
+        (True, True, True, 20, "converged"),
+        (True, False, True, 3, "continue"),
+        (True, True, False, 3, "continue"),
+        (True, False, True, 20, "outer_max"),
+        (False, True, True, 20, "outer_max"),
+    ],
+)
+def test_alignment_must_verify_the_returned_state(
+    provisional, h2_stable, effect_stable, outer, expected
+):
+    assert SPARSE._alignment_action(
+        provisional_convergence=provisional, h2_stable=h2_stable,
+        effect_stable=effect_stable, outer=outer, outer_max=20,
+    ) == expected
 
 
 def test_outer_coherit_h2_matches_final_chive_functional():

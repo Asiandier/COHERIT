@@ -108,9 +108,11 @@ The sparse pipeline standardizes the phenotype once at entry and uses that
 single analysis scale throughout every LASSO, REML, CHIVE, and prediction step.
 The outer loop stops when both the complete fitted mean and primary COHERIT
 heritability stabilize, or after the configured maximum number of updates. It
-then performs exactly one final validation-selected LASSO update at the
-returned covariance, without another
-variance update.  Reaching the outer limit is reported as a warning and does
+then checks a covariance-aligned LASSO update against the same tolerances
+(fitted mean `0.05`, absolute h² change `0.01`). If alignment breaks stability
+and the update budget remains, that LASSO is reused in the next variance update.
+Only a stable final aligned pair is labelled converged.
+Reaching the outer limit is reported as a warning and does
 not invalidate a finite final pair.  If that final update itself is unavailable,
 the most recent complete covariance-aligned pair is returned with a warning.
 The selected lambda/lambda-max ratio is then frozen before the combined
@@ -127,7 +129,9 @@ starts from K=1, freezes the converged K=1 sparse mean, and tests balanced
 boundaries along one deterministic LD-score ordering. A significant global
 parametric-bootstrap LD-CUSUM score adds the strongest boundary, followed by a
 covariance-only REML refit; this continues until the global split score is no
-longer significant. The selected endpoint partition then receives one full
+longer significant, or no candidate has identifiable efficient information.
+Non-finite score inputs are errors, not evidence for splitting.
+The selected endpoint partition then receives one full
 validation-lambda alpha/theta refit. Both modes finally freeze the selected
 lambda ratio and automatically warm-refit on training + validation samples.
 
@@ -142,8 +146,18 @@ Sparse-run output semantics are deliberately explicit:
 
 - `estimator_mode` is `coherit` and `computed_estimators` contains only
   `h2_chive`.
-- New sparse runs use output schema version 8. Raw/standardized duplicate
+- New sparse runs use output schema version 9. Raw/standardized duplicate
   estimator fields and downstream phenotype-scale conversions no longer exist.
+- In each `outer_update` history record, `theta`, `coherit_h2`, and validation
+  predictive R² describe the same selected LASSO state. The subsequent covariance
+  update is recorded separately as `theta_after_variance_update` and
+  `coherit_h2_after_variance_update`; its h² convergence fields use the
+  `variance_update_` prefix. The validation audit also records the aligned h².
+- BASIL validation reuses its training dual and marker scores after a true
+  residual check; only inaccurate columns are refined. Fixed-K variance blocks
+  reuse response-independent REML probe products and single-GRM Lanczos work.
+  These caches do not cross sample sets or GRM partitions. Resuming a pipeline
+  also checks a source-code digest; changed code requires a fresh work directory.
 - `var_components_lasso_ml` contains one variance contribution per fixed GRM
   followed by the residual variance. Standardized component GRMs use the
   unit-mean-diagonal sparse-COHERIT contract.

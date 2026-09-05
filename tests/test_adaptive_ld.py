@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 
 import numpy as np
+import pytest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PARENT = os.path.dirname(REPO_ROOT)
@@ -65,6 +66,55 @@ def test_efficient_score_statistics_returns_global_bootstrap_gate() -> None:
     assert {row["boundary_position"] for row in rows} == {10, 20}
     assert rows[0]["boundary_position"] == 10
     assert 0.0 < diagnostics["global_sup_score_p_value"] <= 1.0
+
+
+@pytest.mark.parametrize("kind", ["zero", "nuisance_span", "empty"])
+def test_unidentifiable_contrasts_cannot_trigger_a_split(kind) -> None:
+    rng = np.random.default_rng(42)
+    nuisance = rng.normal(size=(2, 200))
+    contrast = (
+        np.zeros((1, 200)) if kind == "zero" else
+        (2 * nuisance[0] - nuisance[1])[None, :]
+    )
+    if kind == "empty":
+        contrast = np.empty((0, 200))
+    rows, diagnostics = efficient_score_statistics(
+        np.vstack([nuisance, contrast]), nuisance_count=2,
+        boundary_positions=np.arange(contrast.shape[0]),
+    )
+    assert rows == []
+    assert diagnostics["global_sup_score_p_value"] == 1.0
+    assert diagnostics["global_sup_score"] == 0.0
+
+
+def test_degenerate_candidate_does_not_change_valid_family_calibration() -> None:
+    rng = np.random.default_rng(33)
+    base = rng.normal(size=(3, 200))
+    base[2, 0] += 6
+    expected, calibration = efficient_score_statistics(
+        base, nuisance_count=2, boundary_positions=np.array([1])
+    )
+    actual, with_degenerate = efficient_score_statistics(
+        np.vstack([base, base[0] + base[1], np.zeros(200)]),
+        nuisance_count=2, boundary_positions=np.array([1, 2, 3]),
+    )
+    assert actual == expected
+    assert with_degenerate == calibration
+    scaled = base.copy()
+    scaled[2] *= 1e-12
+    rows, diagnostics = efficient_score_statistics(
+        scaled, nuisance_count=2, boundary_positions=np.array([1])
+    )
+    assert len(rows) == 1
+    assert diagnostics["global_sup_score_p_value"] == calibration["global_sup_score_p_value"]
+
+
+@pytest.mark.parametrize("bad", [np.nan, np.inf])
+def test_score_calibration_rejects_nonfinite_input(bad) -> None:
+    values = np.zeros((3, 200))
+    values[2, 0] = bad
+    with pytest.raises(ValueError, match="finite quadratics"):
+        efficient_score_statistics(values, nuisance_count=2, boundary_positions=np.array([1]))
 
 
 def test_reml_projector_profiles_covariates_without_explicit_gls_residual() -> None:

@@ -1318,6 +1318,20 @@ def _heritability_converged(
     ), float(change)
 
 
+def _alignment_action(
+    *,
+    provisional_convergence: bool,
+    h2_stable: bool,
+    effect_stable: bool,
+    outer: int,
+    outer_max: int,
+) -> str:
+    """Certify the returned iterate, or reuse its Lasso in another update."""
+    if provisional_convergence and h2_stable and effect_stable:
+        return "converged"
+    return "outer_max" if outer >= outer_max else "continue"
+
+
 def _accepted_reml_theta(
     fit_result,
     *,
@@ -1327,9 +1341,9 @@ def _accepted_reml_theta(
     """Return a valid, converged REML state.
 
     ``fit_reml`` returns the last accepted parameter vector when all
-    line-search candidates are downhill.  ``ll_down`` therefore represents a
-    converged no-update state: the current candidate is rejected while the
-    previous accepted parameter vector is retained.
+    line-search candidates are downhill. ``ll_down`` is an accepted terminal
+    state: its rejected trial is discarded, but earlier accepted updates in
+    the same covariance block are retained.
     """
     theta = np.asarray(fit_result.var_components, dtype=np.float64).reshape(-1)
     history = list(fit_result.history)
@@ -1751,7 +1765,7 @@ def _materialize_validation_selected_lasso(
             "support_size": int(active_idx.size),
             **selected_metric,
         },
-        "path_prediction_pcg_reported_res": float(path_prediction_pcg_res),
+        "path_prediction_pcg_true_res": float(path_prediction_pcg_res),
         "path_prediction_pcg_iters": int(path_prediction_pcg_iters),
         "path": merged_path,
     }
@@ -1841,6 +1855,8 @@ def _evaluate_lasso_path_on_validation(
     beta_snp_path: np.ndarray,
     theta: np.ndarray,
     validation_outcome: np.ndarray,
+    hinv_residual_path: np.ndarray | None = None,
+    training_score_path: np.ndarray | None = None,
 ) -> dict[str, object]:
     """Evaluate one already-certified coefficient block on validation data."""
     validation_candidate = (
@@ -1865,6 +1881,8 @@ def _evaluate_lasso_path_on_validation(
         theta=theta,
         pcg_tol=float(args.pcg_tol),
         max_pcg_iters=int(args.max_pcg_iters),
+        hinv_residual_path=hinv_residual_path,
+        training_score_path=training_score_path,
     )
     return {
         "metrics": evaluate_prediction_path(
@@ -1947,7 +1965,7 @@ def _write_iterative_validation_output(
         ),
     }
     payload = {
-        "schema_version": 3,
+        "schema_version": 4,
         "selection_role": "inside_every_alpha_theta_outer_iteration",
         "selection_metric": (
             "predictive_r2_one_minus_sse_over_sst_total_phenotype_prediction"
@@ -2073,7 +2091,7 @@ def _coherit_estimator_guard(
 def _sparse_output_contract() -> dict[str, object]:
     """Return the fixed output contract for the sole COHERIT mode."""
     return {
-        "sparse_output_schema_version": 8,
+        "sparse_output_schema_version": 9,
         "estimator_mode": "coherit",
         "computed_estimators": ["h2_chive"],
         "selected_snp_columns": [
@@ -2657,6 +2675,7 @@ def _fit_complete_weighted_lasso_path_basil(
                 if previous_solution is not None:
                     missing_warm[:, column] = previous_solution
                     warm_hits += 1
+            candidate_pcg_started = time.perf_counter()
             solved_missing, solved_diagnostic = _solve_hinv_columns_batched(
                 hv=hv,
                 precond=precond,
@@ -2668,6 +2687,10 @@ def _fit_complete_weighted_lasso_path_basil(
                 stage=(
                     f"outer {outer} BASIL iteration {basil_iteration} candidate"
                 ),
+            )
+            sparse_path_performance["candidate_hinv_pcg_seconds"] = (
+                sparse_path_performance.get("candidate_hinv_pcg_seconds", 0.0)
+                + time.perf_counter() - candidate_pcg_started
             )
             pcg_diagnostic.update(solved_diagnostic)
             pcg_diagnostic["warm_start_columns"] = int(warm_hits)
@@ -2890,6 +2913,12 @@ def _fit_complete_weighted_lasso_path_basil(
                     ],
                     dtype=np.float64,
                 ),
+                hinv_residual_path=hinv_residual_path[
+                    :, boundary_offset : boundary_offset + n_new_valid
+                ],
+                training_score_path=path_score_signed[
+                    :, boundary_offset : boundary_offset + n_new_valid
+                ],
             )
             validation_seconds = float(
                 time.perf_counter() - validation_started
@@ -3788,6 +3817,7 @@ def main() -> None:
             response_is_standardized=True,
             unit_variance_components=True,
             capture_reml_diagnostics=bool(args.export_ai),
+            cache_reml_setup=True,
             strict_max_linesearch_trials=args.reml_max_linesearch_trials,
             max_pcg_iters=args.max_pcg_iters, pcg_ridge=args.pcg_ridge,
             verbose=args.verbose,
@@ -3810,6 +3840,7 @@ def main() -> None:
             response_is_standardized=True,
             unit_variance_components=True,
             capture_reml_diagnostics=bool(args.export_ai),
+            cache_reml_setup=True,
             strict_max_linesearch_trials=args.reml_max_linesearch_trials,
             max_pcg_iters=args.max_pcg_iters, pcg_ridge=args.pcg_ridge,
             verbose=args.verbose,
@@ -4019,6 +4050,7 @@ def main() -> None:
     outer_converged = False
     outer_stop_reason = "outer_max"
     final_alignment_pending = False
+    provisional_convergence = False
     final_alignment_completed = False
     final_pair_available = False
     final_pair_source = "unavailable"
@@ -4254,6 +4286,8 @@ def main() -> None:
                     train_candidate,
                     beta_cov_path,
                     beta_snp_path,
+                    hinv_residual_path,
+                    training_score_path,
                 ):
                     return _evaluate_lasso_path_on_validation(
                         args=args,
@@ -4267,6 +4301,8 @@ def main() -> None:
                         beta_snp_path=beta_snp_path,
                         theta=theta,
                         validation_outcome=validation_outcome,
+                        hinv_residual_path=hinv_residual_path,
+                        training_score_path=training_score_path,
                     )
 
                 basil_result = _fit_complete_weighted_lasso_path_basil(
@@ -4481,6 +4517,7 @@ def main() -> None:
                         if previous is not None:
                             missing_warm[:, column] = previous
                             warm_hits += 1
+                    candidate_pcg_started = time.perf_counter()
                     solved_missing, solve_diagnostic = (
                         _solve_hinv_columns_batched(
                             hv=hv,
@@ -4501,6 +4538,10 @@ def main() -> None:
                         )
                     )
                     candidate_pcg.update(solve_diagnostic)
+                    sparse_path_performance["candidate_hinv_pcg_seconds"] = (
+                        sparse_path_performance.get("candidate_hinv_pcg_seconds", 0.0)
+                        + time.perf_counter() - candidate_pcg_started
+                    )
                     candidate_pcg["warm_start_columns"] = int(warm_hits)
                     candidate_pcg["reused_within_outer_columns"] = int(
                         reused_hinv_columns
@@ -5300,6 +5341,8 @@ def main() -> None:
                 final_pair_available = True
                 final_pair_source = "last_complete_pair"
                 final_alignment_warning = str(penalized_block_failure)
+                outer_converged = False
+                outer_stop_reason = "final_alignment_failed"
                 history.append(
                     {
                         "outer": outer,
@@ -5385,46 +5428,68 @@ def main() -> None:
             beta_snp=beta_snp_current,
         )
         fixed_mean_current = np.asarray(y_np, dtype=np.float64) - residual
+        sparse_mean_current = fixed_mean_current.copy()
+        if covar_np is not None and covar_np.size and beta_cov_current.size:
+            sparse_mean_current -= np.asarray(covar_np, dtype=np.float64) @ beta_cov_current
+        selected_h2, outer_q_sparse = _outer_coherit_h2_from_fitted_sparse_mean(
+            sparse_mean_current,
+            residual,
+            background_genetic_variance=_background_genetic_variance(theta),
+            residual_variance=float(theta[-1]),
+        )
+        selected_validation_r2 = (
+            float(lasso["validation_selection"]["selected"]["predictive_r2"])
+            if lasso.get("validation_selection") is not None else None
+        )
+        # Every score-bearing record describes alpha and its actual covariance.
+        if iterative_validation_selection:
+            iterative_validation_trace[-1].update(
+                coherit_h2=float(selected_h2), q_sparse=float(outer_q_sparse)
+            )
 
-        if not final_alignment:
-            last_aligned_pair = {
-                "candidate": candidate.copy(),
-                "lasso": lasso,
-                "support": support_new.copy(),
-                "theta": theta.copy(),
-                "kkt": dict(accepted_kkt_record),
-            }
-
-        # Exactly one final selected-Lasso update aligns alpha with the
-        # covariance returned by the outer loop. No variance update follows it.
+        # Alignment can change alpha and h2. Only the returned state may be
+        # labelled converged; a failed check reuses this Lasso for the next
+        # covariance update instead of solving the same path a second time.
         if final_alignment:
-            support = support_new
-            final_candidate = candidate
-            final_lasso = lasso
-            final_alignment_completed = True
-            final_pair_available = True
-            final_pair_source = "final_covariance_lasso"
-            final_kkt_certificate = dict(accepted_kkt_record)
+            alignment_effect_rel = _relative_fitted_mean_change(
+                fixed_mean_current, previous_fixed_mean, y_np
+            )
+            alignment_h2_stable, alignment_h2_change = _heritability_converged(
+                selected_h2, previous_outer_h2, abs_tol=float(args.h2_abs_tol)
+            )
+            alignment_effect_stable = bool(
+                np.isfinite(alignment_effect_rel)
+                and alignment_effect_rel <= float(args.effect_rel_tol)
+            )
+            alignment_action = _alignment_action(
+                provisional_convergence=provisional_convergence,
+                h2_stable=alignment_h2_stable,
+                effect_stable=alignment_effect_stable,
+                outer=outer,
+                outer_max=int(args.outer_max),
+            )
             history.append(
                 {
                     "outer": outer,
-                    "stage": "final_covariance_lasso",
+                    "stage": (
+                        "covariance_alignment_check" if alignment_action == "continue"
+                        else "final_covariance_lasso"
+                    ),
                     "theta": theta.tolist(),
+                    "coherit_h2": float(selected_h2),
+                    "q_sparse": float(outer_q_sparse),
+                    "h2_abs_change": float(alignment_h2_change),
+                    "h2_stable": bool(alignment_h2_stable),
+                    "effect_rel": float(alignment_effect_rel),
+                    "effect_stable": bool(alignment_effect_stable),
+                    "alignment_action": alignment_action,
                     "support_size": int(support_new.size),
                     "lam": float(lasso["lam"]),
                     "lam_ratio": float(lasso["selected_lam_ratio"]),
                     "lambda_selection_method": str(
                         lasso["selection_method"]
                     ),
-                    "validation_predictive_r2": (
-                        float(
-                            lasso["validation_selection"]["selected"][
-                                "predictive_r2"
-                            ]
-                        )
-                        if lasso.get("validation_selection") is not None
-                        else None
-                    ),
+                    "validation_predictive_r2": selected_validation_r2,
                     "kkt_certified": True,
                     "kkt_trace": kkt_trace,
                     "final_alignment": True,
@@ -5432,13 +5497,37 @@ def main() -> None:
                 }
             )
             logger.info(
-                "[INFO] final covariance-aligned %s-selected Lasso completed "
-                "after %s outer variance updates.",
-                str(lasso["selection_method"]),
-                outer,
+                "[alignment after outer %s] h2=%.6f h2_change=%.3e "
+                "effect_rel=%.3e action=%s",
+                outer, selected_h2, alignment_h2_change,
+                alignment_effect_rel, alignment_action,
             )
-            break
+            if alignment_action != "continue":
+                support = support_new
+                final_candidate = candidate
+                final_lasso = lasso
+                final_alignment_completed = True
+                final_pair_available = True
+                final_pair_source = "final_covariance_lasso"
+                final_kkt_certificate = dict(accepted_kkt_record)
+                outer_converged = alignment_action == "converged"
+                outer_stop_reason = alignment_action
+                break
+            outer += 1
+            final_alignment = False
+            provisional_convergence = False
+            if iterative_validation_selection:
+                iterative_validation_trace[-1].update(
+                    outer=int(outer), stage="outer_update", final_alignment=False
+                )
 
+        last_aligned_pair = {
+            "candidate": candidate.copy(), "lasso": lasso,
+            "support": support_new.copy(), "theta": theta.copy(),
+            "kkt": dict(accepted_kkt_record),
+        }
+
+        covariance_started = time.perf_counter()
         try:
             ml_res = _fit_covariate_contrast_residual_reml(
                 fitter,
@@ -5475,9 +5564,13 @@ def main() -> None:
                     ),
                     "stop_reason": str(lasso_reml_stop_reason),
                 }
-            # ``ll_down`` is a converged no-update block: its downhill
-            # candidate is rejected and the previous theta is retained.
+            # ``ll_down`` rejects its last trial, preserving the last accepted
+            # theta, including any earlier accepted steps in this block.
             variance_blocks_completed += 1
+            sparse_path_performance["covariance_update_seconds"] = (
+                sparse_path_performance.get("covariance_update_seconds", 0.0)
+                + time.perf_counter() - covariance_started
+            )
         except (FloatingPointError, RuntimeError, ValueError) as error:
             penalized_failure_reason = str(error)
             outer_stop_reason = "covariate_contrast_reml_failed"
@@ -5521,19 +5614,6 @@ def main() -> None:
             np.isfinite(effect_rel)
             and effect_rel <= float(args.effect_rel_tol)
         )
-        sparse_mean_current = np.asarray(
-            fixed_mean_current,
-            dtype=np.float64,
-        ).copy()
-        if (
-            covar_np is not None
-            and covar_np.size > 0
-            and beta_cov_current.size > 0
-        ):
-            sparse_mean_current -= (
-                np.asarray(covar_np, dtype=np.float64)
-                @ beta_cov_current
-            )
         outer_h2, outer_q_sparse = (
             _outer_coherit_h2_from_fitted_sparse_mean(
                 sparse_mean_current,
@@ -5557,34 +5637,24 @@ def main() -> None:
             "pcg_screen_res": float(np.asarray(res_screen)),
             "pcg_all_iters": int(it_all),
             "pcg_all_res": float(np.asarray(res_all)),
-            "theta": theta_new.tolist(),
+            "theta": theta.tolist(),
+            "theta_after_variance_update": theta_new.tolist(),
             "support_size": int(support_new.size),
             "effect_rel": float(effect_rel),
             "effect_stable": bool(effect_stable),
-            "coherit_h2": float(outer_h2),
+            "coherit_h2": float(selected_h2),
+            "coherit_h2_after_variance_update": float(outer_h2),
             "q_sparse": float(outer_q_sparse),
-            "h2_abs_change": float(h2_abs_change),
-            "h2_stable": bool(h2_stable),
+            "variance_update_h2_abs_change": float(h2_abs_change),
+            "variance_update_h2_stable": bool(h2_stable),
             "lam": float(lasso["lam"]),
             "lam_ratio": float(lasso["selected_lam_ratio"]),
             "lambda_selection_method": str(lasso["selection_method"]),
-            "validation_predictive_r2": (
-                float(
-                    lasso["validation_selection"]["selected"][
-                        "predictive_r2"
-                    ]
-                )
-                if lasso.get("validation_selection") is not None
-                else None
-            ),
+            "validation_predictive_r2": selected_validation_r2,
             "kkt_certified": bool(certified_kkt),
             "kkt_trace": kkt_trace,
             "final_alignment": False,
-            "variance_update": (
-                "covariate_contrast_residual_reml_no_update"
-                if lasso_reml_stop_reason == "ll_down"
-                else "covariate_contrast_residual_reml"
-            ),
+            "variance_update": "covariate_contrast_residual_reml",
             "variance_stop_reason": lasso_reml_stop_reason,
             "variance_step_rejected": bool(
                 lasso_reml_stop_reason == "ll_down"
@@ -5594,7 +5664,8 @@ def main() -> None:
         logger.info(
             "[outer %s] pcg_screen=%s pcg_all=%s cand=%s active=%s "
             "kkt_rounds=%s lam=%.3e validation_predictive_R2=%s h2=%.6f "
-            "h2_change=%.3e effect_rel=%.3e iter_time=%.1fs",
+            "h2_after_variance_update=%.6f variance_update_h2_change=%.3e "
+            "effect_rel=%.3e iter_time=%.1fs",
             outer,
             int(it_screen),
             int(it_all),
@@ -5612,6 +5683,7 @@ def main() -> None:
                 if lasso.get("validation_selection") is not None
                 else "fixed"
             ),
+            selected_h2,
             outer_h2,
             h2_abs_change,
             effect_rel,
@@ -5626,12 +5698,11 @@ def main() -> None:
         previous_outer_h2 = float(outer_h2)
 
         if h2_stable and effect_stable:
-            outer_converged = True
-            outer_stop_reason = "converged"
+            provisional_convergence = True
             final_alignment_pending = True
             logger.info(
-                "[INFO] outer convergence reached at update %s; running one "
-                "final covariance-aligned %s-selected Lasso.",
+                "[INFO] provisional convergence at update %s; checking "
+                "the covariance-aligned %s-selected Lasso.",
                 outer,
                 str(lasso["selection_method"]),
             )
@@ -5646,8 +5717,7 @@ def main() -> None:
                 str(lasso["selection_method"]),
             )
     # Freeze the primary COHERIT branch.  The final Lasso and theta now come
-    # from the same covariance.  A selected-support refit is an explicit,
-    # downstream comparison and is never part of the default estimator.
+    # from the same covariance, with convergence checked on this returned pair.
     theta_lasso_ml = np.asarray(theta, dtype=np.float64).copy()
     lasso_ml_outer_converged = bool(outer_converged)
     theta_lasso_to_lasso_ml_rel = _max_rel_change(
@@ -5676,7 +5746,10 @@ def main() -> None:
     outer_convergence_warning = (
         None
         if lasso_ml_outer_converged or not alpha_theta_pair_usable
-        else "outer_max_reached_before_change_tolerances"
+        else (
+            "outer_max_reached_before_change_tolerances"
+            if outer_stop_reason == "outer_max" else outer_stop_reason
+        )
     )
 
     # ---- Output results ----

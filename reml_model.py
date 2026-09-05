@@ -24,7 +24,7 @@ from .precond import (
     make_precond,
     scalar_diag_from_precond_conf,
 )
-from .reml import fit_reml, standardize_response
+from .reml import REMLProbeCache, fit_reml, standardize_response
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +79,7 @@ class FitConfig:
     verbose: bool = True
     gpu_budget_bytes: float | None = None
     capture_reml_diagnostics: bool = False
+    cache_reml_setup: bool = False
 
 
 @dataclasses.dataclass
@@ -399,6 +400,8 @@ class InfinitesimalREMLFitter:
 
     def __init__(self, cfg: FitConfig):
         self.cfg = cfg
+        self._reml_fit_setup = None
+        self._reml_probe_cache = REMLProbeCache()
         t0 = time.time() if cfg.verbose else None
         if cfg.verbose:
             logger.info("build streamers start @ %s", datetime.now().isoformat(timespec='seconds'))
@@ -1812,6 +1815,8 @@ class InfinitesimalREMLFitter:
         )
 
     def close(self) -> None:
+        self._reml_fit_setup = None
+        self._reml_probe_cache = REMLProbeCache()
         for st in getattr(self, "streamers", ()):
             close_streamer = getattr(st, "close", None)
             if not callable(close_streamer):
@@ -1839,7 +1844,31 @@ class InfinitesimalREMLFitter:
             logger.info("fit_infinitesimal start @ %s", datetime.now().isoformat(timespec='seconds'))
             t_fit_start = time.time()
 
-        ops = self._assemble_reml_operators()
+        # Sparse outer iterations change only the response and theta. Keep
+        # operator identities stable so fit_reml can reuse its probe products.
+        # A new fitter is built for each sample set/partition/standardization.
+        if self.cfg.cache_reml_setup:
+            scope_items = [self._partitioned_streamer, self._admix_sqrt_weights]
+            scope_items.extend(self._smile_operators)
+            for streamer in self.streamers:
+                scope_items.append(streamer)
+                scope_items.extend(
+                    getattr(streamer, name, None) for name in (
+                        "_means_by_call", "_inv_by_call", "_component_snp_offsets",
+                        "_component_eff_m_host", "_eff_m_const",
+                        "_cache_to_source_variant_indices",
+                    )
+                )
+            scope = tuple(scope_items)
+            setup = self._reml_fit_setup
+            if setup is None or len(setup[0]) != len(scope) or any(
+                old is not new for old, new in zip(setup[0], scope)
+            ):
+                self._reml_fit_setup = (scope, self._assemble_reml_operators())
+                self._reml_probe_cache = REMLProbeCache()
+            ops = self._reml_fit_setup[1]
+        else:
+            ops = self._assemble_reml_operators()
         self._ensure_projected_core_precond_ready(ops, var_components_init=var_components_init)
         G = len(ops.K_mvs)
         if self.cfg.unit_variance_components:
@@ -1895,6 +1924,7 @@ class InfinitesimalREMLFitter:
                 max_linesearch_trials=self.cfg.strict_max_linesearch_trials,
                 return_diagnostics=bool(self.cfg.capture_reml_diagnostics),
                 verbose=self.cfg.verbose,
+                **({"probe_cache": self._reml_probe_cache} if self.cfg.cache_reml_setup else {}),
             )
             if bool(self.cfg.capture_reml_diagnostics):
                 vc, history, diagnostics = fit_out

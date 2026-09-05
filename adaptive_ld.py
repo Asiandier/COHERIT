@@ -269,6 +269,8 @@ def efficient_score_statistics(
         raise ValueError("Score calibration requires observed data plus >=19 draws.")
     if values.shape[0] != nuisance_count + positions.size:
         raise ValueError("Quadratic rows do not match nuisance and candidate counts.")
+    if nuisance_count < 1 or not np.all(np.isfinite(values)):
+        raise ValueError("Score calibration requires finite quadratics and nuisance rows.")
     bootstrap_mean = np.mean(values[:, 1:], axis=1)
     scores = 0.5 * (values - bootstrap_mean[:, None])
     centered = scores[:, 1:] - np.mean(scores[:, 1:], axis=1, keepdims=True)
@@ -286,19 +288,29 @@ def efficient_score_statistics(
         index = nuisance_count + offset
         candidate_centered = centered[index]
         cross = candidate_centered @ nuisance_centered.T / denominator
+        raw_information = float(candidate_centered @ candidate_centered / denominator)
         information = float(
-            candidate_centered @ candidate_centered / denominator
+            raw_information
             - cross @ nuisance_inverse @ cross.T
         )
+        # A contrast in the nuisance span is not testable. The relative
+        # roundoff guard also removes tiny positive Schur complements caused
+        # by cancellation; it is not a statistical significance threshold.
+        information_roundoff = (
+            64.0 * np.finfo(np.float64).eps * max(1, nuisance_count)
+            * raw_information
+        )
+        if not np.isfinite(information):
+            raise FloatingPointError("Non-finite efficient score information.")
+        if information <= information_roundoff:
+            continue
         efficient = np.asarray(
             scores[index] - cross @ nuisance_inverse @ scores[:nuisance_count],
             dtype=np.float64,
         )
-        statistics = (
-            np.square(efficient) / information
-            if information > 0.0
-            else np.full_like(efficient, np.nan)
-        )
+        statistics = np.square(efficient) / information
+        if not np.all(np.isfinite(statistics)):
+            raise FloatingPointError("Non-finite efficient score statistic.")
         statistic_rows.append(statistics)
         rows.append(
             {
@@ -309,16 +321,13 @@ def efficient_score_statistics(
                 "score_statistic": float(statistics[0]),
             }
         )
-    rows.sort(
-        key=lambda row: (
-            float(row["score_statistic"])
-            if np.isfinite(float(row["score_statistic"]))
-            else -np.inf
-        ),
-        reverse=True,
+    rows.sort(key=lambda row: float(row["score_statistic"]), reverse=True)
+    # The empty family must stop splitting, never acquire the minimum Monte
+    # Carlo p-value through comparisons against NaN.
+    maximum = (
+        np.max(np.stack(statistic_rows, axis=0), axis=0)
+        if statistic_rows else np.zeros(values.shape[1], dtype=np.float64)
     )
-    statistic_matrix = np.stack(statistic_rows, axis=0)
-    maximum = np.nanmax(statistic_matrix, axis=0)
     observed_maximum = float(maximum[0])
     bootstrap_maximum = np.asarray(maximum[1:], dtype=np.float64)
     global_p = float(
@@ -326,6 +335,7 @@ def efficient_score_statistics(
         / (bootstrap_maximum.size + 1)
     )
     diagnostics = {
+        "testable_candidate_count": len(rows),
         "global_sup_score": observed_maximum,
         "global_sup_score_p_value": global_p,
         "bootstrap_max_quantiles": {
@@ -749,7 +759,10 @@ def run_score(args: argparse.Namespace) -> None:
             "criterion": "global_sup_score_p_value_le_split_alpha",
             "split_alpha": alpha,
             "accepted": accepted,
-            "stop_reason": "split_signal" if accepted else "global_score_rejected",
+            "stop_reason": (
+                "split_signal" if accepted else
+                "global_score_rejected" if rows else "no_testable_contrast"
+            ),
             "current_k": len(context.groups),
             "selected_candidate": rows[0] if rows else None,
             "candidates": rows,

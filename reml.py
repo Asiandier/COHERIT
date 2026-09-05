@@ -59,6 +59,20 @@ class AffineSLQCache:
 
 
 @dataclass
+class REMLProbeCache:
+    """Response/theta-independent work for repeated fits of fixed operators.
+
+    One entry only: changing operators, samples, devices or Monte Carlo
+    settings replaces it. Covariance solves and preconditioners are never
+    cached here. Owners must not mutate the operators' genotype transforms.
+    """
+
+    signature: tuple | None = None
+    kvrand_stack: Array | None = None
+    affine_slq: AffineSLQCache | None = None
+
+
+@dataclass
 class REMLContext:
     n: int
     G: int
@@ -1199,6 +1213,7 @@ def fit_reml(
     verbose: bool = True,
     log_detail: str = "full",
     return_diagnostics: bool = False,
+    probe_cache: REMLProbeCache | None = None,
 ):
     """Fit single-trait Gaussian REML with AI/Fisher updates.
 
@@ -1386,22 +1401,34 @@ def fit_reml(
         diag_stack = jnp.stack(expanded_diags, axis=0)
     del diag_list
 
-    # ---- Precompute K_i @ Vrand — constant across REML iterations ----------
+    # ---- Precompute K_i @ Vrand — constant across responses and theta -----
     # These cached probe responses are reused for:
     #   1) Taylor logdet trace estimates tr(H^{-1} K_i)
     #   2) direct Hutchinson score traces tr(P K_i)
+    cache_signature = (
+        K_mvs, n, int(seed), int(n_rand_vec), int(slq_samples), int(slq_m),
+        residual_diag_stack is None,
+        tuple(sorted(str(device) for device in y.devices())),
+    )
+    cache_hit = bool(
+        probe_cache is not None
+        and probe_cache.signature == cache_signature
+        and probe_cache.kvrand_stack is not None
+    )
     if full_log:
         _t_kv_cache = time.time()
-        logger.info("[REML] precompute K_i @ Vrand (%d kv passes) ...", G)
-    if stacked_kv is not None:
+        logger.info("[REML] %s K_i @ Vrand ...", "reuse" if cache_hit else "precompute")
+    if cache_hit:
+        KVrand_stack = probe_cache.kvrand_stack
+    elif stacked_kv is not None:
         KVrand_stack = stacked_kv(Vrand_fixed)
     else:
         KVrand_stack = jnp.stack([mv(Vrand_fixed) for mv in K_mvs], axis=0)
     if full_log:
         logger.info("[REML] K_i @ Vrand done elapsed=%.1fs", time.time() - _t_kv_cache)
 
-    affine_slq_cache = None
-    if G == 1 and E == 1 and residual_diag_stack is None:
+    affine_slq_cache = probe_cache.affine_slq if cache_hit else None
+    if G == 1 and E == 1 and residual_diag_stack is None and affine_slq_cache is None:
         if full_log:
             _t_affine_slq = time.time()
             logger.info(
@@ -1420,6 +1447,11 @@ def fit_reml(
                 "[REML] affine single-GRM SLQ done elapsed=%.1fs",
                 time.time() - _t_affine_slq,
             )
+
+    if probe_cache is not None and not cache_hit:
+        probe_cache.signature = cache_signature
+        probe_cache.kvrand_stack = KVrand_stack
+        probe_cache.affine_slq = affine_slq_cache
 
     if slq_precond_conf is None:
         slq_precond_conf = precond_conf

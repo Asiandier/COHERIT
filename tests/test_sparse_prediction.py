@@ -556,6 +556,69 @@ def test_single_grm_path_prediction_matches_pointwise_branches():
         test.close()
 
 
+@pytest.mark.parametrize("partitioned", [False, True])
+@pytest.mark.parametrize("perturb", [False, True])
+def test_path_reuses_certified_dual_and_refines_only_inaccurate_columns(
+    monkeypatch, partitioned, perturb
+):
+    x_train, x_test = _partitioned_prediction_genotypes()
+    groups = [[0, 2, 4], [1, 3, 5]] if partitioned else None
+    config = dict(component_variant_indices=groups, call_width=2,
+                  keep_host_stats=True, precond_rank=0, verbose=False)
+    train = InfinitesimalREMLFitter(FitConfig(sources=[_ArraySource(x_train)], **config))
+    test = InfinitesimalREMLFitter(FitConfig(
+        sources=[_ArraySource(x_test)], standardization_overrides=[
+            (train.streamers[0]._means_host, train.streamers[0]._inv_sds_host)
+        ], **config,
+    ))
+    try:
+        marker_indices = np.array([0, 2])
+        z_train = train.streamers[0].extract_standardized_columns(marker_indices)
+        z_test = test.streamers[0].extract_standardized_columns(marker_indices)
+        kwargs = dict(
+            fitter=train, test_fitter=test,
+            y_train=np.linspace(-1, 1, x_train.shape[0]),
+            train_covar=np.ones((x_train.shape[0], 1)),
+            test_covar=np.ones((x_test.shape[0], 1)),
+            train_candidate_geno=z_train, test_candidate_geno=z_test,
+            beta_cov_path=np.array([[0.1], [0.2]]),
+            beta_candidate_path=np.array([[0.1, -0.1], [0.2, 0.1]]),
+            theta=np.array([0.2, 0.3, 0.5] if partitioned else [0.4, 0.6]),
+            pcg_tol=1e-5, max_pcg_iters=100,
+        )
+        predict = predict_sparse_path_partitioned if partitioned else predict_sparse_path_single_grm
+        fresh = predict(**kwargs)
+        dual = fresh.dual.copy()
+        if perturb:
+            dual[:, 1] += 0.5
+        scores = np.asarray(train.streamers[0].xtv(jnp.asarray(dual), normalize=False))
+        solve_widths, score_widths = [], []
+        original_pcg = SPARSE_PRED.pcg_solve
+        original_xtv = train.streamers[0].xtv
+
+        def solve(hv, rhs, **options):
+            solve_widths.append(rhs.shape[1])
+            return original_pcg(hv, rhs, **options)
+
+        def xtv(value, **options):
+            score_widths.append(value.shape[1])
+            return original_xtv(value, **options)
+
+        monkeypatch.setattr(SPARSE_PRED, "pcg_solve", solve)
+        monkeypatch.setattr(train.streamers[0], "xtv", xtv)
+        cached = predict(**kwargs, hinv_residual_path=dual, training_score_path=scores)
+        assert solve_widths == ([1] if perturb else [])
+        assert score_widths == ([1] if perturb else [])
+        assert cached.pcg_rel_res <= 1.05e-5
+        np.testing.assert_allclose(cached.phenotype_prediction, fresh.phenotype_prediction,
+                                   rtol=2e-5, atol=2e-5)
+        with pytest.raises(ValueError, match="matching dual"):
+            predict(**kwargs, training_score_path=scores)
+    finally:
+        train.close()
+        test.close()
+
+
 def _manual_background(z_train, z_test, residual, theta):
     m = float(z_train.shape[1])
     covariance = (
