@@ -34,7 +34,7 @@ def test_read_phenotype_rejects_mismatched_sample_set(tmp_path):
         SELECTION.read_phenotype_aligned(path, ["i1", "i3"])
 
 
-def test_validation_selection_uses_r2_then_sparsity_then_lambda():
+def test_validation_selection_uses_predictive_r2_not_correlation_squared():
     outcome = np.asarray([0.0, 1.0, 2.0, 3.0])
     prediction = np.column_stack(
         [
@@ -50,8 +50,11 @@ def test_validation_selection_uses_r2_then_sparsity_then_lambda():
         {"k": 1, "lam_ratio": 0.2},
     ]
 
-    assert SELECTION.select_validation_path_index(path, metrics) == 1
+    assert SELECTION.select_validation_path_index(path, metrics) == 0
     assert metrics[0]["correlation_squared"] == pytest.approx(1.0)
+    assert metrics[0]["predictive_r2"] == pytest.approx(1.0)
+    assert metrics[1]["correlation_squared"] == pytest.approx(1.0)
+    assert metrics[1]["predictive_r2"] < 0.0
     assert metrics[1]["calibration_slope"] == pytest.approx(0.5)
 
 

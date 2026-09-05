@@ -99,7 +99,7 @@ tolerance; coefficient change is only an active-set scheduling heuristic.
 Every evaluated lambda on the complete path must pass that finite-tolerance
 certificate. An unsolved path point is reported as a numerical failure rather
 than being skipped in favor of the lambda-max empty model. At each covariance
-update, held-out validation squared correlation selects lambda before the
+update, held-out validation predictive R² (`1 - SSE/SST`) selects lambda before the
 variance-component update, and the full-marker KKT scan adds any omitted
 violating variants to the candidate set. The KKT tolerance is matched to the
 ordinary PCG precision; an independent finite-PCG score on candidate
@@ -142,7 +142,7 @@ Sparse-run output semantics are deliberately explicit:
 
 - `estimator_mode` is `coherit` and `computed_estimators` contains only
   `h2_chive`.
-- New sparse runs use output schema version 7. Raw/standardized duplicate
+- New sparse runs use output schema version 8. Raw/standardized duplicate
   estimator fields and downstream phenotype-scale conversions no longer exist.
 - `var_components_lasso_ml` contains one variance contribution per fixed GRM
   followed by the residual variance. Standardized component GRMs use the
@@ -336,7 +336,7 @@ gpu-reml \
   --out-prefix out/smile_multi
 ```
 
-Fixed single-GRM sparse COHERIT with validation-R² lambda selection and an
+Fixed single-GRM sparse COHERIT with validation predictive-R² lambda selection and an
 automatic train+validation final refit:
 
 ```bash
@@ -526,7 +526,8 @@ fit lifecycle.
 - `--outer-max`: maximum number of variance updates; the default is `20`.
 - `--sparsity-validation-pheno-txt` and `--sparsity-validation-out`: required
   together for model selection. The complete lambda path is evaluated on the
-  validation samples inside every alpha/theta outer iteration.
+  validation samples inside every alpha/theta outer iteration, and lambda is
+  selected by maximum predictive R² (`1 - SSE/SST`).
 - `--effect-rel-tol`: relative tolerance for change in the complete fitted
   fixed mean; the default is `5e-2`.
 

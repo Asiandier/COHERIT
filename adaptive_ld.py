@@ -436,15 +436,6 @@ class REMLProjector:
             projected = projected - self._vinv_c @ coefficients.astype(np.float32)
         return projected[:, 0] if squeeze else projected
 
-    def fit_covariates(self, target: np.ndarray) -> np.ndarray:
-        if not self._covar.shape[1]:
-            return np.empty((0,), dtype=np.float64)
-        solution = self._solve(target, stage="fixed_effect_gls")
-        return self._gram_inverse @ (
-            self._covar.astype(np.float64).T @ solution.astype(np.float64)
-        )
-
-
 def sample_partitioned_null_residuals(
     streamer: Any,
     *,
@@ -668,11 +659,12 @@ def run_score(args: argparse.Namespace) -> None:
         _markers, _beta, sparse_mean = _load_sparse_mean(
             args.state_path, context.grm_index
         )
-        gamma = projector.fit_covariates(context.y.astype(np.float64) - sparse_mean)
-        residual = (
-            context.y.astype(np.float64)
-            - sparse_mean
-            - context.covar.astype(np.float64) @ gamma
+        # P_theta already profiles every column of C because P_theta C = 0.
+        # Subtracting a separately fitted C gamma before applying the same
+        # projector is algebraically redundant and adds an unnecessary PCG
+        # solve.  Keep only the frozen sparse mean outside the projector.
+        working_response = (
+            context.y.astype(np.float64) - sparse_mean
         ).astype(np.float32)
         bootstrap = sample_partitioned_null_residuals(
             context.fitter.streamers[0],
@@ -681,7 +673,7 @@ def run_score(args: argparse.Namespace) -> None:
             seed=int(args.bootstrap_seed),
         )
         projected = projector.apply(
-            np.concatenate([residual[:, None], bootstrap], axis=1),
+            np.concatenate([working_response[:, None], bootstrap], axis=1),
             stage="adaptive_ld_observed_and_bootstrap",
         )
         marker_projection = np.asarray(

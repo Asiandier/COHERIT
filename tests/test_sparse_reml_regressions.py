@@ -274,8 +274,8 @@ def test_validation_selected_path_materializes_alpha_used_downstream():
         ],
     }
     metrics = [
-        {"path_index": 0, "correlation_squared": 0.01},
-        {"path_index": 1, "correlation_squared": 0.25},
+        {"path_index": 0, "predictive_r2": 0.01},
+        {"path_index": 1, "predictive_r2": 0.25},
     ]
 
     selected_index = SPARSE._select_converged_validation_path_index(
@@ -290,12 +290,12 @@ def test_validation_selected_path_materializes_alpha_used_downstream():
     )
 
     assert selected_index == 1
-    assert selected["selection_method"] == "validation_r2"
+    assert selected["selection_method"] == "validation_predictive_r2"
     assert selected["selected_lam_ratio"] == 0.2
     assert np.array_equal(selected["beta_snp"], [2.0, -1.0])
     assert np.array_equal(selected["beta_cov"], [3.0])
     assert np.array_equal(selected["active_idx"], [0, 1])
-    assert record["selected"]["correlation_squared"] == 0.25
+    assert record["selected"]["predictive_r2"] == 0.25
 
     residual = SPARSE._lasso_residual(
         y=np.asarray([10.0, 20.0]),
@@ -326,8 +326,8 @@ def test_validation_selection_excludes_unconverged_path_points():
         },
     ]
     metrics = [
-        {"correlation_squared": 0.9},
-        {"correlation_squared": 0.2},
+        {"predictive_r2": 0.9},
+        {"predictive_r2": 0.2},
     ]
 
     assert SPARSE._select_converged_validation_path_index(path, metrics) == 1
@@ -335,7 +335,7 @@ def test_validation_selection_excludes_unconverged_path_points():
 
 def test_validation_early_stopping_waits_for_an_earlier_peak():
     flat = [
-        {"correlation_squared": 0.2}
+        {"predictive_r2": 0.2}
         for _ in range(9)
     ]
     assert not SPARSE._validation_path_early_stopping_decision(
@@ -343,7 +343,7 @@ def test_validation_early_stopping_waits_for_an_earlier_peak():
     )["stopped"]
 
     peaked = [
-        {"correlation_squared": value}
+        {"predictive_r2": value}
         for value in [0.10, 0.20, 0.31, 0.30, 0.29, 0.28, 0.27, 0.26]
     ]
     decision = SPARSE._validation_path_early_stopping_decision(
@@ -351,7 +351,7 @@ def test_validation_early_stopping_waits_for_an_earlier_peak():
     )
     assert decision["stopped"] is True
     assert decision["best_path_index"] == 2
-    assert decision["best_correlation_squared"] == pytest.approx(0.31)
+    assert decision["best_predictive_r2"] == pytest.approx(0.31)
 
 
 def test_batched_hinv_residual_path_matches_columnwise_algebra():
@@ -553,7 +553,7 @@ def test_weighted_basil_path_matches_full_design_lasso():
             "metrics": [
                 {
                     "path_index": local,
-                    "correlation_squared": float(start + local),
+                    "predictive_r2": float(start + local),
                 }
                 for local in range(n_rows)
             ],
@@ -622,8 +622,8 @@ def test_validation_selection_rejects_candidate_only_kkt_point():
         },
     ]
     metrics = [
-        {"correlation_squared": 0.9},
-        {"correlation_squared": 0.3},
+        {"predictive_r2": 0.9},
+        {"predictive_r2": 0.3},
     ]
 
     assert SPARSE._select_converged_validation_path_index(path, metrics) == 1
@@ -712,7 +712,7 @@ def test_coherit_guard_accepts_only_a_certified_finite_estimator():
 def test_sparse_output_contract_is_coherit_only():
     contract = SPARSE._sparse_output_contract()
 
-    assert contract["sparse_output_schema_version"] == 7
+    assert contract["sparse_output_schema_version"] == 8
     assert contract["estimator_mode"] == "coherit"
     assert contract["computed_estimators"] == ["h2_chive"]
     assert contract["selected_snp_columns"][-1] == "beta_lasso"

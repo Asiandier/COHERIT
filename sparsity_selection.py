@@ -116,22 +116,24 @@ def select_validation_path_index(
     path_rows: Sequence[Mapping[str, object]],
     metrics: Sequence[Mapping[str, object]],
 ) -> int:
-    """Maximize squared correlation; prefer sparser and larger-lambda ties."""
+    """Maximize predictive R2; prefer sparser and larger-lambda ties."""
     if len(path_rows) != len(metrics) or not path_rows:
         raise ValueError("Lasso path and validation metrics must align.")
 
     eligible: list[int] = []
     for index, metric in enumerate(metrics):
-        value = metric.get("correlation_squared")
+        value = metric.get("predictive_r2")
         if value is not None and math.isfinite(float(value)):
             eligible.append(index)
     if not eligible:
-        raise ValueError("No validation path point has a finite correlation.")
+        raise ValueError(
+            "No validation path point has a finite predictive R2."
+        )
 
     return max(
         eligible,
         key=lambda index: (
-            float(metrics[index]["correlation_squared"]),
+            float(metrics[index]["predictive_r2"]),
             -int(path_rows[index]["k"]),
             float(path_rows[index]["lam_ratio"]),
         ),

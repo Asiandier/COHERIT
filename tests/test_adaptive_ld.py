@@ -65,3 +65,36 @@ def test_efficient_score_statistics_returns_global_bootstrap_gate() -> None:
     assert {row["boundary_position"] for row in rows} == {10, 20}
     assert rows[0]["boundary_position"] == 10
     assert 0.0 < diagnostics["global_sup_score_p_value"] <= 1.0
+
+
+def test_reml_projector_profiles_covariates_without_explicit_gls_residual() -> None:
+    rng = np.random.default_rng(90210)
+    n = 17
+    covar = np.column_stack(
+        [np.ones(n), rng.normal(size=n), rng.normal(size=n)]
+    )
+    covariance_root = rng.normal(size=(n, n))
+    covariance = covariance_root @ covariance_root.T / n + 0.5 * np.eye(n)
+    precision = np.linalg.inv(covariance)
+
+    class ExactProjector:
+        _covar = covar
+        _vinv_c = precision @ covar
+        _gram_inverse = np.linalg.inv(covar.T @ precision @ covar)
+
+        @staticmethod
+        def _solve(rhs, *, stage):
+            del stage
+            return precision @ rhs
+
+    response = rng.normal(size=n)
+    nuisance_shift = covar @ rng.normal(size=covar.shape[1])
+    direct = ADAPTIVE.REMLProjector.apply(
+        ExactProjector(), response, stage="direct"
+    )
+    shifted = ADAPTIVE.REMLProjector.apply(
+        ExactProjector(), response + nuisance_shift, stage="shifted"
+    )
+
+    np.testing.assert_allclose(direct, shifted, rtol=5e-7, atol=5e-7)
+    assert not hasattr(ADAPTIVE.REMLProjector, "fit_covariates")

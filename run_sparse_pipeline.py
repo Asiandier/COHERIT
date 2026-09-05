@@ -5,7 +5,8 @@ Two modes are intentionally supported:
 
 ``fixed``
     Fit a user-specified fixed GRM partition (or one whole-genome GRM), with
-    validation R2 selecting lambda inside every alpha/theta outer iteration.
+    validation predictive R2 selecting lambda inside every alpha/theta outer
+    iteration.
 
 ``adaptive``
     Fit K=1 as above, freeze its sparse mean, add LD-rank covariance boundaries
@@ -481,7 +482,7 @@ def _validate_summary(
 ) -> dict[str, Any]:
     path = Path(str(prefix) + ".summary.json")
     summary = read_json(path)
-    if int(summary.get("sparse_output_schema_version", -1)) != 7:
+    if int(summary.get("sparse_output_schema_version", -1)) != 8:
         raise ValueError(f"Unsupported sparse summary schema: {path}")
     if int(summary.get("n_grms", -1)) != int(expected_k):
         raise ValueError(f"Sparse summary K does not match expected K={expected_k}: {path}")
@@ -489,7 +490,7 @@ def _validate_summary(
         raise ValueError(f"Sparse summary does not contain a valid COHERIT branch: {path}")
     if summary.get("lambda_selection_method") != expected_method:
         raise ValueError(f"Unexpected lambda-selection method in {path}.")
-    if expected_method == "validation_r2":
+    if expected_method == "validation_predictive_r2":
         if not bool(summary.get("validation_selection_inside_outer_loop", False)):
             raise ValueError("Validation lambda was not selected inside the outer loop.")
         if summary.get("sparse_prediction", {}).get("status") != "emitted":
@@ -553,7 +554,7 @@ def _run_validation_fit(
     summary = _validate_summary(
         prefix,
         expected_k=expected_k,
-        expected_method="validation_r2",
+        expected_method="validation_predictive_r2",
         require_prediction=True,
     )
     if not state.is_file():
@@ -891,7 +892,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--screen-topk", type=int, default=2000)
     parser.add_argument("--candidate-k", type=int, default=256)
     parser.add_argument("--kkt-add-topk", type=int, default=256)
-    parser.add_argument("--kkt-max-rounds", type=int, default=20)
+    parser.add_argument("--kkt-max-rounds", type=int, default=30)
 
     parser.add_argument("--bootstrap-draws", type=int, default=199)
     parser.add_argument("--bootstrap-seed", type=int, default=20260831)

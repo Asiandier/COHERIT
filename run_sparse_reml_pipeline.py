@@ -1146,8 +1146,8 @@ def parse_args() -> argparse.Namespace:
         "--sparsity-validation-out",
         default="",
         help=(
-            "JSON audit of the lambda selected by validation R2 inside every "
-            "alpha/theta outer iteration."
+            "JSON audit of the lambda selected by validation predictive R2 "
+            "inside every alpha/theta outer iteration."
         ),
     )
     p.add_argument(
@@ -1156,8 +1156,8 @@ def parse_args() -> argparse.Namespace:
         default=5,
         help=(
             "Stop the descending exact lambda path when the best validation "
-            "R2 in the latest lag points is below an earlier best. Only "
-            "full-marker-KKT-certified points count."
+            "predictive R2 in the latest lag points is below an earlier best. "
+            "Only full-marker-KKT-certified points count."
         ),
     )
     p.add_argument("--proj-ridge", type=float, default=1e-6)
@@ -1192,7 +1192,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--kkt-max-rounds",
         type=int,
-        default=20,
+        default=30,
         help="Maximum candidate-expansion rounds used to certify global KKT optimality.",
     )
     p.add_argument(
@@ -1678,7 +1678,7 @@ def _select_converged_validation_path_index(
     path_rows: list[dict],
     metrics: list[dict],
 ) -> int:
-    """Select validation R2 only among full-genome KKT path solutions."""
+    """Select predictive R2 only among full-genome KKT path solutions."""
     if len(path_rows) != len(metrics) or not path_rows:
         raise ValueError("Lasso path and validation metrics must align.")
     eligible = [
@@ -1687,18 +1687,18 @@ def _select_converged_validation_path_index(
         if bool(row.get("converged", False))
         and bool(row.get("kkt_passed", False))
         and bool(row.get("global_kkt_passed", False))
-        and metric.get("correlation_squared") is not None
-        and np.isfinite(float(metric["correlation_squared"]))
+        and metric.get("predictive_r2") is not None
+        and np.isfinite(float(metric["predictive_r2"]))
     ]
     if not eligible:
         raise RuntimeError(
             "No converged full-genome-KKT Lasso path point has finite "
-            "validation R2."
+            "validation predictive R2."
         )
     return max(
         eligible,
         key=lambda index: (
-            float(metrics[index]["correlation_squared"]),
+            float(metrics[index]["predictive_r2"]),
             -int(path_rows[index]["k"]),
             float(path_rows[index]["lam_ratio"]),
         ),
@@ -1742,7 +1742,7 @@ def _materialize_validation_selected_lasso(
     merged_path = merge_path_diagnostics(path_rows, metrics)
     selection_record = {
         "selection_metric": (
-            "squared_pearson_correlation_total_phenotype_prediction"
+            "predictive_r2_one_minus_sse_over_sst_total_phenotype_prediction"
         ),
         "selected": {
             "path_index": index,
@@ -1764,7 +1764,7 @@ def _materialize_validation_selected_lasso(
             "active_idx": active_idx,
             "lam": float(selected_row["lam"]),
             "selected_index": index,
-            "selection_method": "validation_r2",
+            "selection_method": "validation_predictive_r2",
             "selected_lam_ratio": float(selected_row["lam_ratio"]),
             "validation_selection": selection_record,
         }
@@ -1777,7 +1777,7 @@ def _validation_path_early_stopping_decision(
     *,
     stopping_lag: int,
 ) -> dict[str, object]:
-    """Apply snpnet-style validation early stopping to an exact path prefix.
+    """Apply predictive-R2 early stopping to an exact path prefix.
 
     For a lag of ``L``, stop when the best metric before the most recent
     ``L`` certified models is strictly better than every metric in that recent
@@ -1788,12 +1788,13 @@ def _validation_path_early_stopping_decision(
     if lag < 1:
         raise ValueError("Validation early-stopping lag must be positive.")
     values = np.asarray(
-        [metric.get("correlation_squared") for metric in metrics],
+        [metric.get("predictive_r2") for metric in metrics],
         dtype=np.float64,
     )
     if values.size > 0 and not np.all(np.isfinite(values)):
         raise ValueError(
-            "Validation early stopping requires finite R2 at every exact point."
+            "Validation early stopping requires finite predictive R2 at "
+            "every exact point."
         )
     best_index = int(np.argmax(values)) if values.size > 0 else None
     best_r2 = float(values[best_index]) if best_index is not None else None
@@ -1803,7 +1804,7 @@ def _validation_path_early_stopping_decision(
             "stopping_lag": lag,
             "n_evaluated": int(values.size),
             "best_path_index": best_index,
-            "best_correlation_squared": best_r2,
+            "best_predictive_r2": best_r2,
             "earlier_max": None,
             "recent_max": None,
             "reason": "insufficient_certified_points",
@@ -1816,7 +1817,7 @@ def _validation_path_early_stopping_decision(
         "stopping_lag": lag,
         "n_evaluated": int(values.size),
         "best_path_index": best_index,
-        "best_correlation_squared": best_r2,
+        "best_predictive_r2": best_r2,
         "earlier_max": earlier_max,
         "recent_max": recent_max,
         "reason": (
@@ -1946,10 +1947,10 @@ def _write_iterative_validation_output(
         ),
     }
     payload = {
-        "schema_version": 2,
+        "schema_version": 3,
         "selection_role": "inside_every_alpha_theta_outer_iteration",
         "selection_metric": (
-            "squared_pearson_correlation_total_phenotype_prediction"
+            "predictive_r2_one_minus_sse_over_sst_total_phenotype_prediction"
         ),
         "validation_phenotype_path": os.path.abspath(phenotype_path),
         "n_validation_samples": int(
@@ -1973,8 +1974,8 @@ def _write_iterative_validation_output(
         "selection_metric": payload["selection_metric"],
         "selected_lam_ratio": float(selected["lam_ratio"]),
         "selected_support_size": int(selected["support_size"]),
-        "validation_correlation_squared": float(
-            selected["correlation_squared"]
+        "validation_predictive_r2": float(
+            selected["predictive_r2"]
         ),
         "n_path_selections": int(len(selection_trace)),
         "outputs": output_paths,
@@ -2072,7 +2073,7 @@ def _coherit_estimator_guard(
 def _sparse_output_contract() -> dict[str, object]:
     """Return the fixed output contract for the sole COHERIT mode."""
     return {
-        "sparse_output_schema_version": 7,
+        "sparse_output_schema_version": 8,
         "estimator_mode": "coherit",
         "computed_estimators": ["h2_chive"],
         "selected_snp_columns": [
@@ -3020,11 +3021,11 @@ def _fit_complete_weighted_lasso_path_basil(
             kkt_seconds,
             float(
                 validation_early_stopping[
-                    "best_correlation_squared"
+                    "best_predictive_r2"
                 ]
             )
             if validation_early_stopping[
-                "best_correlation_squared"
+                "best_predictive_r2"
             ] is not None
             else float("nan"),
             validation_early_stopped,
@@ -3536,7 +3537,7 @@ def main() -> None:
     if iterative_validation_selection and not sparsity_validation_requested:
         raise SystemExit(
             "Sparse fitting requires both --sparsity-validation-pheno-txt "
-            "and --sparsity-validation-out so validation R2 can select "
+            "and --sparsity-validation-out so validation predictive R2 can select "
             "lambda inside every outer iteration. For a final refit, supply "
             "--lasso-fixed-lam-ratio instead."
         )
@@ -4410,14 +4411,14 @@ def main() -> None:
                 iterative_validation_trace.append(trace_record)
                 logger.info(
                     "[outer %s validation alpha/BASIL] ever_active=%s "
-                    "ratio=%.6g active=%s validation_R2=%.8f",
+                    "ratio=%.6g active=%s validation_predictive_R2=%.8f",
                     outer,
                     int(candidate.size),
                     float(lasso["selected_lam_ratio"]),
                     int(active_local.size),
                     float(
                         validation_record["selected"][
-                            "correlation_squared"
+                            "predictive_r2"
                         ]
                     ),
                 )
@@ -4758,7 +4759,7 @@ def main() -> None:
                                 "selection_method": (
                                     "pending_complete_path_global_kkt"
                                 ),
-                                "validation_correlation_squared": None,
+                                "validation_predictive_r2": None,
                                 "n_violators": n_path_viol,
                                 "n_expansion_strict_added": int(
                                     expansion["n_strict_added"]
@@ -4939,7 +4940,7 @@ def main() -> None:
                     iterative_validation_trace.append(trace_record)
                     logger.info(
                         "[outer %s kkt %s validation alpha] cand=%s "
-                        "ratio=%.6g active=%s validation_R2=%.8f",
+                        "ratio=%.6g active=%s validation_predictive_R2=%.8f",
                         outer,
                         kkt_round,
                         int(candidate.size),
@@ -4947,7 +4948,7 @@ def main() -> None:
                         int(np.asarray(lasso["active_idx"]).size),
                         float(
                             validation_record["selected"][
-                                "correlation_squared"
+                                "predictive_r2"
                             ]
                         ),
                     )
@@ -5153,10 +5154,10 @@ def main() -> None:
                     "lambda": float(lasso["lam"]),
                     "lambda_ratio": float(lasso["selected_lam_ratio"]),
                     "selection_method": str(lasso["selection_method"]),
-                    "validation_correlation_squared": (
+                    "validation_predictive_r2": (
                         float(
                             lasso["validation_selection"]["selected"][
-                                "correlation_squared"
+                                "predictive_r2"
                             ]
                         )
                         if lasso.get("validation_selection") is not None
@@ -5415,10 +5416,10 @@ def main() -> None:
                     "lambda_selection_method": str(
                         lasso["selection_method"]
                     ),
-                    "validation_correlation_squared": (
+                    "validation_predictive_r2": (
                         float(
                             lasso["validation_selection"]["selected"][
-                                "correlation_squared"
+                                "predictive_r2"
                             ]
                         )
                         if lasso.get("validation_selection") is not None
@@ -5567,10 +5568,10 @@ def main() -> None:
             "lam": float(lasso["lam"]),
             "lam_ratio": float(lasso["selected_lam_ratio"]),
             "lambda_selection_method": str(lasso["selection_method"]),
-            "validation_correlation_squared": (
+            "validation_predictive_r2": (
                 float(
                     lasso["validation_selection"]["selected"][
-                        "correlation_squared"
+                        "predictive_r2"
                     ]
                 )
                 if lasso.get("validation_selection") is not None
@@ -5592,7 +5593,7 @@ def main() -> None:
 
         logger.info(
             "[outer %s] pcg_screen=%s pcg_all=%s cand=%s active=%s "
-            "kkt_rounds=%s lam=%.3e validation_R2=%s h2=%.6f "
+            "kkt_rounds=%s lam=%.3e validation_predictive_R2=%s h2=%.6f "
             "h2_change=%.3e effect_rel=%.3e iter_time=%.1fs",
             outer,
             int(it_screen),
@@ -5605,7 +5606,7 @@ def main() -> None:
                 "%.8f"
                 % float(
                     lasso["validation_selection"]["selected"][
-                        "correlation_squared"
+                        "predictive_r2"
                     ]
                 )
                 if lasso.get("validation_selection") is not None
@@ -6130,7 +6131,7 @@ def main() -> None:
         "lasso_selected_validation_r2": (
             float(
                 final_lasso["validation_selection"]["selected"][
-                    "correlation_squared"
+                    "predictive_r2"
                 ]
             )
             if final_lasso is not None
