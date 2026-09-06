@@ -128,6 +128,7 @@ make_nonbed_input_fam = _common_mod.make_nonbed_input_fam
 compute_sample_mask = _common_mod.compute_sample_mask
 write_keep_file = _common_mod.write_keep_file
 resolve_cpu_threads = _common_mod.resolve_cpu_threads
+genetic_variance = _common_mod.genetic_variance
 effective_preconditioner_rank_contract = (
     _common_mod.effective_preconditioner_rank_contract
 )
@@ -833,7 +834,6 @@ def _build_prediction_fit_context(
         max_pcg_iters=args.max_pcg_iters,
         pcg_ridge=args.pcg_ridge,
         response_is_standardized=True,
-        unit_variance_components=True,
         verbose=args.verbose,
     )
     if prediction_sources is not None:
@@ -2091,7 +2091,7 @@ def _coherit_estimator_guard(
 def _sparse_output_contract() -> dict[str, object]:
     """Return the fixed output contract for the sole COHERIT mode."""
     return {
-        "sparse_output_schema_version": 9,
+        "sparse_output_schema_version": 10,
         "estimator_mode": "coherit",
         "computed_estimators": ["h2_chive"],
         "selected_snp_columns": [
@@ -3535,8 +3535,16 @@ def main() -> None:
             raise SystemExit(
                 "--lasso-fixed-lam-ratio must lie in (0, 1]."
             )
-        if float(args.lasso_fixed_lam_ratio) < float(
-            args.lasso_lam_min_ratio
+        # Lambda / lambda_max can round just below the path endpoint. Allow
+        # relative roundoff without changing the frozen, selected ratio.
+        if (
+            float(args.lasso_fixed_lam_ratio) < float(args.lasso_lam_min_ratio)
+            and not math.isclose(
+                float(args.lasso_fixed_lam_ratio),
+                float(args.lasso_lam_min_ratio),
+                rel_tol=1e-12,
+                abs_tol=0.0,
+            )
         ):
             raise SystemExit(
                 "lasso-fixed-lam-ratio must be at least "
@@ -3815,7 +3823,6 @@ def main() -> None:
             reml_pcg_tol=args.pcg_tol,
             effect_pcg_tol=args.pcg_tol,
             response_is_standardized=True,
-            unit_variance_components=True,
             capture_reml_diagnostics=bool(args.export_ai),
             cache_reml_setup=True,
             strict_max_linesearch_trials=args.reml_max_linesearch_trials,
@@ -3838,7 +3845,6 @@ def main() -> None:
             reml_pcg_tol=args.pcg_tol,
             effect_pcg_tol=args.pcg_tol,
             response_is_standardized=True,
-            unit_variance_components=True,
             capture_reml_diagnostics=bool(args.export_ai),
             cache_reml_setup=True,
             strict_max_linesearch_trials=args.reml_max_linesearch_trials,
@@ -3875,18 +3881,23 @@ def main() -> None:
             f"{n_grm} operators for {grm_index.n_grm} components."
         )
 
-    def _background_h2(theta_values: np.ndarray) -> float:
-        theta_arr = np.asarray(theta_values, dtype=np.float64).reshape(-1)
-        genetic_var = float(np.sum(theta_arr[:n_grm]))
-        residual_var = float(theta_arr[n_grm])
-        return genetic_var / max(genetic_var + residual_var, 1e-8)
+    # These atoms belong to this fitter's sample set and GRM partition.
+    # Theta remains a coefficient of the original K in every covariance solve.
+    genetic_trace_atoms = np.asarray(
+        jax.device_get(fitter._projected_core_diag_atoms(ops.diag_list)),
+        dtype=np.float64,
+    )
 
     def _background_genetic_variance(theta_values: np.ndarray) -> float:
         theta_arr = np.asarray(theta_values, dtype=np.float64).reshape(-1)
-        return float(np.sum(theta_arr[:n_grm]))
+        return genetic_variance(theta_arr[:n_grm], genetic_trace_atoms)
 
-    # Every standardized GRM is modeled with unit mean diagonal. Finite-sample
-    # deviations from one are intentionally not propagated as scale factors.
+    def _background_h2(theta_values: np.ndarray) -> float:
+        return _sparse_dense_h2(
+            0.0, _background_genetic_variance(theta_values), float(theta_values[-1])
+        )
+
+    # Preserve the coefficient initialization; only variance summaries use atoms.
     h2_init_default = 0.5
     if supplied_theta_init:
         theta = _parse_variance_components_init(
@@ -3902,7 +3913,7 @@ def main() -> None:
         )
         theta_e0 = np.array([1.0 - h2_init_default], dtype=np.float64)
         theta = np.concatenate([theta_g0, theta_e0], axis=0)
-        theta_init_source = "unit_grm_default"
+        theta_init_source = "equal_kernel_coefficients"
     theta_initial = theta.copy()
     fitter._ensure_projected_core_precond_ready(
         ops,
@@ -5758,7 +5769,7 @@ def main() -> None:
         os.makedirs(out_dir, exist_ok=True)
 
     unavailable = float("nan")
-    theta_lasso_ml_sum = _background_genetic_variance(theta_lasso_ml)
+    background_genetic_variance = _background_genetic_variance(theta_lasso_ml)
     theta_e_lasso_ml = float(theta_lasso_ml[-1])
     q_chive = unavailable
     q_chive_term1 = unavailable
@@ -5851,7 +5862,7 @@ def main() -> None:
     # covariate-contrast REML covariance from the same penalized branch.
     h2_chive = _sparse_dense_h2(
         q_chive,
-        theta_lasso_ml_sum,
+        background_genetic_variance,
         theta_e_lasso_ml,
     )
     branch_guards = _coherit_estimator_guard(
@@ -6162,7 +6173,8 @@ def main() -> None:
             if component_variant_indices
             else "single_whole_genome_grm"
         ),
-        "grm_variance_scale": "unit_mean_diagonal",
+        "grm_variance_scale": "trace_weighted",
+        "genetic_trace_atoms": genetic_trace_atoms.tolist(),
         "lambda_selection_method": (
             str(final_lasso["selection_method"])
             if final_lasso is not None

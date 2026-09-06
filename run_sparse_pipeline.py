@@ -482,7 +482,7 @@ def _validate_summary(
 ) -> dict[str, Any]:
     path = Path(str(prefix) + ".summary.json")
     summary = read_json(path)
-    if int(summary.get("sparse_output_schema_version", -1)) != 9:
+    if int(summary.get("sparse_output_schema_version", -1)) != 10:
         raise ValueError(f"Unsupported sparse summary schema: {path}")
     if int(summary.get("n_grms", -1)) != int(expected_k):
         raise ValueError(f"Sparse summary K does not match expected K={expected_k}: {path}")
@@ -507,6 +507,7 @@ def _stage_snapshot(summary: Mapping[str, Any]) -> dict[str, Any]:
         "k": int(summary["n_grms"]),
         "h2": float(summary["h2"]),
         "theta": [float(value) for value in summary["var_components_lasso_ml"]],
+        "genetic_trace_atoms": list(summary["genetic_trace_atoms"]),
         "q_chive": float(summary["q_chive"]),
         "support_size": int(summary["support_size"]),
         "lambda_ratio": float(summary["lasso_selected_lam_ratio"]),
@@ -623,6 +624,7 @@ def _run_adaptive_selection(
             "theta": [
                 float(value) for value in k1_summary["var_components_lasso_ml"]
             ],
+            "genetic_trace_atoms": list(k1_summary["genetic_trace_atoms"]),
             "component_spec": str(root_spec.resolve()),
             "fit": str(current_summary_path.resolve()),
             "stage": "k1_validation_lambda",
@@ -736,6 +738,7 @@ def _run_adaptive_selection(
                 "h2": float(next_summary["h2"]),
                 "q_chive": float(next_summary["q_chive"]),
                 "theta": theta.tolist(),
+                "genetic_trace_atoms": list(next_summary["genetic_trace_atoms"]),
                 "component_spec": str(next_spec.resolve()),
                 "fit": str(next_fit_path.resolve()),
                 "stage": "fixed_k1_sparse_mean_covariance_refit",

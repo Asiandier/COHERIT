@@ -12,7 +12,9 @@ from bed_reader import to_bed
 ROOT = Path(__file__).resolve().parents[1]
 
 
-@pytest.mark.parametrize("mode", ["fixed", "fixed_multi", "adaptive", "alignment"])
+@pytest.mark.parametrize(
+    "mode", ["fixed", "fixed_multi", "adaptive", "alignment", "missing_single", "missing_multi"]
+)
 def test_sparse_pipeline_automatic_fit_effects_prediction(tmp_path, mode):
     rng = np.random.default_rng(206)
     n, m = 480, 96
@@ -20,12 +22,18 @@ def test_sparse_pipeline_automatic_fit_effects_prediction(tmp_path, mode):
     ids = [f"sample{i}" for i in range(n)]
     variants = [f"rs{i}" for i in range(m)]
     prefix = tmp_path / "genotype"
-    to_bed(str(prefix) + ".bed", x, properties={"iid": ids, "fid": ids, "sid": variants})
     z = (x - x.mean(0)) / x.std(0)
     beta = rng.normal(size=m)
     beta[m // 2:] = 0
     genetic = z @ beta
     y = np.sqrt(0.65) * genetic / genetic.std() + np.sqrt(0.35) * rng.normal(size=n)
+    if mode.startswith("missing"):
+        # Different atoms by component AND sample set expose stale or unit atoms.
+        x[:64, :m // 2] = -127
+        x[:32, m // 2:] = -127
+        x[320:328, :m // 2] = -127
+        x[320:344, m // 2:] = -127
+    to_bed(str(prefix) + ".bed", x, properties={"iid": ids, "fid": ids, "sid": variants})
     subsets = {"train": range(320), "validation": range(320, 400), "test": range(400, n)}
     for name, indices in subsets.items():
         (tmp_path / f"{name}.keep").write_text("".join(f"{ids[i]} {ids[i]}\n" for i in indices))
@@ -34,6 +42,9 @@ def test_sparse_pipeline_automatic_fit_effects_prediction(tmp_path, mode):
                 "".join(f"{ids[i]} {ids[i]} {y[i]:.12g}\n" for i in indices)
             )
     output = tmp_path / "result"
+    # Keep a background component in the missing-data fits so the trace-weighted
+    # heritability checks below remain sensitive to incorrect variance scaling.
+    min_ratio = "0.5" if mode.startswith("missing") else "0.1"
     command = [
         sys.executable, "-m", f"{ROOT.name}.run_sparse_pipeline",
         "--mode", "adaptive" if mode == "adaptive" else "fixed",
@@ -48,10 +59,10 @@ def test_sparse_pipeline_automatic_fit_effects_prediction(tmp_path, mode):
         "--gpu-budget-gib", "0.25", "--cpu-threads", "2", "--call-width", "32",
         "--n-rand-vec", "24", "--slq-samples", "8", "--slq-m", "12",
         "--minq-iter", "30", "--outer-max", "12", "--n-lambda", "12",
-        "--lam-min-ratio", "0.1", "--screen-topk", "96", "--candidate-k", "32",
+        "--lam-min-ratio", min_ratio, "--screen-topk", "96", "--candidate-k", "32",
         "--pcg-tol", "0.001", "--verbose",
     ]
-    if mode == "fixed_multi":
+    if mode in {"fixed_multi", "missing_multi"}:
         spec = tmp_path / "partition.npz"
         np.savez(spec, arr_0=np.arange(m // 2), arr_1=np.arange(m // 2, m))
         command += ["--component-spec", str(spec)]
@@ -87,24 +98,47 @@ def test_sparse_pipeline_automatic_fit_effects_prediction(tmp_path, mode):
     pipeline = json.loads(output.with_suffix(".pipeline.json").read_text())
     assert pipeline["status"] == "complete"
     final = json.loads(output.with_suffix(".summary.json").read_text())
-    assert final["sparse_output_schema_version"] == 9
+    assert final["sparse_output_schema_version"] == 10
     assert final["n_samples"] == 400
     assert final["lasso_branch_valid"]
     assert final["sparse_prediction"]["status"] == "emitted"
     assert output.with_suffix(".sparse_effects.tsv").is_file()
     assert len(output.with_suffix(".sparse_prediction.tsv").read_text().splitlines()) == 81
-    if mode == "fixed_multi":
+    if mode in {"fixed_multi", "missing_multi"}:
         assert final["n_grms"] == 2
 
     for path in tmp_path.glob("**/*.history.json"):
         records = json.loads(path.read_text())
         summary = json.loads(path.with_name(path.name.replace(".history.json", ".summary.json")).read_text())
+        assert summary["grm_variance_scale"] == "trace_weighted"
+        atoms = np.asarray(summary["genetic_trace_atoms"])
+        # All markers in this fixture are polymorphic. Missing positions become
+        # zero after centering; each standardized column's norm² is its count.
+        n_fit = summary["n_samples"]
+        counts = np.sum(x[:n_fit] >= 0, axis=0)
+        groups = np.split(counts, np.cumsum(summary["m_per_grm"])[:-1])
+        np.testing.assert_allclose(atoms, [g.mean() / n_fit for g in groups], atol=1e-7)
+        theta_final = np.asarray(summary["var_components_lasso_ml"])
+        bg = float(theta_final[:-1] @ atoms)
+        if mode.startswith("missing"):
+            # A nonzero background makes the final h2 assertion detect raw sums.
+            assert bg > 0.0
+        q_final = summary["q_chive"]
+        assert summary["h2"] == pytest.approx((q_final + bg) / (q_final + bg + theta_final[-1]))
+        assert summary["h2_background_lasso_ml"] == pytest.approx(bg / (bg + theta_final[-1]))
         for row in records:
             if row.get("coherit_h2") is None:
                 continue
             theta, q = row["theta"], row["q_sparse"]
-            expected = (q + sum(theta[:-1])) / (q + sum(theta))
+            bg = float(np.asarray(theta[:-1]) @ atoms)
+            expected = (q + bg) / (q + bg + theta[-1])
             assert row["coherit_h2"] == pytest.approx(expected, abs=1e-10)
+            if "theta_after_variance_update" in row:
+                after = np.asarray(row["theta_after_variance_update"])
+                bg_after = float(after[:-1] @ atoms)
+                assert row["coherit_h2_after_variance_update"] == pytest.approx(
+                    (q + bg_after) / (q + bg_after + after[-1]), abs=1e-10
+                )
         if summary["lasso_ml_outer_converged"]:
             assert records[-1]["stage"] == "final_covariance_lasso"
             assert records[-1]["alignment_action"] == "converged"

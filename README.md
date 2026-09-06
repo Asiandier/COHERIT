@@ -146,7 +146,7 @@ Sparse-run output semantics are deliberately explicit:
 
 - `estimator_mode` is `coherit` and `computed_estimators` contains only
   `h2_chive`.
-- New sparse runs use output schema version 9. Raw/standardized duplicate
+- New sparse runs use output schema version 10. Raw/standardized duplicate
   estimator fields and downstream phenotype-scale conversions no longer exist.
 - In each `outer_update` history record, `theta`, `coherit_h2`, and validation
   predictive R² describe the same selected LASSO state. The subsequent covariance
@@ -158,12 +158,19 @@ Sparse-run output semantics are deliberately explicit:
   reuse response-independent REML probe products and single-GRM Lanczos work.
   These caches do not cross sample sets or GRM partitions. Resuming a pipeline
   also checks a source-code digest; changed code requires a fresh work directory.
-- `var_components_lasso_ml` contains one variance contribution per fixed GRM
-  followed by the residual variance. Standardized component GRMs use the
-  unit-mean-diagonal sparse-COHERIT contract.
+- `var_components_lasso_ml` contains one kernel coefficient per fixed GRM
+  followed by the identity-residual variance. The covariance remains
+  `H = sum_g theta_g K_g + theta_e I`; the kernels are not rescaled.
+- `genetic_trace_atoms` records `a_g = tr(K_g) / n` on the samples used for
+  that fit, and `grm_variance_scale` is `trace_weighted`. Background genetic
+  variance is `sum_g theta_g a_g`, including when missing genotypes are
+  mean-imputed. Atoms are recomputed for each sample set and GRM partition.
 - `h2` is the primary total estimate. For a valid covariance-aligned LASSO
-  pair it combines the calibrated LASSO quadratic with the
-  `var_components_lasso_ml` background and residual components.
+  pair it is `(q_chive + sum_g theta_g a_g) /
+  (q_chive + sum_g theta_g a_g + theta_e)`. The same trace-weighted background
+  is used by outer-loop h² checks and adaptive covariance-refit summaries.
+  `q_chive` already measures variance on the analysis scale and is not
+  multiplied by a GRM trace atom.
 - `h2_chive_guarded` is the validated counterpart of `h2_chive`
   and equals the top-level `h2` field whenever the COHERIT branch is valid.
 - `q_chive_components` retains the squared fitted-mean and residual-correction terms

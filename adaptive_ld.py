@@ -36,6 +36,7 @@ from .pcg import pcg_solve
 from .pipeline_common import (
     cleanup_path,
     compute_sample_mask,
+    genetic_variance,
     make_nonbed_input_fam,
     read_keep_ids,
     resolve_cpu_threads,
@@ -46,6 +47,7 @@ from .reml_model import FitConfig, InfinitesimalREMLFitter, standardize_response
 from .run_sparse_reml_pipeline import (
     MultiGRMIndex,
     _accepted_reml_theta,
+    _sparse_dense_h2,
     _validate_component_partition,
 )
 from .variant_io import iter_variant_records_for_prefix
@@ -605,7 +607,6 @@ def build_analysis_context(args: argparse.Namespace) -> AnalysisContext:
         precond_rank=plan.precond_rank,
         reml_pcg_tol=float(args.pcg_tol),
         response_is_standardized=True,
-        unit_variance_components=True,
         max_pcg_iters=int(args.max_pcg_iters),
         pcg_ridge=float(args.pcg_ridge),
         capture_reml_diagnostics=True,
@@ -794,7 +795,6 @@ def run_frozen_fit(args: argparse.Namespace) -> None:
         fit = context.fitter.fit_infinitesimal(
             jnp.asarray(residual, dtype=jnp.float32),
             jnp.asarray(context.covar, dtype=jnp.float32),
-            h2_init=float(np.sum(theta_init[:-1]) / np.sum(theta_init)),
             var_components_init=jnp.asarray(theta_init, dtype=jnp.float32),
         )
         theta, covariance_stop_reason = _accepted_reml_theta(
@@ -803,8 +803,14 @@ def run_frozen_fit(args: argparse.Namespace) -> None:
             stage="adaptive frozen-alpha covariance refit",
         )
         q_sparse = float(parent["q_chive"])
-        genetic = q_sparse + float(np.sum(theta[:-1]))
-        h2 = float(genetic / (genetic + float(theta[-1])))
+        genetic_trace_atoms = np.asarray(
+            jax.device_get(fit.genetic_trace_atoms), dtype=np.float64
+        )
+        h2 = _sparse_dense_h2(
+            q_sparse,
+            genetic_variance(theta[:-1], genetic_trace_atoms),
+            float(theta[-1]),
+        )
         history = list(fit.history)
         payload = {
             "schema_version": 1,
@@ -819,6 +825,8 @@ def run_frozen_fit(args: argparse.Namespace) -> None:
             "theta_initial": theta_init.tolist(),
             "theta": theta.tolist(),
             "var_components_lasso_ml": theta.tolist(),
+            "grm_variance_scale": "trace_weighted",
+            "genetic_trace_atoms": genetic_trace_atoms.tolist(),
             "h2": h2,
             "support_size": int(parent["support_size"]),
             "restricted_loglik_per_sample": float(fit.final_loglik),

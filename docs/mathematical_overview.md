@@ -158,9 +158,21 @@ to `1`.
 ## PCG and Stochastic Log Determinants
 
 Block multi-RHS PCG supplies the `H^-1` applications. It uses periodic
-convergence checks to avoid synchronizing the GPU after every iteration. A REML
-evaluation is rejected with an explicit error if either the main projection
-solve or the AI solve reports a non-finite or above-tolerance residual.
+convergence checks to avoid synchronizing the GPU after every iteration.
+Each RHS is scaled by a power of two during the solve, with no change to the
+covariance or preconditioner. This protects small/large RHS columns without
+adding absolute constants to the CG step denominators. Zero RHS columns have
+the exact solution zero, and converged columns are excluded from further steps.
+
+Before returning, PCG recomputes `B - H X` for the solution in its original
+units and reports the maximum per-column relative residual. A recursive
+convergence check that fails this verification restarts from the true residual
+within the original iteration budget. This costs one additional operator
+application per verification, rather than per iteration. If the requested
+accuracy is unattainable at the working precision or within the budget, the
+returned residual remains above tolerance. A REML evaluation is rejected with
+an explicit error if either the main projection solve or the AI solve reports
+a non-finite or above-tolerance residual.
 
 The log determinant is estimated with stochastic Lanczos quadrature (SLQ). The
 same SLQ probes are reused across strict line-search trials, so candidate
@@ -234,6 +246,15 @@ h2  = V_G / (V_G + V_E)
 Only when every atom equals one does this reduce to the familiar ratio of raw
 parameter sums. Default initialization is trace-calibrated so that `h2_init`
 has this meaning for standard, admixed, and effective-rank SMILE kernels.
+
+Sparse COHERIT retains its explicit kernel-coefficient initialization and uses
+these same trace atoms for background variance throughout its outer loop and
+adaptive covariance refits. With calibrated sparse variance `Q`, it reports
+`h2 = (Q + V_G) / (Q + V_G + V_E)`. `Q` is computed directly from the sparse
+fitted mean and residual on the analysis scale and receives no trace factor.
+Mean-imputed genotypes can make `tr(K_g) / n` smaller than one even when all
+observed genotype columns were standardized. Reporting their actual trace
+atoms does not change `H`, its REML derivatives, or BLUP effects.
 
 Repeated `n_reml_reps` fits vary the randomized probes. Their spread estimates
 Monte Carlo uncertainty of the replicate mean; it is not a sample-deletion

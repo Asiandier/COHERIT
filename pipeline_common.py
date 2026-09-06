@@ -15,6 +15,19 @@ logger = logging.getLogger(__name__)
 from .suggest_params_v3 import suggest_call_width, PlanResult
 
 
+def genetic_variance(theta_g, trace_atoms) -> float:
+    """Return sample-average genetic variance for unchanged kernel coefficients.
+
+    Each atom is ``tr(K_g) / n`` on the samples used to fit the covariance.
+    This converts coefficients to variance contributions without rescaling K.
+    """
+    coefficients = np.asarray(theta_g, dtype=np.float64)
+    atoms = np.asarray(trace_atoms, dtype=np.float64)
+    if coefficients.ndim != 1 or coefficients.shape != atoms.shape:
+        raise ValueError("Genetic coefficients and trace atoms must be aligned vectors.")
+    return float(coefficients @ atoms)
+
+
 # ---------------------------------------------------------------------------
 # Environment / GPU helpers
 # ---------------------------------------------------------------------------

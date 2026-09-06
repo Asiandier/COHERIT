@@ -1226,9 +1226,10 @@ def fit_reml(
     supplied; low-level callers must include an intercept when it is part of
     the intended fixed-effect model.
 
-    ``unit_variance_components=True`` is the sparse-COHERIT contract for
-    standardized GRMs: every covariance component contributes its fitted
-    coefficient directly, so trace atoms are neither computed nor returned.
+    ``unit_variance_components=True`` assumes every supplied kernel already
+    has unit mean diagonal, so trace atoms are neither computed nor returned.
+    It does not normalize kernels. Sparse COHERIT uses the default actual
+    trace atoms, including when mean-imputed genotypes have missing entries.
 
     ``slq_precond_conf`` is factorized once at the initial parameter vector and
     remains the residual-SLQ reference for the full fit. ``precond_conf`` is the

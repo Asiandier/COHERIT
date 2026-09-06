@@ -1,7 +1,9 @@
 import importlib
+import json
 import os
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -20,6 +22,60 @@ load_component_groups = ADAPTIVE.load_component_groups
 load_ld_rank = ADAPTIVE.load_ld_rank
 write_root_component_spec = ADAPTIVE.write_root_component_spec
 write_ld_rank_artifact = LD_SCORE.write_ld_rank_artifact
+
+
+def test_frozen_fit_uses_current_partition_trace_and_keeps_sparse_variance(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    theta = np.asarray([0.3, 0.2, 0.5])
+    atoms = np.asarray([0.5, 1.5])
+    q = 0.12
+    sparse_mean = np.asarray([0.1, -0.1, 0.0])
+    calls = {}
+
+    def fit_infinitesimal(response, covar, *, var_components_init):
+        calls["response"] = np.asarray(response)
+        calls["theta_init"] = np.asarray(var_components_init)
+        return SimpleNamespace(
+            var_components=theta,
+            genetic_trace_atoms=atoms,
+            final_loglik=-0.7,
+            history=[{"stop_reason": "ll_down", "accepted": False, "converged": True}],
+        )
+
+    context = SimpleNamespace(
+        groups=[np.arange(2), np.arange(2, 6)],
+        grm_index=SimpleNamespace(m_total=6),
+        y=np.asarray([0.2, -0.3, 0.1]),
+        covar=np.ones((3, 1)),
+        fitter=SimpleNamespace(fit_infinitesimal=fit_infinitesimal),
+        close=lambda: calls.update(closed=True),
+    )
+    parent_path = tmp_path / "parent.json"
+    # The parent has a different partition: its atom must not be reused.
+    parent_path.write_text(json.dumps({
+        "q_chive": q, "support_size": 1, "genetic_trace_atoms": [0.8],
+    }))
+    args = SimpleNamespace(
+        parent_summary=parent_path,
+        state_path=tmp_path / "state.npz",
+        component_spec=tmp_path / "child.npz",
+        theta_init_json=json.dumps(theta.tolist()),
+        out=tmp_path / "frozen.json",
+    )
+    monkeypatch.setattr(ADAPTIVE, "build_analysis_context", lambda args: context)
+    monkeypatch.setattr(ADAPTIVE, "_load_sparse_mean", lambda *args: (None, None, sparse_mean))
+    ADAPTIVE.run_frozen_fit(args)
+    summary = json.loads(args.out.read_text())
+    assert calls["closed"]
+    np.testing.assert_allclose(calls["response"], context.y - sparse_mean)
+    np.testing.assert_allclose(calls["theta_init"], theta)
+    np.testing.assert_array_equal(summary["var_components_lasso_ml"], theta)
+    np.testing.assert_array_equal(summary["genetic_trace_atoms"], atoms)
+    assert summary["grm_variance_scale"] == "trace_weighted"
+    assert summary["q_chive"] == q
+    assert summary["h2"] == pytest.approx((q + 0.45) / (q + 0.45 + 0.5))
+    assert summary["stop_reason"] == "ll_down"
 
 
 def test_add_ld_boundary_preserves_genetic_variance_and_rank_intervals(

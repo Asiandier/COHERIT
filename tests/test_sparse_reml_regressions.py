@@ -102,17 +102,67 @@ def test_k1_component_spec_index_matches_unpartitioned_coordinates():
     )
 
 
-def test_multi_grm_theta_parser_uses_unit_variance_contributions():
+def test_multi_grm_theta_parser_preserves_kernel_coefficients():
     theta = SPARSE._parse_variance_components_init(
         "[0.2, 0.3, 0.4]", n_grm=2
     )
     assert SPARSE._sparse_dense_h2(
-        0.1, float(np.sum(theta[:-1])), float(theta[-1])
+        0.1, SPARSE.genetic_variance(theta[:-1], [0.5, 0.8]), float(theta[-1])
     ) == pytest.approx(
-        0.6
+        0.44 / 0.84
     )
+    np.testing.assert_array_equal(theta, [0.2, 0.3, 0.4])
     with pytest.raises(ValueError, match="expected 3"):
         SPARSE._parse_variance_components_init("[0.2, 0.8]", n_grm=2)
+
+
+@pytest.mark.parametrize("scales", [(1.0,), (0.5,), (0.4, 1.4), (0.0, 0.7)])
+def test_trace_weighted_variance_matches_dense_covariance_without_changing_reml(scales):
+    rng = np.random.default_rng(903)
+    n = 24
+    kernels = []
+    for scale in scales:
+        z = rng.normal(size=(n, 8))
+        kernel = z @ z.T
+        kernels.append(kernel * (scale / np.mean(np.diag(kernel))))
+    operators = [
+        lambda value, kernel=REML.jnp.asarray(k, dtype=REML.jnp.float32): kernel @ value
+        for k in kernels
+    ]
+    kwargs = dict(
+        y=REML.jnp.asarray(rng.normal(size=n), dtype=REML.jnp.float32),
+        K_mvs=operators,
+        diag_list=[REML.jnp.asarray(np.diag(k)) for k in kernels],
+        covar=REML.jnp.ones((n, 1)),
+        param_init=REML.jnp.asarray([0.4 / len(scales)] * len(scales) + [0.6]),
+        n_rand_vec=32,
+        maxiter=100,
+        minq_iter=3,
+        slq_samples=32,
+        slq_m=n,
+        pcg_tol=1e-7,
+        precond_conf=None,
+        response_is_standardized=True,
+        return_diagnostics=True,
+        verbose=False,
+    )
+    old_theta, _, old_diagnostics = REML.fit_reml(
+        **kwargs, unit_variance_components=True
+    )
+    theta, _, diagnostics = REML.fit_reml(**kwargs)
+    np.testing.assert_array_equal(theta, old_theta)
+    for key in ("grad", "ai", "loglik"):
+        np.testing.assert_array_equal(diagnostics[key], old_diagnostics[key])
+    atoms = np.asarray(diagnostics["genetic_trace_atoms"])
+    np.testing.assert_allclose(atoms, scales, atol=1e-7)
+    genetic_covariance = sum(float(t) * k for t, k in zip(theta[:-1], kernels))
+    dense_variance = np.trace(genetic_covariance) / n
+    background = SPARSE.genetic_variance(np.asarray(theta[:-1]), atoms)
+    assert background == pytest.approx(dense_variance, abs=1e-7)
+    q = 0.13
+    assert SPARSE._sparse_dense_h2(q, background, float(theta[-1])) == pytest.approx(
+        (q + dense_variance) / (q + dense_variance + float(theta[-1]))
+    )
 
 
 def test_component_spec_partition_must_be_exhaustive_and_disjoint():
@@ -712,7 +762,7 @@ def test_coherit_guard_accepts_only_a_certified_finite_estimator():
 def test_sparse_output_contract_is_coherit_only():
     contract = SPARSE._sparse_output_contract()
 
-    assert contract["sparse_output_schema_version"] == 9
+    assert contract["sparse_output_schema_version"] == 10
     assert contract["estimator_mode"] == "coherit"
     assert contract["computed_estimators"] == ["h2_chive"]
     assert contract["selected_snp_columns"][-1] == "beta_lasso"
@@ -767,6 +817,56 @@ def test_fixed_lambda_ratio_canonicalizes_lambda_max_endpoint():
     assert SPARSE._canonical_fixed_lam_ratio(0.9999999999999998) == 1.0
     assert SPARSE._canonical_fixed_lam_ratio(1.0000000000000002) == 1.0
     assert SPARSE._canonical_fixed_lam_ratio(0.999999) == pytest.approx(0.999999)
+
+
+@pytest.mark.parametrize(
+    "minimum, selected",
+    [
+        (0.1, 0.09999999999999999),
+        (0.1, 0.1),
+        (0.1, np.nextafter(0.1, np.inf)),
+        (0.1, 0.25),
+        (1e-14, np.nextafter(1e-14, 0.0)),
+    ],
+)
+def test_fixed_lambda_ratio_cli_accepts_lower_endpoint_roundoff(
+    monkeypatch, minimum, selected
+):
+    monkeypatch.setattr(
+        sys, "argv",
+        [
+            "gpu-reml-sparse",
+            "--lasso-lam-min-ratio", str(minimum),
+            "--lasso-fixed-lam-ratio", str(selected),
+        ],
+    )
+    args = SPARSE.parse_args()
+    monkeypatch.setattr(SPARSE, "parse_args", lambda: args)
+
+    # Reaching the warm-start requirement proves the ratio passed validation,
+    # without loading genotype data or running a fit.
+    with pytest.raises(SystemExit, match="requires both its validation-selected"):
+        SPARSE.main()
+    assert args.lasso_fixed_lam_ratio == selected
+
+
+@pytest.mark.parametrize(
+    "minimum, selected",
+    [(0.1, 0.099999999), (1e-14, 0.9e-14)],
+)
+def test_fixed_lambda_ratio_cli_rejects_values_below_path(
+    monkeypatch, minimum, selected
+):
+    monkeypatch.setattr(
+        sys, "argv",
+        [
+            "gpu-reml-sparse",
+            "--lasso-lam-min-ratio", str(minimum),
+            "--lasso-fixed-lam-ratio", str(selected),
+        ],
+    )
+    with pytest.raises(SystemExit, match="must be at least --lasso-lam-min-ratio"):
+        SPARSE.main()
 
 
 def test_sparse_pipeline_has_no_max_active_cap(monkeypatch):

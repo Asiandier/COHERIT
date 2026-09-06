@@ -58,10 +58,14 @@ GPU_REML is organized around one contract: a covariance component must expose
   manifest remain responsible for equivalent validation.
 - Fixed effects must be full column rank. High-level loaders add an intercept;
   low-level callers control the design matrix explicitly.
-- Every REML fit standardizes its response internally and records the mean and
-  scale needed for effects and predictions. Sparse residual-ML converts its
-  unit-residual variance estimates back to the global standardized-phenotype
-  scale before combining them with sparse quadratic terms.
+- REML standardizes its response unless `response_is_standardized=True`.
+  Sparse COHERIT standardizes the phenotype once at entry and retains that
+  scale through residual REML, LASSO, calibrated quadratics, and prediction.
+- Sparse covariance parameters remain coefficients of the original kernels.
+  Outer-loop h², final COHERIT h², and adaptive frozen-mean summaries use
+  `sum_g theta_g * tr(K_g) / n` for background genetic variance. The trace
+  atoms belong to the current fit's samples and partition; prediction keeps
+  the training coefficients and standardization without rescaling the kernels.
 - Strict REML requires converged PCG solves and symmetric operators. Approximate
   `smile_scoring` is a separate opt-in optimization policy.
 
