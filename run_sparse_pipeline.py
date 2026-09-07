@@ -646,10 +646,18 @@ def _run_adaptive_selection(
                         str(current_summary_path),
                         "--rank-path",
                         str(rank_path),
-                        "--bootstrap-draws",
-                        str(int(args.bootstrap_draws)),
-                        "--bootstrap-seed",
-                        str(int(args.bootstrap_seed) + current_k),
+                        "--score-core-rank",
+                        str(int(args.score_core_rank)),
+                        "--score-reference-samples",
+                        str(int(args.score_reference_samples)),
+                        "--score-trace-probes",
+                        str(int(args.score_trace_probes)),
+                        "--score-trace-max-probes",
+                        str(int(args.score_trace_max_probes)),
+                        "--score-trace-tol",
+                        format(float(args.score_trace_tol), ".8g"),
+                        "--score-trace-seed",
+                        str(int(args.score_trace_seed) + current_k),
                         "--split-alpha",
                         format(float(args.split_alpha), ".8g"),
                         "--out",
@@ -659,7 +667,9 @@ def _run_adaptive_selection(
                 adaptive_dir / f"k{current_k:04d}.score.log",
             )
         score = read_json(score_path)
-        p_value = float(score["diagnostics"]["global_sup_score_p_value"])
+        if score.get("schema_version") != 3:
+            raise ValueError(f"Unsupported score schema; rerun the score stage: {score_path}")
+        p_value = float(score["diagnostics"]["global_p_value"])
         selected = score.get("selected_candidate")
         path[-1].update(
             {
@@ -897,8 +907,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--kkt-add-topk", type=int, default=256)
     parser.add_argument("--kkt-max-rounds", type=int, default=30)
 
-    parser.add_argument("--bootstrap-draws", type=int, default=199)
-    parser.add_argument("--bootstrap-seed", type=int, default=20260831)
+    parser.add_argument("--score-core-rank", type=int, default=64,
+                        help="Shared subspace dimension for the joint quadratic score reference.")
+    parser.add_argument("--score-reference-samples", type=int, default=16383,
+                        help="Fixed number of joint quadratic integration samples.")
+    parser.add_argument("--score-trace-probes", type=int, default=512,
+                        help="Initial independent trace probes per score stage.")
+    parser.add_argument("--score-trace-max-probes", type=int, default=4096,
+                        help="Maximum probes per independent group before a precision error.")
+    parser.add_argument("--score-trace-tol", type=float, default=0.05,
+                        help="Target standard error for standardized scores and information scale.")
+    parser.add_argument("--score-trace-seed", type=int, default=20260831)
     parser.add_argument("--split-alpha", type=float, default=0.05)
     parser.add_argument("--adaptive-max-k", type=int, default=128)
 
@@ -943,7 +962,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "candidate_k",
         "kkt_add_topk",
         "kkt_max_rounds",
-        "bootstrap_draws",
+        "score_core_rank",
+        "score_reference_samples",
+        "score_trace_probes",
+        "score_trace_max_probes",
         "adaptive_max_k",
         "n_rand_vec",
         "slq_samples",
@@ -955,8 +977,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     for name in positive_integer_names:
         if int(getattr(args, name)) < 1:
             parser.error(f"--{name.replace('_', '-')} must be positive.")
-    if args.bootstrap_draws < 19:
-        parser.error("--bootstrap-draws must be at least 19.")
+    if args.score_reference_samples < 255:
+        parser.error("--score-reference-samples must be at least 255.")
+    if 1 / (args.score_reference_samples + 1) > args.split_alpha:
+        parser.error("--score-reference-samples cannot resolve --split-alpha.")
+    if args.score_trace_probes < 32:
+        parser.error("--score-trace-probes must be at least 32.")
+    if args.score_trace_max_probes < args.score_trace_probes:
+        parser.error("--score-trace-max-probes must be >= --score-trace-probes.")
+    if not 0 < args.score_trace_tol <= 0.25:
+        parser.error("--score-trace-tol must lie in (0, 0.25].")
+    if args.score_trace_seed < 0:
+        parser.error("--score-trace-seed must be nonnegative.")
     if args.ld_rank_bins < 2:
         parser.error("--ld-rank-bins must be at least 2.")
     if args.screen_topk < args.candidate_k:
@@ -1117,8 +1149,12 @@ def _configuration(args: argparse.Namespace) -> dict[str, Any]:
             else {
                 "ld_window_kb": int(args.ld_window_kb),
                 "ld_rank_bins": int(args.ld_rank_bins),
-                "bootstrap_draws": int(args.bootstrap_draws),
-                "bootstrap_seed": int(args.bootstrap_seed),
+                "score_core_rank": int(args.score_core_rank),
+                "score_reference_samples": int(args.score_reference_samples),
+                "score_trace_probes": int(args.score_trace_probes),
+                "score_trace_max_probes": int(args.score_trace_max_probes),
+                "score_trace_tol": float(args.score_trace_tol),
+                "score_trace_seed": int(args.score_trace_seed),
                 "split_alpha": float(args.split_alpha),
                 "max_k_safety_cap": int(args.adaptive_max_k),
                 "plink2": str(args.plink2),

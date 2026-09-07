@@ -126,14 +126,29 @@ the COHERIT estimator.
 The production `gpu-reml-sparse` runner has exactly two modes. `fixed` uses one
 whole-genome GRM or an exhaustive user-supplied `--component-spec`. `adaptive`
 starts from K=1, freezes the converged K=1 sparse mean, and tests balanced
-boundaries along one deterministic LD-score ordering. A significant global
-parametric-bootstrap LD-CUSUM score adds the strongest boundary, followed by a
-covariance-only REML refit; this continues until the global split score is no
-longer significant, or no candidate has identifiable efficient information.
-Non-finite score inputs are errors, not evidence for splitting.
+boundaries along one deterministic LD-score ordering. Independent trace probes
+estimate nuisance-adjusted covariance scores and their Fisher information.
+The maximum absolute standardized score is calibrated against one shared
+Gaussian quadratic-form reference over all available candidates. Its joint
+p-value must pass `--split-alpha` before the maximizing boundary is added.
+A covariance-only REML refit follows each split.
+The process stops when evidence is insufficient or no contrast is identifiable.
+The common quadratic reference retains dependence and non-Gaussian score tails.
+Non-finite inputs or unresolved trace precision cause an explicit numerical error.
 The selected endpoint partition then receives one full
 validation-lambda alpha/theta refit. Both modes finally freeze the selected
 lambda ratio and automatically warm-refit on training + validation samples.
+
+Adaptive scores use `--score-core-rank` (64), `--score-reference-samples` (16383),
+`--score-trace-probes` (512 initial probes per independent group),
+`--score-trace-max-probes` (4096), `--score-trace-tol` (0.05), and
+`--score-trace-seed`. Score JSON schema 3 records `global_p_value`, signed
+standardized scores, the joint critical value, and trace/PCG diagnostics.
+Large arrays use temporary files beside the score output, removed on completion
+or error; GPU reference evaluation uses bounded batches. The fitted null and
+finite probes give a plug-in p-value, not a finite-sample guarantee for the
+complete adaptive path. See [the score-test derivation](docs/adaptive_score.md)
+for the formulas, precision criterion, and validation procedure.
 
 Adaptive mode accepts an aligned `--ld-score` table with `ID` and `ld_score`
 columns. If it is omitted, the workflow invokes PLINK2 on the training samples,

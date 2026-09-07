@@ -14,6 +14,7 @@ GPU_REML is organized around one contract: a covariance component must expose
 | Numerical solver | `reml.py`, `pcg.py`, `precond.py` | Form the REML projection, Hutchinson scores, SLQ objective, AI matrix, constrained updates, and projected-core preconditioner. |
 | Public model API | `reml_model.py` | Build compatible operator bundles, manage preconditioner lifecycle, fit replicates, estimate effects, and predict. |
 | Downstream models | `lasso_cd.py`, `gwas.py` | Reuse the fitted covariance for sparse GLS and marginal GWAS. |
+| Adaptive partition | `run_sparse_pipeline.py`, `adaptive_ld.py`, `score_process.py` | Orchestrate the path, stream shared boundary contractions, and calibrate trace-defined quadratic scores. |
 
 ## Fit Lifecycle
 
@@ -101,6 +102,14 @@ GPU_REML is organized around one contract: a covariance component must expose
   parameter update, not during rejected line-search trials.
 - The default runtime uses JAX's pooled allocator with preallocation disabled.
   The platform allocator remains available as an explicit diagnostic override.
+- Adaptive scores use a common subspace and independent pilot/evaluation
+  covariance-factor probes. A single LD prefix shares genotype products across
+  boundaries. Only nuisance Fisher rows and evaluation variances are computed;
+  the common quadratic matrices retain dependence between candidates directly.
+  Large sketches and reference matrices are file-backed, and both projection
+  and GPU integration use bounded batches. Temporary files are removed even
+  on failure. Statistical and numerical assumptions are specified in
+  [adaptive_score.md](adaptive_score.md).
 
 ## Extension Points
 

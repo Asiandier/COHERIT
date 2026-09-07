@@ -69,7 +69,7 @@ def test_sparse_pipeline_automatic_fit_effects_prediction(tmp_path, mode):
     if mode == "adaptive":
         ld = tmp_path / "ld.tsv"
         ld.write_text("ID\tld_score\n" + "".join(f"{v}\t{i + 1}\n" for i, v in enumerate(variants)))
-        command += ["--ld-score", str(ld), "--ld-rank-bins", "4", "--bootstrap-draws", "39"]
+        command += ["--ld-score", str(ld), "--ld-rank-bins", "4", "--score-trace-probes", "64"]
     if mode == "alignment":
         worker = tmp_path / "alignment_worker.py"
         worker.write_text(
@@ -106,6 +106,27 @@ def test_sparse_pipeline_automatic_fit_effects_prediction(tmp_path, mode):
     assert len(output.with_suffix(".sparse_prediction.tsv").read_text().splitlines()) == 81
     if mode in {"fixed_multi", "missing_multi"}:
         assert final["n_grms"] == 2
+    if mode == "adaptive":
+        score_paths = sorted(tmp_path.glob("**/fixed_alpha_path/k*.score.json"))
+        assert score_paths
+        for score_path in score_paths:
+            score = json.loads(score_path.read_text())
+            assert score["schema_version"] == 3
+            assert score["method"] == "joint_quadratic_reml_ld_cusum"
+            diagnostics = score["diagnostics"]
+            assert score["accepted"] == (diagnostics["global_p_value"] <= 0.05)
+            if score["candidates"]:
+                assert diagnostics["calibration_method"] == "joint_core_probe_quadratic"
+                assert diagnostics["max_score_trace_standard_error"] <= 0.05
+                assert diagnostics["max_information_relative_standard_error"] <= 0.10
+                assert score["selected_candidate"] == score["candidates"][0]
+                assert all("trace_" in row["stage"] or row["stage"] in {
+                    "adaptive_ld_observed", "adaptive_ld_common_core", "covariate_projection"}
+                    for row in score["pcg"])
+                assert score["selected_candidate"]["score_statistic"] == max(
+                    row["score_statistic"] for row in score["candidates"])
+                assert diagnostics["global_p_value"] >= 1/(diagnostics["reference_samples"]+1)
+        assert not list(tmp_path.glob("**/.score-*"))
 
     for path in tmp_path.glob("**/*.history.json"):
         records = json.loads(path.read_text())

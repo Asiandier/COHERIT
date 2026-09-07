@@ -4,6 +4,8 @@ import os
 from pathlib import Path
 import sys
 
+import pytest
+
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PARENT = os.path.dirname(REPO_ROOT)
 if PARENT not in sys.path:
@@ -11,6 +13,36 @@ if PARENT not in sys.path:
 PKG = importlib.import_module(os.path.basename(REPO_ROOT))
 RUN_SPARSE = importlib.import_module(f"{PKG.__name__}.run_sparse_pipeline")
 _prepare_combined_fit_inputs = RUN_SPARSE._prepare_combined_fit_inputs
+
+
+def score_args():
+    return ["--mode", "adaptive", "--bed-prefix", "geno", "--pheno-txt", "train.pheno",
+            "--validation-pheno-txt", "validation.pheno", "--keep-path", "train.keep",
+            "--validation-keep-path", "validation.keep", "--out-prefix", "result"]
+
+
+def test_trace_score_cli_defaults():
+    args = RUN_SPARSE.parse_args(score_args())
+    assert args.score_core_rank == 64
+    assert args.score_reference_samples == 16383
+    assert args.score_trace_probes == 512
+    assert args.score_trace_max_probes == 4096
+    assert args.score_trace_tol == 0.05
+    assert args.score_trace_seed >= 0
+    assert not any("bootstrap" in name for name in vars(args))
+
+
+@pytest.mark.parametrize("option,value", [
+    ("--score-trace-probes", "1"), ("--score-trace-max-probes", "64"),
+    ("--score-trace-tol", "0"), ("--score-trace-tol", "nan"),
+    ("--score-trace-seed", "-1"), ("--bootstrap-draws", "199"),
+    ("--score-core-rank", "0"), ("--score-reference-samples", "1"),
+    ("--split-alpha", "0.00001"),
+])
+def test_invalid_trace_configuration_is_rejected(option, value):
+    with pytest.raises(SystemExit) as error:
+        RUN_SPARSE.parse_args(score_args()+[option, value])
+    assert error.value.code == 2
 
 
 def test_resume_digest_detects_source_changes(monkeypatch, tmp_path: Path) -> None:

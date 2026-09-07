@@ -33,6 +33,8 @@ tests/*
 !tests/test_sparse_pipeline_driver.py
 !tests/test_reml_probe_cache.py
 !tests/test_pcg_stability.py
+!tests/test_score_process.py
+!tests/validate_score_process.py
 !tests/test_sparse_pipeline_end_to_end.py
 
 # Local backup snapshot

@@ -2,9 +2,9 @@
 
 This module contains only the selected K=1 -> fixed-alpha LD-CUSUM -> endpoint
 refit algorithm.  Candidate boundaries are deterministic balanced cuts of one
-global LD-score ordering.  At each layer an efficient REML score is adjusted
-for the current GRM components and residual variance, and a parametric
-bootstrap calibrates the maximum over all still-available boundaries.
+global LD-score ordering. At each layer independent trace probes fit and
+evaluate covariance-score directions. A common Gaussian quadratic reference
+jointly calibrates the maximum absolute standardized score across all cuts.
 
 The user-facing orchestration lives in :mod:`GPU_REML.run_sparse_pipeline`.
 The small command-line interface here is internal: separate processes keep GPU
@@ -16,8 +16,10 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import json
+import logging
 import os
 from pathlib import Path
+import tempfile
 from typing import Any, Sequence
 
 from .runtime_env import configure_runtime_env
@@ -31,7 +33,6 @@ import numpy as np
 from .component_spec import load_component_specs
 from .data_utils import load_pheno_covar_aligned_with_transform
 from .geno_source import PgenGenoSource
-from .kv_impl import _device_put_block, _zxb_multi_one_call_jit
 from .pcg import pcg_solve
 from .pipeline_common import (
     cleanup_path,
@@ -51,6 +52,15 @@ from .run_sparse_reml_pipeline import (
     _validate_component_partition,
 )
 from .variant_io import iter_variant_records_for_prefix
+from .score_process import (
+    TracePrecisionError,
+    TraceSketch,
+    calibrate_boundary_maximum,
+    fit_nuisance_projection,
+    score_process_moments,
+)
+
+logger = logging.getLogger(__name__)
 
 
 def read_json(path: str | Path) -> dict[str, Any]:
@@ -258,100 +268,6 @@ def add_ld_boundary(
     }
 
 
-def efficient_score_statistics(
-    quadratics: np.ndarray,
-    *,
-    nuisance_count: int,
-    boundary_positions: np.ndarray,
-) -> tuple[list[dict[str, float | int]], dict[str, Any]]:
-    """Nuisance-adjust candidate scores and bootstrap the global maximum."""
-    values = np.asarray(quadratics, dtype=np.float64)
-    positions = np.asarray(boundary_positions, dtype=np.int64).reshape(-1)
-    if values.ndim != 2 or values.shape[1] < 20:
-        raise ValueError("Score calibration requires observed data plus >=19 draws.")
-    if values.shape[0] != nuisance_count + positions.size:
-        raise ValueError("Quadratic rows do not match nuisance and candidate counts.")
-    if nuisance_count < 1 or not np.all(np.isfinite(values)):
-        raise ValueError("Score calibration requires finite quadratics and nuisance rows.")
-    bootstrap_mean = np.mean(values[:, 1:], axis=1)
-    scores = 0.5 * (values - bootstrap_mean[:, None])
-    centered = scores[:, 1:] - np.mean(scores[:, 1:], axis=1, keepdims=True)
-    denominator = float(centered.shape[1] - 1)
-    nuisance_centered = centered[:nuisance_count]
-    nuisance_information = nuisance_centered @ nuisance_centered.T / denominator
-    nuisance_information = 0.5 * (nuisance_information + nuisance_information.T)
-    nuisance_inverse = np.linalg.pinv(
-        nuisance_information, rcond=1e-8, hermitian=True
-    )
-
-    rows: list[dict[str, float | int]] = []
-    statistic_rows: list[np.ndarray] = []
-    for offset, boundary in enumerate(positions.tolist()):
-        index = nuisance_count + offset
-        candidate_centered = centered[index]
-        cross = candidate_centered @ nuisance_centered.T / denominator
-        raw_information = float(candidate_centered @ candidate_centered / denominator)
-        information = float(
-            raw_information
-            - cross @ nuisance_inverse @ cross.T
-        )
-        # A contrast in the nuisance span is not testable. The relative
-        # roundoff guard also removes tiny positive Schur complements caused
-        # by cancellation; it is not a statistical significance threshold.
-        information_roundoff = (
-            64.0 * np.finfo(np.float64).eps * max(1, nuisance_count)
-            * raw_information
-        )
-        if not np.isfinite(information):
-            raise FloatingPointError("Non-finite efficient score information.")
-        if information <= information_roundoff:
-            continue
-        efficient = np.asarray(
-            scores[index] - cross @ nuisance_inverse @ scores[:nuisance_count],
-            dtype=np.float64,
-        )
-        statistics = np.square(efficient) / information
-        if not np.all(np.isfinite(statistics)):
-            raise FloatingPointError("Non-finite efficient score statistic.")
-        statistic_rows.append(statistics)
-        rows.append(
-            {
-                "boundary_position": int(boundary),
-                "raw_score": float(scores[index, 0]),
-                "efficient_score": float(efficient[0]),
-                "efficient_information": information,
-                "score_statistic": float(statistics[0]),
-            }
-        )
-    rows.sort(key=lambda row: float(row["score_statistic"]), reverse=True)
-    # The empty family must stop splitting, never acquire the minimum Monte
-    # Carlo p-value through comparisons against NaN.
-    maximum = (
-        np.max(np.stack(statistic_rows, axis=0), axis=0)
-        if statistic_rows else np.zeros(values.shape[1], dtype=np.float64)
-    )
-    observed_maximum = float(maximum[0])
-    bootstrap_maximum = np.asarray(maximum[1:], dtype=np.float64)
-    global_p = float(
-        (1 + np.count_nonzero(bootstrap_maximum >= observed_maximum))
-        / (bootstrap_maximum.size + 1)
-    )
-    diagnostics = {
-        "testable_candidate_count": len(rows),
-        "global_sup_score": observed_maximum,
-        "global_sup_score_p_value": global_p,
-        "bootstrap_max_quantiles": {
-            str(probability): float(np.quantile(bootstrap_maximum, probability))
-            for probability in (0.5, 0.9, 0.95, 0.99)
-        },
-        "nuisance_score": scores[:nuisance_count, 0].tolist(),
-        "nuisance_information_eigenvalues": np.linalg.eigvalsh(
-            nuisance_information
-        ).tolist(),
-    }
-    return rows, diagnostics
-
-
 @dataclass
 class REMLProjector:
     fitter: Any
@@ -448,65 +364,275 @@ class REMLProjector:
             projected = projected - self._vinv_c @ coefficients.astype(np.float32)
         return projected[:, 0] if squeeze else projected
 
-def sample_partitioned_null_residuals(
-    streamer: Any,
-    *,
-    theta: np.ndarray,
-    n_draws: int,
-    seed: int,
-) -> np.ndarray:
-    if not bool(getattr(streamer, "has_component_partition", False)):
-        raise ValueError("Adaptive bootstrap requires a partitioned streamer.")
-    values = np.asarray(theta, dtype=np.float64).reshape(-1)
-    if values.shape != (int(streamer.n_components) + 1,):
-        raise ValueError("Bootstrap theta does not align with the component partition.")
-    if np.any(values[:-1] < 0.0) or values[-1] <= 0.0:
-        raise ValueError("Bootstrap variance components are invalid.")
-    draws = int(n_draws)
-    if draws < 19:
-        raise ValueError("Adaptive bootstrap requires at least 19 draws.")
+@dataclass
+class BoundaryContractions:
+    """Apply all covariance directions through shared LD-bin prefix sums."""
 
-    rng = np.random.default_rng(int(seed))
-    result = jnp.zeros((int(streamer.n), draws), dtype=jnp.float32)
-    missing = jnp.asarray(np.uint8(streamer._missing_val), dtype=jnp.uint8)
-    if streamer._n_calls > 0:
-        streamer._prepare_kv_pass()
-        next_block = _device_put_block(streamer._pop_cached(0), streamer.dev)
-        for call_index in range(streamer._n_calls):
-            current_block = next_block
-            if call_index + 1 < streamer._n_calls:
-                next_block = _device_put_block(
-                    streamer._pop_cached(call_index + 1), streamer.dev
+    cache_order: np.ndarray
+    grid_positions: np.ndarray
+    candidates: np.ndarray
+    intervals: list[tuple[int, int]]
+    component_normalizers: np.ndarray
+
+    def __post_init__(self) -> None:
+        self.edges = np.r_[0, self.grid_positions, self.cache_order.size]
+        if (not np.all(np.isin(self.candidates, self.grid_positions))
+                or not np.all(np.isin(self.intervals, self.edges))):
+            raise ValueError("Candidates and component endpoints must align with the LD-rank grid.")
+        self.candidate_bins = np.searchsorted(self.grid_positions, self.candidates)
+        self.component_bins = [
+            (int(np.searchsorted(self.edges, start)), int(np.searchsorted(self.edges, stop)))
+            for start, stop in self.intervals
+        ]
+
+    def apply(self, left, right, marker_left, marker_right) -> np.ndarray:
+        bins = np.stack([
+            np.sum(
+                marker_left[self.cache_order[start:stop]].astype(np.float64)
+                * marker_right[self.cache_order[start:stop]].astype(np.float64), axis=0,
+            )
+            for start, stop in zip(self.edges[:-1], self.edges[1:], strict=True)
+        ])
+        nuisance = [
+            np.sum(bins[start:stop], axis=0) / normalizer
+            if normalizer > 0 else np.zeros(bins.shape[1])
+            for (start, stop), normalizer in zip(
+                self.component_bins, self.component_normalizers, strict=True
+            )
+        ]
+        nuisance.append(np.einsum(
+            "ij,ij->j", np.asarray(left, dtype=np.float64), np.asarray(right, dtype=np.float64)
+        ))
+        prefix = np.cumsum(bins, axis=0)
+        low = prefix[self.candidate_bins]
+        high = prefix[-1] - low
+        contrasts = (low / self.candidates[:, None]
+                     - high / (self.cache_order.size - self.candidates[:, None]))
+        return np.concatenate([np.stack(nuisance), contrasts], axis=0)
+
+    def bilinear(self, left, right, marker_left, marker_right, *, out=None):
+        """Full shared bilinear products with one running LD prefix."""
+        shape = (len(self.intervals) + 1 + len(self.candidates), left.shape[1], right.shape[1])
+        result = np.empty(shape, dtype=np.float64) if out is None else out
+        if result.shape != shape:
+            raise ValueError("Bilinear output shape does not match directions and vectors.")
+        width = max(1, min(16384, 32 * 1024**2 // (8 * max(1, left.shape[1] + right.shape[1]))))
+
+        def marker_product(start, stop):
+            value = np.zeros(shape[1:], dtype=np.float64)
+            for offset in range(start, stop, width):
+                indices = self.cache_order[offset:min(stop, offset + width)]
+                value += (np.asarray(marker_left[indices], dtype=np.float64).T
+                          @ np.asarray(marker_right[indices], dtype=np.float64))
+            return value
+
+        total = np.zeros(shape[1:], dtype=np.float64)
+        for g, ((start, stop), normalizer) in enumerate(zip(
+            self.intervals, self.component_normalizers, strict=True
+        )):
+            value = marker_product(start, stop)
+            total += value
+            result[g] = value / normalizer if normalizer > 0 else 0
+        identity = np.zeros(shape[1:], dtype=np.float64)
+        for offset in range(0, len(left), width):
+            identity += (np.asarray(left[offset:offset + width], dtype=np.float64).T
+                         @ np.asarray(right[offset:offset + width], dtype=np.float64))
+        result[len(self.intervals)] = identity
+        prefix = np.zeros_like(total)
+        candidate = 0
+        for start, stop in zip(self.edges[:-1], self.edges[1:], strict=True):
+            prefix += marker_product(start, stop)
+            if candidate < len(self.candidates) and stop == self.candidates[candidate]:
+                result[len(self.intervals) + 1 + candidate] = (
+                    prefix / stop - (total - prefix) / (self.cache_order.size - stop)
                 )
-            component = int(streamer._call_component_ids[call_index])
-            effective_m = float(streamer._component_eff_m_host[component])
-            scale = (
-                np.sqrt(values[component] / effective_m)
-                if effective_m > 0.0 and values[component] > 0.0
-                else 0.0
-            )
-            width = int(streamer._call_true_widths[call_index])
-            coefficients = np.zeros(
-                (streamer._max_unpack_width, draws), dtype=np.float32
-            )
-            coefficients[:width] = rng.standard_normal(
-                (width, draws), dtype=np.float32
-            ) * np.float32(scale)
-            result = result + _zxb_multi_one_call_jit(
-                current_block,
-                streamer._true_widths_dev[call_index],
-                streamer._means_by_call[call_index],
-                streamer._inv_by_call[call_index],
-                jax.device_put(jnp.asarray(coefficients), streamer.dev),
-                missing,
-            )
-            del current_block
-    noise = rng.standard_normal(
-        (int(streamer.n), draws), dtype=np.float32
-    ) * np.float32(np.sqrt(values[-1]))
-    result = result + jax.device_put(jnp.asarray(noise), streamer.dev)
-    return np.asarray(jax.device_get(result), dtype=np.float32)
+                candidate += 1
+        if candidate != len(self.candidates):
+            raise RuntimeError("Not all score candidates were visited.")
+        return result
 
+
+class ScoreWorkspace:
+    """Own large file-backed score arrays and remove them on success or failure."""
+
+    def __init__(self, directory: str | Path):
+        Path(directory).mkdir(parents=True, exist_ok=True)
+        self._temporary = tempfile.TemporaryDirectory(prefix=".score-", dir=directory)
+        self._maps: list[np.memmap] = []
+
+    def allocate(self, shape, *, dtype=np.float64):
+        if np.prod(shape, dtype=np.int64) * np.dtype(dtype).itemsize < 8 * 1024**2:
+            return np.empty(shape, dtype=dtype)
+        value = np.memmap(
+            Path(self._temporary.name) / f"{len(self._maps)}.bin",
+            mode="w+", dtype=dtype, shape=shape,
+        )
+        self._maps.append(value)
+        return value
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        for value in self._maps:
+            value._mmap.close()
+        self._maps.clear()
+        self._temporary.cleanup()
+
+
+def _score_rhs_width(projector, index):
+    return max(1, min(16, 32 * 1024**2 // (8 * (projector._covar.shape[0] + index.m_total))))
+
+
+def _factor_rhs(index, theta, streams):
+    """Covariance-factor Rademacher probes with exactly the GRM m_eff weights.
+
+    Each probe has its own stream, so growing/batching the group preserves its
+    prefix. Standardized genotype columns are extracted in bounded blocks.
+    """
+    n, m = index.streamer.n, index.m_total
+    normalizers = np.asarray(index.streamer._component_eff_m_host, dtype=np.float64)
+    weights = np.sqrt(np.divide(theta[:-1], normalizers, out=np.zeros_like(normalizers),
+                                where=normalizers > 0))
+    result = jnp.zeros((n, len(streams)), dtype=jnp.float32)
+    width = max(1, min(1024, 32 * 1024**2 // (4 * max(1, n))))
+    for start in range(0, m, width):
+        stop = min(m, start + width)
+        indices = np.arange(start, stop)
+        component = np.searchsorted(index.offsets[1:], indices, side="right")
+        signs = np.column_stack([
+            2 * rng.integers(0, 2, size=stop - start, dtype=np.int32) - 1 for rng in streams
+        ]).astype(np.float32)
+        if np.any(weights[component] > 0):
+            z = index.extract_standardized_columns(indices)
+            result = result + jnp.matmul(
+                jnp.asarray(z, dtype=jnp.float32),
+                jnp.asarray(weights[component, None] * signs, dtype=jnp.float32),
+                precision=jax.lax.Precision.HIGHEST,
+            )
+    residual = np.column_stack([
+        2 * rng.integers(0, 2, size=n, dtype=np.int32) - 1 for rng in streams
+    ]).astype(np.float32)
+    return np.asarray(result + jnp.asarray(np.sqrt(theta[-1]) * residual, dtype=jnp.float32))
+
+
+def _build_score_core(projector, index, contractions, rank, rng, workspace):
+    """Build H=PT with T'PT=I from a phenotype-independent root-GRM sketch."""
+    n = projector._covar.shape[0]
+    rank = min(int(rank), n, index.m_total)
+    width = _score_rhs_width(projector, index)
+    sketch = workspace.allocate((n, rank))
+    for offset in range(0, rank, width):
+        stop = min(rank, offset + width)
+        omega = rng.standard_normal((n, stop - offset), dtype=np.float32)
+        sketch[:, offset:stop] = np.asarray(index.streamer.kv(jnp.asarray(omega)))
+    basis, singular, _ = np.linalg.svd(sketch, full_matrices=False)
+    basis = basis[:, singular > 1e-7 * np.max(singular, initial=0.0)]
+    projected = workspace.allocate(basis.shape)
+    for offset in range(0, basis.shape[1], width):
+        projected[:, offset:offset + width] = projector.apply(
+            basis[:, offset:offset + width], stage="adaptive_ld_common_core",
+        )
+    gram = basis.T @ projected
+    values, rotation = np.linalg.eigh(0.5 * (gram + gram.T))
+    tolerance = 1e-7 * np.max(values, initial=0.0)
+    if np.min(values, initial=0.0) < -max(tolerance, np.finfo(float).eps):
+        raise TracePrecisionError("Common-core P Gram is indefinite beyond roundoff.")
+    keep = values > tolerance
+    transform = rotation[:, keep] / np.sqrt(values[keep])
+    h = projected @ transform
+    marker_h = workspace.allocate((index.m_total, h.shape[1]), dtype=np.float32)
+    for offset in range(0, h.shape[1], width):
+        marker_h[:, offset:offset + width] = index.xtv_all(
+            jnp.asarray(h[:, offset:offset + width], dtype=jnp.float32), normalize=False,
+        )
+    core = workspace.allocate((len(contractions.intervals) + 1 + len(contractions.candidates),
+                               h.shape[1], h.shape[1]))
+    contractions.bilinear(h, h, marker_h, marker_h, out=core)
+    return h, marker_h, core
+
+
+def _fill_probe_cache(projector, index, h, seed, samples, markers, start, stop, *, stage):
+    width = _score_rhs_width(projector, index)
+    for offset in range(start, stop, width):
+        end = min(stop, offset + width)
+        streams = [np.random.default_rng(child) for child in seed.spawn(end - offset)]
+        rhs = _factor_rhs(index, projector.theta, streams)
+        projected = projector.apply(rhs, stage=stage).astype(np.float64)
+        b = projected - h @ (h.T @ rhs)
+        samples[offset:end] = b.T
+        markers[offset:end] = index.xtv_all(jnp.asarray(b, dtype=jnp.float32), normalize=False).T
+
+
+def _probe_sketch(contractions, h, marker_h, core, samples, markers, workspace):
+    count = len(samples)
+    ql = len(core)
+    b, marker_b = samples.T, markers.T
+    cross = workspace.allocate((ql, h.shape[1], count))
+    bulk = workspace.allocate((ql, count, count))
+    contractions.bilinear(h, b, marker_h, marker_b, out=cross)
+    contractions.bilinear(b, b, marker_b, marker_b, out=bulk)
+    diagonal = np.diagonal(bulk, axis1=1, axis2=2).copy()
+    index = np.arange(count)
+    bulk[:, index, index] = 0
+    return TraceSketch(core, cross, bulk, diagonal)
+
+
+def _estimate_score_process(args, projector, grm_index, contractions, response, *, workspace):
+    q = len(contractions.intervals) + 1
+    projected = projector.apply(response[:, None], stage="adaptive_ld_observed")
+    marker = np.asarray(grm_index.xtv_all(jnp.asarray(projected), normalize=False))
+    quadratics = contractions.apply(projected, projected, marker, marker)[:, 0]
+    core_seed, pilot_seed, evaluation_seed, reference_seed = np.random.SeedSequence(
+        args.score_trace_seed
+    ).spawn(4)
+    h, marker_h, core = _build_score_core(
+        projector, grm_index, contractions, args.score_core_rank, np.random.default_rng(core_seed), workspace,
+    )
+    limit = int(args.score_trace_max_probes)
+    pilot_count = min(limit, max(int(args.score_trace_probes), 4 * q))
+    n, m = response.size, grm_index.m_total
+    pilot_samples = workspace.allocate((pilot_count, n), dtype=np.float32)
+    pilot_markers = workspace.allocate((pilot_count, m), dtype=np.float32)
+    _fill_probe_cache(projector, grm_index, h, pilot_seed, pilot_samples, pilot_markers,
+                      0, pilot_count, stage="adaptive_ld_trace_pilot")
+    pilot = _probe_sketch(contractions, h, marker_h, core, pilot_samples, pilot_markers, workspace)
+    coefficients, nuisance_eigenvalues = fit_nuisance_projection(pilot, q)
+    del pilot, pilot_samples, pilot_markers
+    samples = workspace.allocate((limit, n), dtype=np.float32)
+    markers = workspace.allocate((limit, m), dtype=np.float32)
+    target, count = int(args.score_trace_probes), 0
+    while True:
+        _fill_probe_cache(projector, grm_index, h, evaluation_seed, samples, markers,
+                          count, target, stage="adaptive_ld_trace_evaluation")
+        count = target
+        evaluation = _probe_sketch(contractions, h, marker_h, core,
+                                   samples[:count], markers[:count], workspace)
+        reference = workspace.allocate(
+            (len(contractions.candidates), h.shape[1] + count, h.shape[1] + count),
+            dtype=np.float32,
+        )
+        process = score_process_moments(
+            quadratics, evaluation=evaluation, coefficients=coefficients,
+            boundary_positions=contractions.candidates, reference_out=reference,
+        )
+        process.diagnostics.update(
+            pilot_probes=pilot_count,
+            nuisance_information_eigenvalues=nuisance_eigenvalues.tolist(),
+            reference_seed=int(reference_seed.generate_state(1)[0]),
+        )
+        error = max(process.diagnostics["max_score_trace_standard_error"],
+                    process.diagnostics["max_information_relative_standard_error"] / 2)
+        logger.info("Adaptive score: core rank %d, %d pilot, %d evaluation probes; standard error %.3g",
+                    h.shape[1], pilot_count, count, error)
+        if error <= args.score_trace_tol:
+            return process
+        if count >= limit:
+            raise TracePrecisionError(
+                f"Score trace standard error {error:.3g} exceeds {args.score_trace_tol:.3g}; "
+                f"increase --score-trace-max-probes (current {limit})."
+            )
+        target = min(limit, 2 * target)
 
 @dataclass
 class AnalysisContext:
@@ -655,126 +781,75 @@ def run_score(args: argparse.Namespace) -> None:
         theta = np.asarray(summary["var_components_lasso_ml"], dtype=np.float64)
         if theta.shape != (len(context.groups) + 1,):
             raise ValueError("Score parent theta does not align with its partition.")
+        if not np.all(np.isfinite(theta)) or np.any(theta[:-1] < 0) or theta[-1] <= 0:
+            raise ValueError("Score parent variance components are invalid.")
+        source_order, grid_positions = load_ld_rank(args.rank_path)
+        intervals = _rank_intervals(context.groups, source_order)
+        current_positions = existing_boundary_positions(context.groups, source_order)
+        candidates = np.setdiff1d(grid_positions, current_positions, assume_unique=True)
+        parent_indices = np.searchsorted([stop for _start, stop in intervals], candidates)
+        positive_parent = theta[parent_indices] > 0
+        excluded = candidates[~positive_parent]
+        candidates = candidates[positive_parent]
+        base = {
+            "schema_version": 3,
+            "method": "joint_quadratic_reml_ld_cusum",
+            "criterion": "global_p_value_le_split_alpha",
+            "split_alpha": float(args.split_alpha),
+            "current_k": len(context.groups),
+            "current_boundaries": current_positions.tolist(),
+            "available_boundary_count": int(candidates.size),
+            "zero_parent_boundaries_excluded": excluded.tolist(),
+            "score_trace_seed": int(args.score_trace_seed),
+        }
+        if not candidates.size:
+            atomic_json(args.out, {
+                **base, "accepted": False,
+                "stop_reason": "no_positive_parent_variance" if excluded.size else "no_available_boundary",
+                "selected_candidate": None, "candidates": [],
+                "diagnostics": {"global_p_value": 1.0, "calibration_method": "empty_family",
+                                "testable_candidate_count": 0, "reference_samples": 0},
+            })
+            return
         ops = context.fitter._assemble_reml_operators()
         context.fitter._ensure_projected_core_precond_ready(
             ops, var_components_init=jnp.asarray(theta, dtype=jnp.float32)
         )
         projector = REMLProjector(
-            fitter=context.fitter,
-            ops=ops,
-            theta=theta,
-            covar=context.covar,
-            pcg_tol=float(args.pcg_tol),
+            fitter=context.fitter, ops=ops, theta=theta, covar=context.covar,
+            pcg_tol=min(float(args.pcg_tol), 1e-5, float(args.score_trace_tol) / 10),
             max_pcg_iters=int(args.max_pcg_iters),
         )
-        _markers, _beta, sparse_mean = _load_sparse_mean(
-            args.state_path, context.grm_index
-        )
-        # P_theta already profiles every column of C because P_theta C = 0.
-        # Subtracting a separately fitted C gamma before applying the same
-        # projector is algebraically redundant and adds an unnecessary PCG
-        # solve.  Keep only the frozen sparse mean outside the projector.
-        working_response = (
-            context.y.astype(np.float64) - sparse_mean
-        ).astype(np.float32)
-        bootstrap = sample_partitioned_null_residuals(
-            context.fitter.streamers[0],
-            theta=theta,
-            n_draws=int(args.bootstrap_draws),
-            seed=int(args.bootstrap_seed),
-        )
-        projected = projector.apply(
-            np.concatenate([working_response[:, None], bootstrap], axis=1),
-            stage="adaptive_ld_observed_and_bootstrap",
-        )
-        marker_projection = np.asarray(
-            context.grm_index.xtv_all(
-                jnp.asarray(projected, dtype=jnp.float32), normalize=False
+        _markers, _beta, sparse_mean = _load_sparse_mean(args.state_path, context.grm_index)
+        # P already profiles C; retain the same frozen sparse mean and response
+        # scale as the covariance fit. No simulated phenotype enters this stage.
+        response = (context.y.astype(np.float64) - sparse_mean).astype(np.float32)
+        contractions = BoundaryContractions(
+            cache_order=context.grm_index.cache_variant_indices(source_order),
+            grid_positions=grid_positions, candidates=candidates, intervals=intervals,
+            component_normalizers=np.asarray(
+                context.fitter.streamers[0]._component_eff_m_host, dtype=np.float64
             ),
-            dtype=np.float64,
         )
-        nuisance = [
-            np.mean(
-                np.square(marker_projection[int(start) : int(stop)]), axis=0
+        with jax.default_device(context.grm_index.streamer.dev), ScoreWorkspace(Path(args.out).parent) as workspace:
+            process = _estimate_score_process(
+                args, projector, context.grm_index, contractions, response, workspace=workspace,
             )
-            for start, stop in zip(
-                context.grm_index.offsets[:-1],
-                context.grm_index.offsets[1:],
-                strict=True,
+            rows, diagnostics = calibrate_boundary_maximum(
+                process, alpha=float(args.split_alpha), samples=int(args.score_reference_samples),
+                seed=process.diagnostics["reference_seed"],
             )
-        ]
-        nuisance.append(np.einsum("ij,ij->j", projected, projected, optimize=True))
-
-        source_order, grid_positions = load_ld_rank(args.rank_path)
-        current_positions = existing_boundary_positions(context.groups, source_order)
-        candidates = np.setdiff1d(
-            grid_positions, current_positions, assume_unique=True
+        accepted = bool(diagnostics["accepted"])
+        stop_reason = (
+            "split_signal" if accepted else "no_testable_contrast" if not rows else
+            "global_score_not_significant"
         )
-        if not candidates.size:
-            payload = {
-                "schema_version": 1,
-                "accepted": False,
-                "stop_reason": "no_available_boundary",
-                "current_k": len(context.groups),
-                "candidates": [],
-                "diagnostics": {"global_sup_score_p_value": 1.0},
-            }
-            atomic_json(args.out, payload)
-            return
-
-        cache_order = context.grm_index.cache_variant_indices(source_order)
-        grid_edges = np.concatenate([[0], grid_positions, [source_order.size]])
-        bin_sums: list[np.ndarray] = []
-        bin_sizes: list[int] = []
-        for start, stop in zip(grid_edges[:-1], grid_edges[1:], strict=True):
-            indices = cache_order[int(start) : int(stop)]
-            bin_sums.append(np.sum(np.square(marker_projection[indices]), axis=0))
-            bin_sizes.append(int(indices.size))
-        cumulative_sums = np.cumsum(np.stack(bin_sums, axis=0), axis=0)
-        cumulative_sizes = np.cumsum(np.asarray(bin_sizes, dtype=np.int64))
-        total_sum = cumulative_sums[-1]
-        total_size = int(cumulative_sizes[-1])
-        grid_index_by_position = {
-            int(position): index
-            for index, position in enumerate(grid_positions.tolist())
-        }
-        candidate_quadratics: list[np.ndarray] = []
-        for position in candidates.tolist():
-            boundary_index = grid_index_by_position[int(position)]
-            low_size = int(cumulative_sizes[boundary_index])
-            high_size = total_size - low_size
-            low = cumulative_sums[boundary_index] / low_size
-            high = (total_sum - cumulative_sums[boundary_index]) / high_size
-            candidate_quadratics.append(low - high)
-        quadratics = np.stack(nuisance + candidate_quadratics, axis=0)
-        rows, diagnostics = efficient_score_statistics(
-            quadratics,
-            nuisance_count=len(nuisance),
-            boundary_positions=candidates,
-        )
-        alpha = float(args.split_alpha)
-        accepted = bool(rows and diagnostics["global_sup_score_p_value"] <= alpha)
-        payload = {
-            "schema_version": 1,
-            "method": "parametric_bootstrap_efficient_reml_ld_cusum",
-            "criterion": "global_sup_score_p_value_le_split_alpha",
-            "split_alpha": alpha,
-            "accepted": accepted,
-            "stop_reason": (
-                "split_signal" if accepted else
-                "global_score_rejected" if rows else "no_testable_contrast"
-            ),
-            "current_k": len(context.groups),
+        atomic_json(args.out, {
+            **base, "accepted": accepted, "stop_reason": stop_reason,
             "selected_candidate": rows[0] if rows else None,
-            "candidates": rows,
-            "diagnostics": diagnostics,
-            "bootstrap_draws": int(args.bootstrap_draws),
-            "bootstrap_seed": int(args.bootstrap_seed),
-            "current_boundaries": current_positions.tolist(),
-            "available_boundary_count": int(candidates.size),
+            "candidates": rows, "diagnostics": diagnostics,
             "pcg": projector.solve_diagnostics,
-        }
-        atomic_json(args.out, payload)
+        })
     finally:
         context.close()
 
@@ -870,8 +945,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     _add_common_fit_arguments(score)
     score.add_argument("--summary-path", required=True)
     score.add_argument("--rank-path", required=True)
-    score.add_argument("--bootstrap-draws", type=int, default=199)
-    score.add_argument("--bootstrap-seed", type=int, default=20260831)
+    score.add_argument("--score-core-rank", type=int, default=64)
+    score.add_argument("--score-reference-samples", type=int, default=16383)
+    score.add_argument("--score-trace-probes", type=int, default=512)
+    score.add_argument("--score-trace-max-probes", type=int, default=4096)
+    score.add_argument("--score-trace-tol", type=float, default=0.05)
+    score.add_argument("--score-trace-seed", type=int, default=20260831)
     score.add_argument("--split-alpha", type=float, default=0.05)
     score.add_argument("--out", required=True)
 
@@ -891,8 +970,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     ):
         parser.error("Threads, GPU budget, call width, and ring depth must be nonnegative.")
     if args.command == "score":
-        if args.bootstrap_draws < 19:
-            parser.error("--bootstrap-draws must be at least 19.")
+        if args.score_core_rank < 1:
+            parser.error("--score-core-rank must be positive.")
+        if args.score_reference_samples < 255:
+            parser.error("--score-reference-samples must be at least 255.")
+        if 1 / (args.score_reference_samples + 1) > args.split_alpha:
+            parser.error("--score-reference-samples cannot resolve --split-alpha.")
+        if args.score_trace_probes < 32:
+            parser.error("--score-trace-probes must be at least 32.")
+        if args.score_trace_max_probes < args.score_trace_probes:
+            parser.error("--score-trace-max-probes must be >= --score-trace-probes.")
+        if not 0 < args.score_trace_tol <= 0.25:
+            parser.error("--score-trace-tol must lie in (0, 0.25].")
+        if args.score_trace_seed < 0:
+            parser.error("--score-trace-seed must be nonnegative.")
         if not 0.0 < args.split_alpha < 1.0:
             parser.error("--split-alpha must lie in (0, 1).")
     return args
@@ -914,7 +1005,6 @@ if __name__ == "__main__":
 
 __all__ = [
     "add_ld_boundary",
-    "efficient_score_statistics",
     "existing_boundary_positions",
     "load_ld_rank",
     "write_root_component_spec",
