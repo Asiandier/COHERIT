@@ -762,7 +762,7 @@ def test_coherit_guard_accepts_only_a_certified_finite_estimator():
 def test_sparse_output_contract_is_coherit_only():
     contract = SPARSE._sparse_output_contract()
 
-    assert contract["sparse_output_schema_version"] == 10
+    assert contract["sparse_output_schema_version"] == 11
     assert contract["estimator_mode"] == "coherit"
     assert contract["computed_estimators"] == ["h2_chive"]
     assert contract["selected_snp_columns"][-1] == "beta_lasso"

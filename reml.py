@@ -31,6 +31,7 @@ import scipy.linalg as sla
 from scipy.optimize import nnls
 
 from .pcg import pcg_solve
+from .slq import logdet_value_and_grad as _slq_value_and_grad
 from .precond import (
     ProjectedCorePrecondConf,
     ProjectedCoreRuntime,
@@ -89,12 +90,14 @@ class REMLContext:
     rand_stop: int
     n_XyZ_cols: int
     R_rand: int
-    kvrand_stack: Array
+    kvrand_stack: Optional[Array]
     precond_conf: Optional[ProjectedCorePrecondConf]
     diag_atoms: Optional[Array] = None
     residual_diag_atoms: Optional[Array] = None
     affine_slq_cache: Optional[AffineSLQCache] = None
     slq_reference_runtime: Optional[ProjectedCoreRuntime] = None
+    mean_information: object | None = None
+    slq_workspace_bytes: int = 256 * 1024**2
 
 
 @dataclass
@@ -483,29 +486,58 @@ def _affine_slq_logdet_derivatives_jit(
     return logdet, jnp.stack([d_scale, d_shift])
 
 
-def _slq_logdet_projected_core_residual(
+def _multi_slq_logdet_and_score(
+    ctx: REMLContext,
     Hv_fn: Callable,
-    precond_runtime,
-    n_dim: int,
+    pvec: Array,
     key: "jax.random.PRNGKey",
-    nsamples: int = 30,
-    m: int = 50,
-) -> Array:
-    """
-    Residual SLQ for logdet(H):
+    *,
+    nsamples: int,
+    m: int,
+    use_reference: bool,
+    accept_logdet: Optional[Callable[[Array], bool]] = None,
+) -> tuple[Array, Optional[Array]]:
+    """Differentiate the fixed-probe numerical logdet used by line search.
 
-        logdet(H) = logdet(M) + logdet(M^{-1/2} H M^{-1/2})
-
-    with M given by the current projected-core preconditioner.
+    The optional M in log|M| + log|M^{-1/2} H M^{-1/2}| is frozen for the fit,
+    independently of PCG preconditioner refreshes. Its derivative is zero.
+    The streamed reverse pass reuses D_k(left) for both adjoints, avoiding
+    another genome scan and any G x n x probes intermediate.
     """
+    reference = ctx.slq_reference_runtime if use_reference else None
+
+    def whiten(v):
+        return projected_core_apply_invsqrt(reference, v) if reference is not None else v
+
     def Bv(v: Array) -> Array:
-        v_left = projected_core_apply_invsqrt(precond_runtime, v)
-        hv = Hv_fn(v_left)
-        return projected_core_apply_invsqrt(precond_runtime, hv)
+        return whiten(Hv_fn(whiten(v)))
 
-    return projected_core_logdet(precond_runtime, n_dim) + _slq_logdet(
-        Bv, n_dim, key, nsamples=nsamples, m=m
+    def pullback(left, right):
+        left, right = whiten(left), whiten(right)
+        result = jnp.zeros_like(left)
+        scores = []
+        for k, operator in enumerate(ctx.K_mvs):
+            product = operator(left)
+            result = result + pvec[k]*product
+            scores.append(jnp.sum(right*product))
+        for e in range(ctx.E):
+            product = left if ctx.residual_diag_stack is None else ctx.residual_diag_stack[e, :, None]*left
+            result = result + pvec[ctx.G+e]*product
+            scores.append(jnp.sum(right*product))
+        return whiten(result), jnp.stack(scores)
+
+    reference_logdet = (
+        projected_core_logdet(reference, ctx.n) if reference is not None else 0.0
     )
+    value, gradient = _slq_value_and_grad(
+        Bv, pullback, ctx.n, key, nsamples=nsamples, m=m,
+        workspace_bytes=ctx.slq_workspace_bytes, dtype=pvec.dtype,
+        accept_value=(
+            None if accept_logdet is None
+            else lambda value: accept_logdet(value + reference_logdet)
+        ),
+    )
+    return value + reference_logdet, gradient
 
 
 # ---------------------------------------------------------------------------
@@ -622,7 +654,7 @@ def _compute_score_traces(
     PZrand: Array,
     Vrand: Array,
 ) -> Array:
-    """Estimate ``tr(P K_i)`` and ``tr(P R_j)`` from fixed probes.
+    """Estimate SMILE Taylor score traces ``tr(P K_i)`` and ``tr(P R_j)``.
 
     Genetic probe products are cached once as ``K_i @ Vrand``. Symmetry gives
     ``Vrand.T @ K_i @ PZrand == PZrand.T @ K_i @ Vrand``, so an evaluation only
@@ -667,11 +699,15 @@ def _eval_once(
     warm_ai_ready: bool = False,
     taylor_logdet: Optional[Array] = None,
     compute_traces: bool = True,
+    min_loglik: Optional[Array] = None,
 ) -> tuple:
     """One REML objective evaluation.  kv() only in Python scope.
 
     If *taylor_logdet* is provided (not None), the SLQ logdet computation
     is skipped and this pre-computed value is used instead.
+    Strict line-search trials below *min_loglik* return no score/AI. Accepted
+    trials reuse their solves and, within the SLQ workspace budget, Lanczos
+    state; no likelihood reevaluation or rejected-state warm start is needed.
     """
     theta_g = pvec[:ctx.G]
     theta_e = pvec[ctx.G:]
@@ -756,24 +792,7 @@ def _eval_once(
 
     PYstar = proj(HinvXyZ[:, ctx.y_col : ctx.rand_stop])
 
-    # Only K_i(Py) is needed here. Probe products K_i(Vrand) are cached once and
-    # reused below through the symmetric Hutchinson identity.
     Py = PYstar[:, :1]
-    PZrand = PYstar[:, 1:]
-    GPy_genetic = _apply_genetic_stack(ctx, Py)
-    GPy_residual = _apply_residual_stack(ctx, Py)
-    GPy_stack = jnp.concatenate([GPy_genetic, GPy_residual], axis=0)
-    Vrand_cols = ctx.rhs_const[:, ctx.y_col + 1 : ctx.rand_stop]
-
-    # ---- REML statistics (pure XLA) ----------------------------------------
-    q_sel = jnp.einsum(
-        "n,in->i",
-        Py[:, 0],
-        GPy_stack[:, :, 0],
-        precision=jax.lax.Precision.HIGH,
-    )
-    trace_pg_sel = _compute_score_traces(ctx, PZrand, Vrand_cols)
-
     yPy = jnp.dot(ctx.y, PYstar[:, 0])
 
     if ctx.xmat is not None and ctx.xmat.shape[1] > 0:
@@ -781,16 +800,62 @@ def _eval_once(
     else:
         logdet_x = jnp.array(0.0, dtype=pvec.dtype)
 
+    # The sparse mean is still an offset: the quadratic uses P_C, not
+    # P_[C,Z]. Its information determinant is needed even on rejected trials,
+    # but its score correction can wait until the likelihood is accepted.
+    mean_state = None
+    mean_logdet = 0.0
+    if ctx.mean_information is not None:
+        mean_state = ctx.mean_information.evaluate(
+            pvec, Hv, M_cur,
+            HinvX if ctx.xmat is not None and ctx.xmat.shape[1] else None,
+            tol=minq_tol, maxiter=maxiter,
+        )
+        mean_logdet = mean_state["logdet"]
+    scale = jnp.asarray(ctx.n, dtype=pvec.dtype)
+
+    def loglik(logdet_value):
+        return -0.5 * (yPy + logdet_value + logdet_x + mean_logdet) / scale
+
     # ---- SLQ logdet — Python loop, Hv in Python scope ----------------------
     if taylor_logdet is not None:
         logdet = taylor_logdet
     elif ctx.affine_slq_cache is not None:
-        logdet, affine_logdet_derivatives = _affine_slq_logdet(
+        logdet, trace_pg_sel = _affine_slq_logdet(
             ctx.affine_slq_cache,
             theta_g[0],
             theta_e[0],
             return_derivatives=True,
         )
+    else:
+        logdet, trace_pg_sel = _multi_slq_logdet_and_score(
+            ctx, Hv, pvec, key_slq, nsamples=slq_samples, m=slq_m,
+            use_reference=use_residual_slq,
+            accept_logdet=(None if min_loglik is None else
+                           lambda value: bool(loglik(value) >= min_loglik)),
+        )
+    ll = loglik(logdet)
+    if not bool(jnp.isfinite(ll)):
+        raise FloatingPointError("Non-finite REML objective.")
+    if min_loglik is not None and not bool(ll >= min_loglik):
+        return (
+            ll, None, None, jnp.asarray(k_pcg, dtype=jnp.int32),
+            warm_all_next, None, None, None, logdet,
+        )
+
+    # ---- Score and AI: only initial states or accepted line-search trials --
+    GPy_genetic = _apply_genetic_stack(ctx, Py)
+    GPy_residual = _apply_residual_stack(ctx, Py)
+    GPy_stack = jnp.concatenate([GPy_genetic, GPy_residual], axis=0)
+    q_sel = jnp.einsum(
+        "n,in->i", Py[:, 0], GPy_stack[:, :, 0],
+        precision=jax.lax.Precision.HIGH,
+    )
+    if taylor_logdet is not None:
+        trace_pg_sel = _compute_score_traces(
+            ctx, PYstar[:, 1:], ctx.rhs_const[:, ctx.y_col + 1 : ctx.rand_stop],
+        )
+    elif ctx.affine_slq_cache is not None:
         # Make the score the derivative of the same fixed-probe affine-SLQ
         # restricted likelihood used by the strict line search.  For
         # A=X' H^{-1} X and U=H^{-1}X,
@@ -799,8 +864,7 @@ def _eval_once(
         #
         # so d(log|H|+log|A|) is the SLQ logdet derivative minus this
         # low-dimensional fixed-effect correction.  With no fixed effects the
-        # correction is zero.  Multi-GRM/non-affine paths retain the direct
-        # Hutchinson estimate computed above.
+        # correction is zero.
         if ctx.xmat is not None and ctx.xmat.shape[1] > 0:
             K_HinvX = _apply_genetic_stack(ctx, HinvX)[0]
             correction_rhs = jnp.stack(
@@ -813,18 +877,26 @@ def _eval_once(
             )(correction_rhs)
         else:
             correction = jnp.zeros((2,), dtype=pvec.dtype)
-        trace_pg_sel = affine_logdet_derivatives - correction
-    elif use_residual_slq:
-        logdet = _slq_logdet_projected_core_residual(
-            Hv,
-            ctx.slq_reference_runtime,
-            ctx.n,
-            key_slq,
-            nsamples=slq_samples,
-            m=slq_m,
-        )
+        trace_pg_sel = trace_pg_sel - correction
     else:
-        logdet = _slq_logdet(Hv, ctx.n, key_slq, nsamples=slq_samples, m=slq_m)
+        # The same exact low-dimensional covariate correction as above,
+        # including nonidentity or multiple residual covariance components.
+        if ctx.xmat is not None and ctx.xmat.shape[1] > 0:
+            correction_rhs = [HinvX.T @ operator(HinvX) for operator in ctx.K_mvs]
+            for e in range(ctx.E):
+                product = HinvX if ctx.residual_diag_stack is None else ctx.residual_diag_stack[e, :, None]*HinvX
+                correction_rhs.append(HinvX.T @ product)
+            correction = jax.vmap(lambda rhs: jnp.trace(
+                jsp.linalg.cho_solve(chol, rhs, check_finite=False)
+            ))(jnp.stack(correction_rhs))
+            trace_pg_sel = trace_pg_sel - correction
+
+    if mean_state is not None:
+        trace_pg_sel = trace_pg_sel - jnp.asarray(
+            ctx.mean_information.score_trace_correction(
+                mean_state, ctx.K_mvs, ctx.residual_diag_stack,
+            ), dtype=trace_pg_sel.dtype,
+        )
 
     fisher_stats = FisherSolveStats()
     fisher_stats.free_dim = int(ctx.G + ctx.E)
@@ -854,14 +926,15 @@ def _eval_once(
     PGPy_cols = proj(HinvGPy)
 
     # ---- Trace estimates for Taylor warm-start ------------------------------
-    if compute_traces:
+    if compute_traces and ctx.R_rand > 0:
         tr_Hinv_R, tr_Hinv_K = _compute_traces_from_pcg(sol_all, ctx)
     else:
-        tr_Hinv_R = jnp.full((ctx.E,), jnp.nan, dtype=sol_all.dtype)
-        tr_Hinv_K = jnp.full((ctx.G,), jnp.nan, dtype=sol_all.dtype)
+        tr_Hinv_R, tr_Hinv_K = None, None
 
     # ---- Assemble ll, grad, FI ----------------------------------------------
-    scale = jnp.asarray(ctx.n, dtype=pvec.dtype)
+    # With mean information this is a positive scoring metric, NOT the exact
+    # corrected Hessian. The corrected score defines the direction and strict
+    # line search evaluates the corrected objective at every trial covariance.
     AI_sel = (
         0.5
         * jnp.einsum(
@@ -878,7 +951,6 @@ def _eval_once(
         stats=fisher_stats,
     )
     grad = 0.5 * (q_sel - trace_pg_sel) / scale
-    ll    = -0.5 * (yPy + logdet + logdet_x) / scale
     if not bool(
         jnp.isfinite(ll)
         & jnp.all(jnp.isfinite(grad))
@@ -1214,6 +1286,8 @@ def fit_reml(
     log_detail: str = "full",
     return_diagnostics: bool = False,
     probe_cache: REMLProbeCache | None = None,
+    mean_information=None,
+    slq_workspace_bytes: int = 256 * 1024**2,
 ):
     """Fit single-trait Gaussian REML with AI/Fisher updates.
 
@@ -1255,6 +1329,8 @@ def fit_reml(
         raise ValueError("fit_reml requires minq_iter >= 0.")
     if slq_m <= 0:
         raise ValueError("fit_reml requires slq_m > 0.")
+    if slq_workspace_bytes < 1:
+        raise ValueError("fit_reml requires slq_workspace_bytes > 0.")
     if not 0.0 <= h2_init <= 1.0:
         raise ValueError("h2_init must lie in [0, 1].")
     genetic_trace_atoms = (
@@ -1316,6 +1392,20 @@ def fit_reml(
         raise ValueError("taylor_threshold must be >= 0.")
     if pcg_tol <= 0.0:
         raise ValueError("pcg_tol must be > 0.")
+    if mean_information is not None:
+        if not response_is_standardized or optimizer != "strict":
+            raise ValueError("Mean information requires fixed response scale and strict optimization.")
+        if mean_information.n != n:
+            raise ValueError("Mean information sample count mismatch.")
+    if mean_information is not None or (
+        optimizer == "strict" and (G > 1 or residual_diag_stack is not None)
+    ):
+        # Accurate SLQ derivatives alone are insufficient: a loose warm PCG
+        # solve can leave y'Py unchanged while the covariance moves, invalidating
+        # strict likelihood comparisons. Information determinants also require
+        # accurate solves. Preserve explicitly tighter requests and the affine
+        # single-GRM fast path's existing policy.
+        pcg_tol = min(pcg_tol, 1e-5)
     _t0 = time.time()
     full_log = bool(verbose) and log_detail == "full"
     compact_log = bool(verbose) and log_detail == "compact"
@@ -1327,10 +1417,14 @@ def fit_reml(
 
     key_master = jax.random.PRNGKey(seed + 2026)
     key_master, key_vrand, key_slq_fixed = jax.random.split(key_master, 3)
+    # Strict REML differentiates its SLQ target; only SMILE's Taylor updates
+    # need independent Hutchinson probes. Keep the SLQ key unchanged.
+    use_trace_probes = optimizer == "smile_scoring"
+    n_trace_probes = n_rand_vec if use_trace_probes else 0
     Vrand_fixed = (
         jax.random.rademacher(key_vrand, (n, n_rand_vec), dtype=jnp.int32)
         .astype(jnp.float32)
-    )
+    ) if use_trace_probes else None
 
     if response_is_standardized:
         if not bool(jnp.all(jnp.isfinite(y))):
@@ -1402,30 +1496,28 @@ def fit_reml(
         diag_stack = jnp.stack(expanded_diags, axis=0)
     del diag_list
 
-    # ---- Precompute K_i @ Vrand — constant across responses and theta -----
-    # These cached probe responses are reused for:
-    #   1) Taylor logdet trace estimates tr(H^{-1} K_i)
-    #   2) direct Hutchinson score traces tr(P K_i)
+    # ---- Response-independent setup: affine SLQ and SMILE trace probes ----
     cache_signature = (
-        K_mvs, n, int(seed), int(n_rand_vec), int(slq_samples), int(slq_m),
+        K_mvs, n, int(seed), int(n_trace_probes), int(slq_samples), int(slq_m),
         residual_diag_stack is None,
         tuple(sorted(str(device) for device in y.devices())),
     )
     cache_hit = bool(
         probe_cache is not None
         and probe_cache.signature == cache_signature
-        and probe_cache.kvrand_stack is not None
     )
-    if full_log:
+    if full_log and use_trace_probes:
         _t_kv_cache = time.time()
         logger.info("[REML] %s K_i @ Vrand ...", "reuse" if cache_hit else "precompute")
-    if cache_hit:
+    KVrand_stack = None
+    if cache_hit and use_trace_probes:
         KVrand_stack = probe_cache.kvrand_stack
-    elif stacked_kv is not None:
-        KVrand_stack = stacked_kv(Vrand_fixed)
-    else:
-        KVrand_stack = jnp.stack([mv(Vrand_fixed) for mv in K_mvs], axis=0)
-    if full_log:
+    if use_trace_probes and KVrand_stack is None:
+        if stacked_kv is not None:
+            KVrand_stack = stacked_kv(Vrand_fixed)
+        else:
+            KVrand_stack = jnp.stack([mv(Vrand_fixed) for mv in K_mvs], axis=0)
+    if full_log and use_trace_probes:
         logger.info("[REML] K_i @ Vrand done elapsed=%.1fs", time.time() - _t_kv_cache)
 
     affine_slq_cache = probe_cache.affine_slq if cache_hit else None
@@ -1449,7 +1541,7 @@ def fit_reml(
                 time.time() - _t_affine_slq,
             )
 
-    if probe_cache is not None and not cache_hit:
+    if probe_cache is not None:
         probe_cache.signature = cache_signature
         probe_cache.kvrand_stack = KVrand_stack
         probe_cache.affine_slq = affine_slq_cache
@@ -1488,7 +1580,7 @@ def fit_reml(
                 int(slq_reference_runtime.total_rank),
             )
 
-    # ---- Cache constant RHS [X | y | Vrand] once ---------------------------
+    # ---- Cache [X | y]; only SMILE appends independent trace probes --------
     rhs_parts = []
     x_cols = 0
     if xmat is not None and xmat.shape[1] > 0:
@@ -1496,8 +1588,9 @@ def fit_reml(
         rhs_parts.append(xmat)
     y_col = x_cols
     rhs_parts.append(y[:, None])
-    rand_stop = x_cols + 1 + n_rand_vec
-    rhs_parts.append(Vrand_fixed)
+    rand_stop = x_cols + 1 + n_trace_probes
+    if use_trace_probes:
+        rhs_parts.append(Vrand_fixed)
     n_XyZ_cols = rand_stop
     rhs_const = jnp.concatenate(rhs_parts, axis=1)
 
@@ -1514,13 +1607,15 @@ def fit_reml(
         y_col=y_col,
         rand_stop=rand_stop,
         n_XyZ_cols=n_XyZ_cols,
-        R_rand=n_rand_vec,
+        R_rand=n_trace_probes,
         kvrand_stack=KVrand_stack,
         precond_conf=precond_conf,
         diag_atoms=diag_atoms,
         residual_diag_atoms=residual_diag_atoms,
         affine_slq_cache=affine_slq_cache,
         slq_reference_runtime=slq_reference_runtime,
+        mean_information=mean_information,
+        slq_workspace_bytes=int(slq_workspace_bytes),
     )
     # The fixed SLQ runtime only needs the original basis and its factorization;
     # release the original component-core configuration once the context owns
@@ -1543,7 +1638,7 @@ def fit_reml(
     if full_log:
         logger.info(
             "[REML] warm shapes: n_XyZ=%d n_warm=%d n_rand_vec=%d n_covar=%d",
-            n_XyZ_cols, n_warm_cols, n_rand_vec,
+            n_XyZ_cols, n_warm_cols, n_trace_probes,
             xmat.shape[1] if xmat is not None else 0,
         )
 
@@ -1555,19 +1650,10 @@ def fit_reml(
         warm_ai_is_ready,
         taylor_logdet_val=None,
         *,
-        compute_traces=True,
+        compute_traces=use_trace_probes,
+        min_loglik=None,
     ):
-        (
-            ll_eval,
-            grad_eval,
-            fisher_eval,
-            k_pcg_eval,
-            warm_next,
-            warm_ai_next,
-            tr_Hinv_R,
-            tr_Hinv_K,
-            logdet_eval,
-        ) = _eval_once(
+        return _eval_once(
             ctx, pvec, warm,
             warm_ai=warm_ai_cur,
             key_slq=key_slq_fixed,
@@ -1581,17 +1667,7 @@ def fit_reml(
             warm_ai_ready=warm_ai_is_ready,
             taylor_logdet=taylor_logdet_val,
             compute_traces=compute_traces,
-        )
-        return (
-            ll_eval,
-            grad_eval,
-            fisher_eval,
-            k_pcg_eval,
-            warm_next,
-            warm_ai_next,
-            jnp.asarray(tr_Hinv_R, dtype=jnp.asarray(pvec).dtype).reshape(-1),
-            tr_Hinv_K,
-            logdet_eval,
+            min_loglik=min_loglik,
         )
 
     # Warmup
@@ -1599,7 +1675,7 @@ def fit_reml(
         _t_eval = time.time()
         logger.info("[REML] warmup eval @ %s", datetime.now().isoformat(timespec='seconds'))
     ll, grad, FI, k_pcg0, warm_all, warm_ai, tr_Hinv_R_cached, tr_Hinv_K_cached, logdet_cached = _run_eval(
-        param, warm_all, warm_ai, warm_ready, warm_ai_ready, compute_traces=True
+        param, warm_all, warm_ai, warm_ready, warm_ai_ready
     )
     warm_ready = True
     warm_ai_ready = True
@@ -1750,6 +1826,7 @@ def fit_reml(
                     trial_warm_ai_ready,
                     taylor_logdet_val=taylor_ld,
                     compute_traces=False,
+                    min_loglik=ll if optimizer == "strict" else None,
                 )
             except FloatingPointError:
                 eval_elapsed += time.time() - eval_t0
@@ -1763,7 +1840,8 @@ def fit_reml(
             dll = float(dll_arr)
             k_pcg_trial = int(k_pcg_arr)
             ai_pcg_trial = (
-                int(FI_try.stats.ai_pcg_iters) if FI_try.stats is not None else 0
+                int(FI_try.stats.ai_pcg_iters)
+                if FI_try is not None and FI_try.stats is not None else 0
             )
             eval_ai_pcg = ai_pcg_trial
             trial_accepted = (dll >= 0.0) or optimizer == "smile_scoring"
@@ -1775,7 +1853,8 @@ def fit_reml(
                 FI_new = FI_try
                 warm_next = warm_try
                 warm_ai_next = warm_ai_try
-                tr_Hinv_R_new, tr_Hinv_K_new = _compute_traces_from_pcg(warm_try, ctx)
+                if use_trace_probes:
+                    tr_Hinv_R_new, tr_Hinv_K_new = _compute_traces_from_pcg(warm_try, ctx)
                 logdet_new = logdet_try
                 k_pcg = k_pcg_trial
                 eval_ai_pcg = ai_pcg_trial

@@ -60,6 +60,7 @@ _inf_mod = importlib.import_module(f"{pkg_name}.reml_model")
 _data_mod = importlib.import_module(f"{pkg_name}.data_utils")
 _lasso_mod = importlib.import_module(f"{pkg_name}.lasso_cd")
 _pcg_mod = importlib.import_module(f"{pkg_name}.pcg")
+_information_mod = importlib.import_module(f"{pkg_name}.sparse_information")
 _precond_mod = importlib.import_module(f"{pkg_name}.precond")
 _common_mod = importlib.import_module(f"{pkg_name}.pipeline_common")
 _io_utils_mod = importlib.import_module(f"{pkg_name}.io_utils")
@@ -85,6 +86,7 @@ make_lambda_sequence = _lasso_mod.make_lambda_sequence
 compute_projected_hinv_vector = _lasso_mod.compute_projected_hinv_vector
 fit_weighted_lasso_with_covariates = _lasso_mod.fit_weighted_lasso_with_covariates
 pcg_solve = _pcg_mod.pcg_solve
+SparseMeanInformation = _information_mod.SparseMeanInformation
 load_component_specs = _component_spec_mod.load_component_specs
 write_sparse_effect_outputs = _effect_io_mod.write_sparse_effect_outputs
 iter_variant_records_for_prefix = _variant_io_mod.iter_variant_records_for_prefix
@@ -592,10 +594,10 @@ class MultiGRMIndex:
             groups.append((grm_idx, local, positions))
         return groups
 
-    def xtv_all(self, u_jax: jnp.ndarray, normalize: bool = False) -> np.ndarray:
+    def xtv_all(self, u_jax: jnp.ndarray, normalize: bool = False, *, dtype=np.float64) -> np.ndarray:
         return np.asarray(
             self.streamer.xtv(u_jax, normalize=normalize),
-            dtype=np.float64,
+            dtype=dtype,
         )
 
     def extract_standardized_columns(
@@ -1391,6 +1393,7 @@ def _fit_covariate_contrast_residual_reml(
     *,
     covar: np.ndarray | None,
     h2_init: float,
+    mean_information=None,
 ):
     """Profile the full nuisance design in the sparse variance-component block.
 
@@ -1428,6 +1431,7 @@ def _fit_covariate_contrast_residual_reml(
         jnp.asarray(nuisance_design, dtype=jnp.float32),
         h2_init=float(h2_init),
         var_components_init=jnp.asarray(theta, dtype=jnp.float32),
+        **({"mean_information": mean_information} if mean_information is not None else {}),
     )
 
 
@@ -1632,6 +1636,7 @@ def _outer_coherit_h2_from_fitted_sparse_mean(
     *,
     background_genetic_variance: float,
     residual_variance: float,
+    mean_uncertainty_trace: float = 0.0,
 ) -> tuple[float, float]:
     """Return current COHERIT h2 and calibrated sparse variance.
 
@@ -1639,7 +1644,7 @@ def _outer_coherit_h2_from_fitted_sparse_mean(
     primary estimator, expressed through the already available fitted sparse
     mean ``g`` and residual ``r``:
 
-        q_sparse = (g'g + 2 g'r) / n.
+        q_sparse = (g'g + 2 g'r - tr(Sigma_g)) / n.
 
     Using these vectors avoids another genotype matrix product inside the
     outer convergence check.
@@ -1655,6 +1660,7 @@ def _outer_coherit_h2_from_fitted_sparse_mean(
         (
             sparse_arr @ sparse_arr
             + 2.0 * (sparse_arr @ residual_arr)
+            - float(mean_uncertainty_trace)
         )
         / n_samples
     )
@@ -2091,7 +2097,7 @@ def _coherit_estimator_guard(
 def _sparse_output_contract() -> dict[str, object]:
     """Return the fixed output contract for the sole COHERIT mode."""
     return {
-        "sparse_output_schema_version": 10,
+        "sparse_output_schema_version": 11,
         "estimator_mode": "coherit",
         "computed_estimators": ["h2_chive"],
         "selected_snp_columns": [
@@ -4068,6 +4074,9 @@ def main() -> None:
     final_alignment_warning = None
     last_aligned_pair = None
     last_covariance_reml_diagnostics = None
+    final_information = None
+    information_markers = None
+    mean_information = None
     lasso_reml_stop_reason = ""
     penalized_failure_reason = None
 
@@ -5349,6 +5358,7 @@ def main() -> None:
                 theta = last_aligned_pair["theta"]
                 theta_lasso = theta.copy()
                 final_kkt_certificate = last_aligned_pair["kkt"]
+                final_information = last_aligned_pair["mean_information"]
                 final_pair_available = True
                 final_pair_source = "last_complete_pair"
                 final_alignment_warning = str(penalized_block_failure)
@@ -5442,11 +5452,33 @@ def main() -> None:
         sparse_mean_current = fixed_mean_current.copy()
         if covar_np is not None and covar_np.size and beta_cov_current.size:
             sparse_mean_current -= np.asarray(covar_np, dtype=np.float64) @ beta_cov_current
+        information_started = time.perf_counter()
+        active_markers = candidate[active_local]
+        if information_markers is None or not np.array_equal(active_markers, information_markers):
+            mean_information = SparseMeanInformation(
+                Z_cand[:, active_local], covar_np,
+                hinv_active=sol_z_np[:, active_local],
+                batch_size=int(args.candidate_pcg_rhs_batch_size),
+            )
+            information_markers = active_markers.copy()
+        mean_state, residual, beta_cov_current = mean_information.statistics(
+            theta, hv, precond, np.asarray(y_np, dtype=np.float64)-sparse_mean_current,
+            tol=min(float(args.pcg_tol), 1e-5), maxiter=int(args.max_pcg_iters),
+        )
+        lasso["beta_cov"] = beta_cov_current
+        fixed_mean_current = sparse_mean_current + (
+            np.asarray(covar_np) @ beta_cov_current if covar_np is not None else 0.
+        )
+        sparse_path_performance["mean_information_seconds"] = (
+            sparse_path_performance.get("mean_information_seconds", 0.)
+            + time.perf_counter()-information_started
+        )
         selected_h2, outer_q_sparse = _outer_coherit_h2_from_fitted_sparse_mean(
             sparse_mean_current,
             residual,
             background_genetic_variance=_background_genetic_variance(theta),
             residual_variance=float(theta[-1]),
+            mean_uncertainty_trace=mean_state["trace"],
         )
         selected_validation_r2 = (
             float(lasso["validation_selection"]["selected"]["predictive_r2"])
@@ -5489,6 +5521,8 @@ def main() -> None:
                     "theta": theta.tolist(),
                     "coherit_h2": float(selected_h2),
                     "q_sparse": float(outer_q_sparse),
+                    "mean_uncertainty_trace_per_n": mean_state["trace"]/n_samples,
+                    "mean_information_rank": mean_information.rank,
                     "h2_abs_change": float(alignment_h2_change),
                     "h2_stable": bool(alignment_h2_stable),
                     "effect_rel": float(alignment_effect_rel),
@@ -5516,6 +5550,7 @@ def main() -> None:
             if alignment_action != "continue":
                 support = support_new
                 final_candidate = candidate
+                final_information = mean_information
                 final_lasso = lasso
                 final_alignment_completed = True
                 final_pair_available = True
@@ -5536,6 +5571,7 @@ def main() -> None:
             "candidate": candidate.copy(), "lasso": lasso,
             "support": support_new.copy(), "theta": theta.copy(),
             "kkt": dict(accepted_kkt_record),
+            "mean_information": mean_information,
         }
 
         covariance_started = time.perf_counter()
@@ -5546,6 +5582,7 @@ def main() -> None:
                 theta,
                 covar=covar_np,
                 h2_init=_background_h2(theta),
+                mean_information=mean_information,
             )
             theta_new, lasso_reml_stop_reason = _accepted_reml_theta(
                 ml_res,
@@ -5625,14 +5662,28 @@ def main() -> None:
             np.isfinite(effect_rel)
             and effect_rel <= float(args.effect_rel_tol)
         )
-        outer_h2, outer_q_sparse = (
+        hv_after = fitter._make_hv(
+            ops, jnp.asarray(theta_new[:-1], dtype=jnp.float32),
+            jnp.asarray(theta_new[-1], dtype=jnp.float32),
+        )
+        precond_after = fitter._make_effect_precond(
+            ops, jnp.asarray(theta_new[:-1], dtype=jnp.float32),
+            jnp.asarray(theta_new[-1], dtype=jnp.float32),
+        )
+        mean_after, residual_after, _gamma_after = mean_information.statistics(
+            theta_new, hv_after, precond_after,
+            np.asarray(y_np, dtype=np.float64)-sparse_mean_current,
+            tol=min(float(args.pcg_tol), 1e-5), maxiter=int(args.max_pcg_iters),
+        )
+        outer_h2, outer_q_after = (
             _outer_coherit_h2_from_fitted_sparse_mean(
                 sparse_mean_current,
-                residual,
+                residual_after,
                 background_genetic_variance=(
                     _background_genetic_variance(theta_new)
                 ),
                 residual_variance=float(theta_new[-1]),
+                mean_uncertainty_trace=mean_after["trace"],
             )
         )
         h2_stable, h2_abs_change = _heritability_converged(
@@ -5656,6 +5707,10 @@ def main() -> None:
             "coherit_h2": float(selected_h2),
             "coherit_h2_after_variance_update": float(outer_h2),
             "q_sparse": float(outer_q_sparse),
+            "q_sparse_after_variance_update": float(outer_q_after),
+            "mean_uncertainty_trace_per_n": mean_state["trace"]/n_samples,
+            "mean_uncertainty_trace_per_n_after_variance_update": mean_after["trace"]/n_samples,
+            "mean_information_rank": mean_information.rank,
             "variance_update_h2_abs_change": float(h2_abs_change),
             "variance_update_h2_stable": bool(h2_stable),
             "lam": float(lasso["lam"]),
@@ -5665,7 +5720,7 @@ def main() -> None:
             "kkt_certified": bool(certified_kkt),
             "kkt_trace": kkt_trace,
             "final_alignment": False,
-            "variance_update": "covariate_contrast_residual_reml",
+            "variance_update": "sparse_mean_information_corrected_reml",
             "variance_stop_reason": lasso_reml_stop_reason,
             "variance_step_rejected": bool(
                 lasso_reml_stop_reason == "ll_down"
@@ -5774,6 +5829,7 @@ def main() -> None:
     q_chive = unavailable
     q_chive_term1 = unavailable
     q_chive_term2 = unavailable
+    q_mean_uncertainty = unavailable
     beta_cov_lasso = np.empty((0,), dtype=np.float64)
     beta_lasso_active = np.empty((0,), dtype=np.float64)
     lasso_quadratics_available = bool(
@@ -5840,6 +5896,23 @@ def main() -> None:
                 )
 
         if lasso_quadratics_available:
+            if final_information is None:
+                final_information = SparseMeanInformation(Z_support, covar_np)
+            final_hv = fitter._make_hv(
+                ops, jnp.asarray(theta_lasso_ml[:-1], dtype=jnp.float32),
+                jnp.asarray(theta_lasso_ml[-1], dtype=jnp.float32),
+            )
+            final_precond = fitter._make_effect_precond(
+                ops, jnp.asarray(theta_lasso_ml[:-1], dtype=jnp.float32),
+                jnp.asarray(theta_lasso_ml[-1], dtype=jnp.float32),
+            )
+            final_g = np.asarray(Z_support, dtype=np.float64) @ beta_lasso_active
+            final_mean_state, _final_residual, beta_cov_lasso = final_information.statistics(
+                theta_lasso_ml, final_hv, final_precond,
+                np.asarray(y_np, dtype=np.float64)-final_g,
+                tol=min(float(args.pcg_tol), 1e-5), maxiter=int(args.max_pcg_iters),
+            )
+            q_mean_uncertainty = final_mean_state["trace"]/n_samples
             y_chive = np.asarray(y_np, dtype=np.float64)
             if (
                 covar_np is not None
@@ -5857,6 +5930,7 @@ def main() -> None:
                     beta_lasso_active,
                 )
             )
+            q_chive -= q_mean_uncertainty
 
     # The sole COHERIT estimate uses the calibrated Lasso quadratic and the
     # covariate-contrast REML covariance from the same penalized branch.
@@ -5888,7 +5962,7 @@ def main() -> None:
     h2_chive_guarded = float(h2_chive) if lasso_branch_valid else unavailable
     h2 = h2_chive_guarded
     primary_h2_method = (
-        "penalized_reml_lasso_chive" if lasso_branch_valid else "unavailable"
+        "information_corrected_sparse_reml" if lasso_branch_valid else "unavailable"
     )
 
     lasso_warm_state_out_summary = None
@@ -6255,7 +6329,7 @@ def main() -> None:
         "outer_stop_reason": outer_stop_reason,
         "outer_convergence_warning": outer_convergence_warning,
         "penalized_failure_reason": penalized_failure_reason,
-        "lasso_variance_update": "covariate_contrast_residual_reml",
+        "lasso_variance_update": "sparse_mean_information_corrected_reml",
         "lasso_variance_contrast": "orthogonal_to_complete_nuisance_design",
         "lasso_variance_analysis_dimension": int(
             y_np.shape[0] - n_covar
@@ -6280,7 +6354,9 @@ def main() -> None:
         "q_chive_components": {
             "term1_g2_over_n": _finite_float_or_none(q_chive_term1),
             "term2_cross": _finite_float_or_none(q_chive_term2),
+            "term3_mean_uncertainty_subtracted": _finite_float_or_none(q_mean_uncertainty),
         },
+        "mean_information_rank": None if final_information is None else final_information.rank,
         "support_size": int(support.size),
         "support_indices": support.tolist(),
         "support_source_indices": grm_index.source_variant_indices(support).tolist(),

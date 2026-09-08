@@ -99,3 +99,78 @@ def test_combined_fit_inputs_follow_source_sample_order(tmp_path: Path) -> None:
         "d\td\t4",
         "c\tc\t3",
     ]
+
+
+@pytest.fixture
+def cohort_inputs(tmp_path):
+    prefix = tmp_path / "geno"
+    prefix.with_suffix(".fam").write_text("".join(f"f {iid} 0 0 0 -9\n" for iid in "abcde"))
+    contents = {
+        "train.keep": "f a\nf c\n", "validation.keep": "f b\nf d\n",
+        "fit.keep": "f d\nf c\nf b\nf a\n", "test.keep": "f e\n",
+        "train.pheno": "f a 1\nf c 3\n", "validation.pheno": "f b 2\nf d 4\n",
+        "fit.pheno": "f a 1\nf b 2\nf c 3\nf d 4\n",
+    }
+    for name, content in contents.items():
+        (tmp_path/name).write_text(content)
+    return argparse.Namespace(
+        fit_pheno_txt=tmp_path/"fit.pheno", fit_keep_path=tmp_path/"fit.keep",
+        keep_path=tmp_path/"train.keep", validation_keep_path=tmp_path/"validation.keep",
+        genotype_prefix=prefix, genotype_format="bed", pheno_txt=tmp_path/"train.pheno",
+        validation_pheno_txt=tmp_path/"validation.pheno", work_dir=tmp_path/"work",
+        prediction_prefix=prefix, prediction_format="bed", prediction_keep_path=tmp_path/"test.keep",
+    )
+
+
+def test_explicit_final_inputs_are_validated_without_rewriting(cohort_inputs):
+    args = cohort_inputs
+    modified = args.fit_pheno_txt.stat().st_mtime_ns
+    assert _prepare_combined_fit_inputs(args) == (args.fit_pheno_txt, args.fit_keep_path, False)
+    assert args.fit_pheno_txt.stat().st_mtime_ns == modified
+    assert not args.work_dir.exists()
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+@pytest.mark.parametrize("bad", ["selection_overlap", "prediction_overlap", "prediction_missing",
+                                 "own_phenotype_missing"])
+def test_cohort_isolation_is_required_with_both_input_modes(cohort_inputs, explicit, bad):
+    args = cohort_inputs
+    if not explicit:
+        args.fit_pheno_txt = args.fit_keep_path = None
+    if bad == "selection_overlap":
+        args.validation_keep_path.write_text("f a\nf d\n")
+        match = "Training and validation.*disjoint"
+    elif bad == "prediction_overlap":
+        args.prediction_keep_path.write_text("f a\nf e\n")
+        match = "Prediction and training.*disjoint"
+    elif bad == "prediction_missing":
+        args.prediction_keep_path.write_text("f unknown\n")
+        match = "Prediction keep ID is absent"
+    else:
+        args.pheno_txt.write_text("f a 1\n")
+        args.validation_pheno_txt.write_text("f b 2\nf c 3\nf d 4\n")
+        match = "Training phenotype is missing"
+    with pytest.raises(ValueError, match=match):
+        _prepare_combined_fit_inputs(args)
+    assert not args.work_dir.exists()
+
+
+@pytest.mark.parametrize("bad", ["missing_id", "extra_id", "missing_value", "changed_value"])
+def test_explicit_final_inputs_must_match_selection(cohort_inputs, bad):
+    args = cohort_inputs
+    if bad == "missing_id":
+        args.fit_keep_path.write_text("f a\nf b\nf c\n")
+    elif bad == "extra_id":
+        args.fit_keep_path.write_text("f a\nf b\nf c\nf d\nf e\n")
+    elif bad == "missing_value":
+        args.fit_pheno_txt.write_text("f a 1\nf b 2\nf c 3\n")
+    else:
+        args.fit_pheno_txt.write_text("f a 1\nf b 2\nf c 3\nf d 40\n")
+    with pytest.raises(ValueError, match="Final-fit"):
+        _prepare_combined_fit_inputs(args)
+
+
+def test_prediction_without_keep_still_checks_the_actual_sample_set(cohort_inputs):
+    cohort_inputs.prediction_keep_path = None
+    with pytest.raises(ValueError, match="Prediction and training.*disjoint"):
+        _prepare_combined_fit_inputs(cohort_inputs)

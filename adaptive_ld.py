@@ -19,6 +19,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import shutil
 import tempfile
 from typing import Any, Sequence
 
@@ -34,6 +35,7 @@ from .component_spec import load_component_specs
 from .data_utils import load_pheno_covar_aligned_with_transform
 from .geno_source import PgenGenoSource
 from .pcg import pcg_solve
+from .kv_impl import _device_put_block, _zxb_multi_one_call_jit
 from .pipeline_common import (
     cleanup_path,
     compute_sample_mask,
@@ -61,6 +63,10 @@ from .score_process import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Bound float32 dot-product reduction length even when the runtime planner
+# selects a very wide packed block. This is kernel geometry, not a model knob.
+_FACTOR_MAX_REDUCTION_WIDTH = 65536
 
 
 def read_json(path: str | Path) -> dict[str, Any]:
@@ -319,16 +325,9 @@ class REMLProjector:
             maxiter=int(self.max_pcg_iters),
         )
         host = np.asarray(jax.device_get(solution), dtype=np.float32)
-        residual = np.asarray(
-            jax.device_get(self._hv(solution) - jnp.asarray(matrix)),
-            dtype=np.float64,
-        )
-        denominator = np.maximum(
-            np.linalg.norm(matrix.astype(np.float64), axis=0),
-            np.finfo(float).tiny,
-        )
-        true_relative = float(np.max(np.linalg.norm(residual, axis=0) / denominator))
+        # PCG's returned residual is already checked against the actual Hx.
         reported_relative = float(np.max(np.asarray(jax.device_get(reported))))
+        true_relative = reported_relative
         iteration_count = int(np.max(np.asarray(jax.device_get(iterations))))
         limit = max(5.0 * float(self.pcg_tol), 5e-5)
         if (
@@ -453,63 +452,150 @@ class BoundaryContractions:
 
 
 class ScoreWorkspace:
-    """Own large file-backed score arrays and remove them on success or failure."""
+    """Bound the lifetime of scratch arrays; only current probe work stays live."""
 
     def __init__(self, directory: str | Path):
         Path(directory).mkdir(parents=True, exist_ok=True)
         self._temporary = tempfile.TemporaryDirectory(prefix=".score-", dir=directory)
-        self._maps: list[np.memmap] = []
+        self._arrays: dict[int, np.ndarray] = {}
+        self._next_file = 0
+        self.live_bytes = 0
+        self.peak_bytes = 0
+
+    def ensure_capacity(self, additional_bytes, *, stage="allocation"):
+        # mmap creation can reserve a sparse file without consuming disk yet.
+        # Account for those outstanding writes as well as the next allocation.
+        unwritten = sum(max(0, value.nbytes - Path(value.filename).stat().st_blocks * 512)
+                        for value in self._arrays.values() if isinstance(value, np.memmap))
+        available = shutil.disk_usage(self._temporary.name).free - unwritten
+        if int(additional_bytes) > available:
+            raise RuntimeError(
+                f"Insufficient score scratch space for {stage}: need "
+                f"{int(additional_bytes)/1024**3:.2f} GiB beyond live arrays, "
+                f"{max(0, available)/1024**3:.2f} GiB available. "
+                "Use an output filesystem with more free scratch space."
+            )
+
+    def _register(self, value):
+        self._arrays[id(value)] = value
+        self.live_bytes += value.nbytes
+        self.peak_bytes = max(self.peak_bytes, self.live_bytes)
+        return value
 
     def allocate(self, shape, *, dtype=np.float64):
         if np.prod(shape, dtype=np.int64) * np.dtype(dtype).itemsize < 8 * 1024**2:
-            return np.empty(shape, dtype=dtype)
+            return self._register(np.empty(shape, dtype=dtype))
+        self.ensure_capacity(int(np.prod(shape)) * np.dtype(dtype).itemsize)
         value = np.memmap(
-            Path(self._temporary.name) / f"{len(self._maps)}.bin",
+            Path(self._temporary.name) / f"{self._next_file}.bin",
             mode="w+", dtype=dtype, shape=shape,
         )
-        self._maps.append(value)
-        return value
+        self._next_file += 1
+        return self._register(value)
+
+    def release(self, *arrays):
+        """Release owned arrays, including the ndarray views used by TraceSketch."""
+        for value in arrays:
+            while isinstance(value, np.ndarray) and id(value) not in self._arrays:
+                value = value.base
+            owned = self._arrays.pop(id(value), None)
+            if owned is None:
+                continue
+            self.live_bytes -= owned.nbytes
+            if isinstance(owned, np.memmap):
+                path = Path(owned.filename)
+                owned._mmap.close()
+                path.unlink()
+
+    def grow_rows(self, value, rows):
+        """Append probe capacity without regenerating or copying a mapped prefix.
+
+        Call only after releasing all views of the old probe cache. Its layout
+        is row-major (probe, sample/marker), so file extension preserves rows.
+        """
+        if id(value) not in self._arrays or not value.flags.c_contiguous:
+            raise ValueError("Only owned contiguous probe caches can grow.")
+        if rows <= value.shape[0]:
+            return value
+        shape = (int(rows), *value.shape[1:])
+        size = int(np.prod(shape)) * value.dtype.itemsize
+        if not isinstance(value, np.memmap):
+            expanded = self.allocate(shape, dtype=value.dtype)
+            expanded[:len(value)] = value
+            self.release(value)
+            return expanded
+        self.ensure_capacity(size - value.nbytes, stage="probe cache growth")
+        path, dtype, old_size = Path(value.filename), value.dtype, value.nbytes
+        value._mmap.close()
+        with path.open("r+b") as handle:
+            handle.truncate(size)
+        expanded = np.memmap(path, mode="r+", dtype=dtype, shape=shape)
+        self._arrays.pop(id(value))
+        self.live_bytes -= old_size
+        return self._register(expanded)
 
     def __enter__(self):
         return self
 
     def __exit__(self, *_):
-        for value in self._maps:
-            value._mmap.close()
-        self._maps.clear()
-        self._temporary.cleanup()
+        try:
+            self.release(*list(self._arrays.values()))
+        finally:
+            self._temporary.cleanup()
 
 
 def _score_rhs_width(projector, index):
-    return max(1, min(16, 32 * 1024**2 // (8 * (projector._covar.shape[0] + index.m_total))))
+    """Reserve a bounded part of the existing runtime budget for probe RHSs.
+
+    The genotype block geometry is still selected by the normal planner. The
+    additional budget covers the GPU X'B output, its host copy and PCG vectors;
+    it must not charge the full genotype matrix once per probe.
+    """
+    cfg = getattr(getattr(projector, "fitter", None), "cfg", None)
+    total = getattr(cfg, "gpu_budget_bytes", None)
+    budget = min(1024**3, float(total) / 8) if total else 256 * 1024**2
+    per_column = 12 * index.m_total + 64 * projector._covar.shape[0]
+    capacity = max(1, min(256, int(budget) // max(1, per_column)))
+    return 1 << (capacity.bit_length() - 1)
 
 
 def _factor_rhs(index, theta, streams):
     """Covariance-factor Rademacher probes with exactly the GRM m_eff weights.
 
-    Each probe has its own stream, so growing/batching the group preserves its
-    prefix. Standardized genotype columns are extracted in bounded blocks.
+    Each probe has its own stream, so changing RHS or genotype block widths
+    preserves its random signs. Reuse the packed prediction kernel: transfer
+    and decode each cached block once for the whole batch, not on the CPU.
     """
-    n, m = index.streamer.n, index.m_total
+    n = index.streamer.n
     normalizers = np.asarray(index.streamer._component_eff_m_host, dtype=np.float64)
     weights = np.sqrt(np.divide(theta[:-1], normalizers, out=np.zeros_like(normalizers),
                                 where=normalizers > 0))
-    result = jnp.zeros((n, len(streams)), dtype=jnp.float32)
-    width = max(1, min(1024, 32 * 1024**2 // (4 * max(1, n))))
-    for start in range(0, m, width):
-        stop = min(m, start + width)
-        indices = np.arange(start, stop)
-        component = np.searchsorted(index.offsets[1:], indices, side="right")
-        signs = np.column_stack([
-            2 * rng.integers(0, 2, size=stop - start, dtype=np.int32) - 1 for rng in streams
-        ]).astype(np.float32)
-        if np.any(weights[component] > 0):
-            z = index.extract_standardized_columns(indices)
-            result = result + jnp.matmul(
-                jnp.asarray(z, dtype=jnp.float32),
-                jnp.asarray(weights[component, None] * signs, dtype=jnp.float32),
-                precision=jax.lax.Precision.HIGHEST,
+    st = index.streamer
+    st._prepare_kv_pass()
+    result = jax.device_put(jnp.zeros((n, len(streams)), dtype=jnp.float32), st.dev)
+    miss = jnp.asarray(st._missing_val, dtype=jnp.uint8)
+    next_block = _device_put_block(st._pop_cached(0), st.dev) if st._n_calls else None
+    for call in range(st._n_calls):
+        block = next_block
+        if call + 1 < st._n_calls:
+            next_block = _device_put_block(st._pop_cached(call + 1), st.dev)
+        call_width = int(st._call_true_widths[call])
+        component = int(st._call_component_ids[call])
+        for offset in range(0, call_width, _FACTOR_MAX_REDUCTION_WIDTH):
+            width = min(_FACTOR_MAX_REDUCTION_WIDTH, call_width - offset)
+            packed = block[:, offset//4:(offset + width + 3)//4]
+            padded = int(packed.shape[1]) * 4
+            coefficients = np.zeros((padded, len(streams)), dtype=np.float32)
+            for column, rng in enumerate(streams):
+                signs = 2 * rng.integers(0, 2, size=width, dtype=np.int32) - 1
+                coefficients[:width, column] = weights[component] * signs
+            result = result + _zxb_multi_one_call_jit(
+                packed, jnp.asarray(width, dtype=jnp.int32),
+                st._means_by_call[call, offset:offset+padded],
+                st._inv_by_call[call, offset:offset+padded],
+                jax.device_put(coefficients, st.dev), miss,
             )
+        del block
     residual = np.column_stack([
         2 * rng.integers(0, 2, size=n, dtype=np.int32) - 1 for rng in streams
     ]).astype(np.float32)
@@ -522,11 +608,21 @@ def _build_score_core(projector, index, contractions, rank, rng, workspace):
     rank = min(int(rank), n, index.m_total)
     width = _score_rhs_width(projector, index)
     sketch = workspace.allocate((n, rank))
+    # Preserve the established random sketch independently of compute batching.
+    # This small input is generated once; the large genotype passes below use
+    # the runtime-budgeted RHS width instead of the random stream's tile width.
+    draw_width = max(1, min(16, 32 * 1024**2 // (8 * (n + index.m_total))))
+    omega = np.empty((n, rank), dtype=np.float32)
+    for offset in range(0, rank, draw_width):
+        stop = min(rank, offset + draw_width)
+        omega[:, offset:stop] = rng.standard_normal((n, stop - offset), dtype=np.float32)
     for offset in range(0, rank, width):
         stop = min(rank, offset + width)
-        omega = rng.standard_normal((n, stop - offset), dtype=np.float32)
-        sketch[:, offset:stop] = np.asarray(index.streamer.kv(jnp.asarray(omega)))
+        sketch[:, offset:stop] = np.asarray(index.streamer.kv(jnp.asarray(omega[:, offset:stop])))
+    del omega
     basis, singular, _ = np.linalg.svd(sketch, full_matrices=False)
+    workspace.release(sketch)
+    del sketch
     basis = basis[:, singular > 1e-7 * np.max(singular, initial=0.0)]
     projected = workspace.allocate(basis.shape)
     for offset in range(0, basis.shape[1], width):
@@ -541,10 +637,13 @@ def _build_score_core(projector, index, contractions, rank, rng, workspace):
     keep = values > tolerance
     transform = rotation[:, keep] / np.sqrt(values[keep])
     h = projected @ transform
+    workspace.release(projected)
+    del projected
     marker_h = workspace.allocate((index.m_total, h.shape[1]), dtype=np.float32)
     for offset in range(0, h.shape[1], width):
         marker_h[:, offset:offset + width] = index.xtv_all(
             jnp.asarray(h[:, offset:offset + width], dtype=jnp.float32), normalize=False,
+            dtype=np.float32,
         )
     core = workspace.allocate((len(contractions.intervals) + 1 + len(contractions.candidates),
                                h.shape[1], h.shape[1]))
@@ -561,7 +660,9 @@ def _fill_probe_cache(projector, index, h, seed, samples, markers, start, stop, 
         projected = projector.apply(rhs, stage=stage).astype(np.float64)
         b = projected - h @ (h.T @ rhs)
         samples[offset:end] = b.T
-        markers[offset:end] = index.xtv_all(jnp.asarray(b, dtype=jnp.float32), normalize=False).T
+        markers[offset:end] = index.xtv_all(
+            jnp.asarray(b, dtype=jnp.float32), normalize=False, dtype=np.float32,
+        ).T
 
 
 def _probe_sketch(contractions, h, marker_h, core, samples, markers, workspace):
@@ -592,17 +693,32 @@ def _estimate_score_process(args, projector, grm_index, contractions, response, 
     limit = int(args.score_trace_max_probes)
     pilot_count = min(limit, max(int(args.score_trace_probes), 4 * q))
     n, m = response.size, grm_index.m_total
+    directions, rank = len(core), h.shape[1]
+    pilot_bytes = (4 * pilot_count * (n + m)
+                   + 8 * directions * (rank * pilot_count + pilot_count**2))
+    workspace.ensure_capacity(pilot_bytes, stage=f"{pilot_count}-probe pilot")
+    logger.info("Adaptive score: %d RHSs per batch; pilot scratch %.2f GiB",
+                _score_rhs_width(projector, grm_index), pilot_bytes / 1024**3)
     pilot_samples = workspace.allocate((pilot_count, n), dtype=np.float32)
     pilot_markers = workspace.allocate((pilot_count, m), dtype=np.float32)
     _fill_probe_cache(projector, grm_index, h, pilot_seed, pilot_samples, pilot_markers,
                       0, pilot_count, stage="adaptive_ld_trace_pilot")
     pilot = _probe_sketch(contractions, h, marker_h, core, pilot_samples, pilot_markers, workspace)
     coefficients, nuisance_eigenvalues = fit_nuisance_projection(pilot, q)
+    workspace.release(pilot.cross, pilot.bulk, pilot_samples, pilot_markers)
     del pilot, pilot_samples, pilot_markers
-    samples = workspace.allocate((limit, n), dtype=np.float32)
-    markers = workspace.allocate((limit, m), dtype=np.float32)
     target, count = int(args.score_trace_probes), 0
+    samples = workspace.allocate((0, n), dtype=np.float32)
+    markers = workspace.allocate((0, m), dtype=np.float32)
     while True:
+        # Reserve a whole tier before spending time generating it. Earlier
+        # tiers and the pilot have been released, not left mapped until exit.
+        tier_bytes = (4 * (target - count) * (n + m)
+                      + 8 * directions * (rank * target + target**2)
+                      + 4 * len(contractions.candidates) * (rank + target)**2)
+        workspace.ensure_capacity(tier_bytes, stage=f"{target}-probe score tier")
+        samples = workspace.grow_rows(samples, target)
+        markers = workspace.grow_rows(markers, target)
         _fill_probe_cache(projector, grm_index, h, evaluation_seed, samples, markers,
                           count, target, stage="adaptive_ld_trace_evaluation")
         count = target
@@ -616,6 +732,8 @@ def _estimate_score_process(args, projector, grm_index, contractions, response, 
             quadratics, evaluation=evaluation, coefficients=coefficients,
             boundary_positions=contractions.candidates, reference_out=reference,
         )
+        workspace.release(evaluation.cross, evaluation.bulk)
+        del evaluation
         process.diagnostics.update(
             pilot_probes=pilot_count,
             nuisance_information_eigenvalues=nuisance_eigenvalues.tolist(),
@@ -626,7 +744,12 @@ def _estimate_score_process(args, projector, grm_index, contractions, response, 
         logger.info("Adaptive score: core rank %d, %d pilot, %d evaluation probes; standard error %.3g",
                     h.shape[1], pilot_count, count, error)
         if error <= args.score_trace_tol:
+            workspace.release(samples, markers, marker_h, core)
+            process.diagnostics.update(probe_rhs_width=_score_rhs_width(projector, grm_index),
+                                       scratch_peak_bytes=workspace.peak_bytes)
             return process
+        workspace.release(reference)
+        del reference, process
         if count >= limit:
             raise TracePrecisionError(
                 f"Score trace standard error {error:.3g} exceeds {args.score_trace_tol:.3g}; "

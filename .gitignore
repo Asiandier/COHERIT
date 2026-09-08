@@ -32,10 +32,12 @@ tests/*
 !tests/test_sparse_effect_io.py
 !tests/test_sparse_pipeline_driver.py
 !tests/test_reml_probe_cache.py
+!tests/test_reml_lazy_evaluation.py
 !tests/test_pcg_stability.py
 !tests/test_score_process.py
 !tests/validate_score_process.py
 !tests/test_sparse_pipeline_end_to_end.py
+!tests/test_sparse_information.py
 
 # Local backup snapshot
 bolt_jax_副本 22-47-38-277/

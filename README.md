@@ -86,13 +86,17 @@ $$
 (\hat\alpha_\lambda,\hat b_\lambda)=\arg\min_{\alpha,b}\frac{1}{2}(y-C\alpha-Z_Sb)^TV(\theta)^{-1}(y-C\alpha-Z_Sb)+\lambda\|b\|_1.
 $$
 
-The sparse command first alternates this weighted-LASSO step with REML for the
+The sparse command first alternates this weighted-LASSO step with information-corrected REML for the
 residual `y-C alpha-Z b` in the \(n-\operatorname{rank}(C)\) dimensional space
 orthogonal to the complete nuisance design. Supplying the full `C` matrix to
 the REML routine profiles its unpenalized coefficients at every candidate
 covariance. Since \(P_C C=0\), using a residual that already subtracts the
 current nuisance score is algebraically equivalent to applying \(P_C\) to
 `y-Z b`, while retaining the numerically convenient residual scale.
+For an orthonormal basis `B` of the selected SNP span, the covariance objective
+adds `-0.5 log|B' P_C B|` to the log likelihood. The sparse quadratic subtracts
+`tr{B (B' P_C B)^-1 B'}/n`. These are paired local mean-information corrections;
+the Lasso residual quadratic itself retains `P_C`.
 Within each candidate problem, coordinate descent is accepted solely when the
 active and inactive score-KKT conditions pass at the configured numerical
 tolerance; coefficient change is only an active-set scheduling heuristic.
@@ -131,7 +135,8 @@ estimate nuisance-adjusted covariance scores and their Fisher information.
 The maximum absolute standardized score is calibrated against one shared
 Gaussian quadratic-form reference over all available candidates. Its joint
 p-value must pass `--split-alpha` before the maximizing boundary is added.
-A covariance-only REML refit follows each split.
+A covariance-only REML refit follows each split, keeping both the K=1 sparse
+mean and its information-corrected sparse quadratic fixed.
 The process stops when evidence is insufficient or no contrast is identifiable.
 The common quadratic reference retains dependence and non-Gaussian score tails.
 Non-finite inputs or unresolved trace precision cause an explicit numerical error.
@@ -161,13 +166,15 @@ Sparse-run output semantics are deliberately explicit:
 
 - `estimator_mode` is `coherit` and `computed_estimators` contains only
   `h2_chive`.
-- New sparse runs use output schema version 10. Raw/standardized duplicate
+- New sparse runs use output schema version 11. Raw/standardized duplicate
   estimator fields and downstream phenotype-scale conversions no longer exist.
 - In each `outer_update` history record, `theta`, `coherit_h2`, and validation
   predictive R² describe the same selected LASSO state. The subsequent covariance
   update is recorded separately as `theta_after_variance_update` and
   `coherit_h2_after_variance_update`; its h² convergence fields use the
   `variance_update_` prefix. The validation audit also records the aligned h².
+  `q_sparse_after_variance_update` includes information and nuisance effects
+  recomputed at that new covariance, rather than reusing the pre-update Q.
 - BASIL validation reuses its training dual and marker scores after a true
   residual check; only inaccurate columns are refined. Fixed-K variance blocks
   reuse response-independent REML probe products and single-GRM Lanczos work.
@@ -188,8 +195,9 @@ Sparse-run output semantics are deliberately explicit:
   multiplied by a GRM trace atom.
 - `h2_chive_guarded` is the validated counterpart of `h2_chive`
   and equals the top-level `h2` field whenever the COHERIT branch is valid.
-- `q_chive_components` retains the squared fitted-mean and residual-correction terms
-  that together form the COHERIT sparse
+- `q_chive_components` retains the squared fitted-mean and residual-correction terms,
+  and `term3_mean_uncertainty_subtracted`, which is subtracted from their sum
+  to form the COHERIT sparse
   variance contribution; the squared fitted-mean term is not exposed as a
   standalone heritability estimator.
 - Sparse prediction emits only the `lasso_*` branch: the Lasso

@@ -91,14 +91,18 @@ def test_sparse_pipeline_automatic_fit_effects_prediction(tmp_path, mode):
         )
         command += ["--low-level-pipeline", str(worker)]
     env = {**os.environ, "OPENBLAS_NUM_THREADS": "1", "XLA_PYTHON_CLIENT_ALLOCATOR": "platform"}
+    # A complete adaptive run includes several separately compiled fits. Allow
+    # for the SLQ reverse pass and shared-GPU contention; numerical assertions
+    # below (and the isolated performance benchmark) are unchanged.
     result = subprocess.run(command, cwd=ROOT.parent, env=env, text=True,
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=240)
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=480)
     logs = "\n".join(p.read_text()[-3500:] for p in tmp_path.glob("**/runner.log"))
     assert result.returncode == 0, result.stdout[-5000:] + logs
     pipeline = json.loads(output.with_suffix(".pipeline.json").read_text())
     assert pipeline["status"] == "complete"
     final = json.loads(output.with_suffix(".summary.json").read_text())
-    assert final["sparse_output_schema_version"] == 10
+    assert final["sparse_output_schema_version"] == 11
+    assert final["primary_h2_method"] == "information_corrected_sparse_reml"
     assert final["n_samples"] == 400
     assert final["lasso_branch_valid"]
     assert final["sparse_prediction"]["status"] == "emitted"
@@ -145,6 +149,9 @@ def test_sparse_pipeline_automatic_fit_effects_prediction(tmp_path, mode):
             # A nonzero background makes the final h2 assertion detect raw sums.
             assert bg > 0.0
         q_final = summary["q_chive"]
+        parts = summary["q_chive_components"]
+        assert q_final == pytest.approx(parts["term1_g2_over_n"] + parts["term2_cross"]
+                                       - parts["term3_mean_uncertainty_subtracted"])
         assert summary["h2"] == pytest.approx((q_final + bg) / (q_final + bg + theta_final[-1]))
         assert summary["h2_background_lasso_ml"] == pytest.approx(bg / (bg + theta_final[-1]))
         for row in records:
@@ -158,7 +165,8 @@ def test_sparse_pipeline_automatic_fit_effects_prediction(tmp_path, mode):
                 after = np.asarray(row["theta_after_variance_update"])
                 bg_after = float(after[:-1] @ atoms)
                 assert row["coherit_h2_after_variance_update"] == pytest.approx(
-                    (q + bg_after) / (q + bg_after + after[-1]), abs=1e-10
+                    (row["q_sparse_after_variance_update"] + bg_after) /
+                    (row["q_sparse_after_variance_update"] + bg_after + after[-1]), abs=1e-10
                 )
         if summary["lasso_ml_outer_converged"]:
             assert records[-1]["stage"] == "final_covariance_lasso"

@@ -14,6 +14,7 @@ GPU_REML is organized around one contract: a covariance component must expose
 | Numerical solver | `reml.py`, `pcg.py`, `precond.py` | Form the REML projection, Hutchinson scores, SLQ objective, AI matrix, constrained updates, and projected-core preconditioner. |
 | Public model API | `reml_model.py` | Build compatible operator bundles, manage preconditioner lifecycle, fit replicates, estimate effects, and predict. |
 | Downstream models | `lasso_cd.py`, `gwas.py` | Reuse the fitted covariance for sparse GLS and marginal GWAS. |
+| Sparse mean information | `sparse_information.py` | Selected-span log determinant, score correction and paired sparse-variance correction, without sample-square matrices. |
 | Adaptive partition | `run_sparse_pipeline.py`, `adaptive_ld.py`, `score_process.py` | Orchestrate the path, stream shared boundary contractions, and calibrate trace-defined quadratic scores. |
 
 ## Fit Lifecycle
@@ -69,6 +70,11 @@ GPU_REML is organized around one contract: a covariance component must expose
   the training coefficients and standardization without rescaling the kernels.
 - Strict REML requires converged PCG solves and symmetric operators. Approximate
   `smile_scoring` is a separate opt-in optimization policy.
+- Sparse joint covariance blocks use the selected-mean information correction.
+  They retain the
+  Lasso residual's ordinary-covariate projection; profiling active SNPs as new
+  ordinary covariates would implement a different estimator. Fixed-mean adaptive
+  covariance-only fits keep the corrected K=1 sparse quadratic frozen.
 
 ## Performance-Critical Paths
 

@@ -53,7 +53,8 @@ def test_sparse_reml_setup_reuses_operators_and_invalidates_transforms(monkeypat
 
 
 @pytest.mark.parametrize("components", [1, 2])
-def test_probe_cache_preserves_changed_response_and_theta(monkeypatch, components):
+@pytest.mark.parametrize("optimizer", ["strict", "smile_scoring"])
+def test_probe_cache_preserves_changed_response_and_theta(monkeypatch, components, optimizer):
     rng = np.random.default_rng(73)
     n = 12
     kernels = []
@@ -71,7 +72,6 @@ def test_probe_cache_preserves_changed_response_and_theta(monkeypatch, component
     original = REML._build_affine_slq_cache
 
     def build(*args, **kwargs):
-        # Multi-GRM likelihood SLQ also uses this builder, but is theta-dependent.
         calls["lanczos"] += int(components == 1)
         return original(*args, **kwargs)
 
@@ -83,27 +83,32 @@ def test_probe_cache_preserves_changed_response_and_theta(monkeypatch, component
         maxiter=100, minq_iter=0, slq_samples=4, slq_m=8,
         response_is_standardized=True, pcg_tol=1e-5, verbose=False,
         return_diagnostics=True,
+        optimizer=optimizer,
     )
+    trace_builds = int(optimizer == "smile_scoring")
     REML.fit_reml(y=rng.normal(size=n), probe_cache=cache, **base)
-    assert calls == {"probes": 1, "lanczos": int(components == 1)}
+    assert calls == {"probes": trace_builds, "lanczos": int(components == 1)}
     response = rng.normal(size=n)
     theta = np.array([0.2] * components + [0.6])
     cached = REML.fit_reml(y=response, param_init=theta, probe_cache=cache, **base)
-    assert calls == {"probes": 1, "lanczos": int(components == 1)}
+    assert calls == {"probes": trace_builds, "lanczos": int(components == 1)}
     fresh = REML.fit_reml(y=response, param_init=theta, **base)
     np.testing.assert_array_equal(cached[0], fresh[0])
     for key in ["loglik", "grad", "ai"]:
         np.testing.assert_allclose(cached[2][key], fresh[2][key], rtol=1e-6, atol=1e-6)
     before = calls.copy()
     REML.fit_reml(y=response, seed=91, probe_cache=cache, **base)
-    assert calls["probes"] == before["probes"] + 1
+    assert calls["probes"] == before["probes"] + trace_builds
     assert calls["lanczos"] == before["lanczos"] + int(components == 1)
     before = calls.copy()
     # Same dimensions but different operators must never share products.
-    previous_products = np.asarray(cache.kvrand_stack).copy()
+    previous_products = np.asarray(cache.kvrand_stack).copy() if trace_builds else None
     changed = {**base, "K_mvs": tuple(lambda v, k=k: 2 * k @ v for k in kernels)}
     changed["stacked_kv"] = None
     REML.fit_reml(y=response, seed=91, probe_cache=cache, **changed)
-    np.testing.assert_allclose(cache.kvrand_stack, 2 * previous_products, rtol=1e-6, atol=1e-6)
+    if trace_builds:
+        np.testing.assert_allclose(cache.kvrand_stack, 2 * previous_products, rtol=1e-6, atol=1e-6)
+    else:
+        assert cache.kvrand_stack is None
     assert cache.signature[0] == changed["K_mvs"]
     assert calls["lanczos"] == before["lanczos"] + int(components == 1)

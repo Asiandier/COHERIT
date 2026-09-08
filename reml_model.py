@@ -1839,6 +1839,7 @@ class InfinitesimalREMLFitter:
         h2_init: float = 0.5,
         var_components_init: Optional[jnp.ndarray] = None,
         estimate_effects: bool = False,
+        mean_information=None,
     ) -> FitResult:
         if self.cfg.verbose:
             logger.info("fit_infinitesimal start @ %s", datetime.now().isoformat(timespec='seconds'))
@@ -1906,6 +1907,10 @@ class InfinitesimalREMLFitter:
                 slq_samples=self.cfg.slq_samples,
                 slq_m=self.cfg.slq_m,
                 slq_mode=self.cfg.slq_mode,
+                slq_workspace_bytes=(
+                    min(2 * 1024**3, max(1, int(self.cfg.gpu_budget_bytes / 8)))
+                    if self.cfg.gpu_budget_bytes is not None else 256 * 1024**2
+                ),
                 precond_conf=self.precond_conf,
                 slq_precond_conf=self.precond_conf,
                 precond_refresh_fn=self._make_pcg_precond_refresh_fn(ops),
@@ -1925,6 +1930,7 @@ class InfinitesimalREMLFitter:
                 return_diagnostics=bool(self.cfg.capture_reml_diagnostics),
                 verbose=self.cfg.verbose,
                 **({"probe_cache": self._reml_probe_cache} if self.cfg.cache_reml_setup else {}),
+                **({"mean_information": mean_information} if mean_information is not None else {}),
             )
             if bool(self.cfg.capture_reml_diagnostics):
                 vc, history, diagnostics = fit_out

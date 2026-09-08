@@ -192,9 +192,6 @@ def _read_phenotype_map(path: Path) -> dict[str, float]:
 
 
 def _prepare_combined_fit_inputs(args: argparse.Namespace) -> tuple[Path, Path, bool]:
-    if args.fit_pheno_txt:
-        return args.fit_pheno_txt, args.fit_keep_path, False
-
     train_ids = _read_keep(args.keep_path)
     validation_ids = _read_keep(args.validation_keep_path)
     overlap = set(train_ids).intersection(validation_ids)
@@ -224,6 +221,46 @@ def _prepare_combined_fit_inputs(args: argparse.Namespace) -> tuple[Path, Path, 
         raise ValueError(
             f"Combined fit phenotype is missing selected IID {absent[0]!r}."
         )
+
+    # Each selection phenotype must cover its own cohort; another file must
+    # not silently fill a missing training/validation outcome in the final fit.
+    for name, ids, values in (("Training", train_ids, train_values),
+                              ("Validation", validation_ids, validation_values)):
+        missing = set(ids).difference(values)
+        if missing:
+            raise ValueError(f"{name} phenotype is missing selected IID {min(missing)!r}.")
+
+    if args.fit_pheno_txt:
+        fit_ids = set(_read_keep(args.fit_keep_path))
+        if fit_ids != selected:
+            raise ValueError(
+                "Final-fit keep must equal the training+validation union; "
+                f"missing={len(selected-fit_ids)}, extra={len(fit_ids-selected)}."
+            )
+        fit_values = _read_phenotype_map(args.fit_pheno_txt)
+        for iid in combined_ids:
+            if iid not in fit_values:
+                raise ValueError(f"Final-fit phenotype is missing selected IID {iid!r}.")
+            if not math.isclose(fit_values[iid], combined_values[iid], rel_tol=1e-10, abs_tol=1e-12):
+                raise ValueError(f"Final-fit phenotype conflicts with selection phenotype for IID {iid!r}.")
+
+    prediction_prefix = getattr(args, "prediction_prefix", None)
+    if prediction_prefix is not None:
+        prediction_order = _read_source_sample_ids(prediction_prefix, args.prediction_format)
+        prediction_keep = getattr(args, "prediction_keep_path", None)
+        prediction_ids = set(_read_keep(prediction_keep) if prediction_keep else prediction_order)
+        missing = prediction_ids.difference(prediction_order)
+        if missing:
+            raise ValueError(f"Prediction keep ID is absent from genotype: {min(missing)!r}.")
+        overlap = selected.intersection(prediction_ids)
+        if overlap:
+            raise ValueError(
+                "Prediction and training+validation samples must be disjoint; "
+                f"first overlap: {min(overlap)!r}."
+            )
+
+    if args.fit_pheno_txt:
+        return args.fit_pheno_txt, args.fit_keep_path, False
 
     combined_dir = args.work_dir / "combined_fit_inputs"
     phenotype_path = combined_dir / "train_plus_validation.pheno"
@@ -482,7 +519,7 @@ def _validate_summary(
 ) -> dict[str, Any]:
     path = Path(str(prefix) + ".summary.json")
     summary = read_json(path)
-    if int(summary.get("sparse_output_schema_version", -1)) != 10:
+    if int(summary.get("sparse_output_schema_version", -1)) != 11:
         raise ValueError(f"Unsupported sparse summary schema: {path}")
     if int(summary.get("n_grms", -1)) != int(expected_k):
         raise ValueError(f"Sparse summary K does not match expected K={expected_k}: {path}")
