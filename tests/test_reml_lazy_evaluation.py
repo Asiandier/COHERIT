@@ -179,3 +179,49 @@ def test_lazy_backtracking_matches_eager_trajectory(monkeypatch):
     for first, second in zip(lazy[1], full[1]):
         for field in ("loglik", "params", "accepted", "line_search_trials", "stop_reason"):
             np.testing.assert_equal(first.get(field), second.get(field))
+
+
+def test_all_numerically_failed_trials_raise_instead_of_converging(monkeypatch):
+    original = REML._eval_once
+    calls = 0
+
+    def failing_trials(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return original(*args, **kwargs)
+        raise FloatingPointError("injected PCG failure")
+
+    monkeypatch.setattr(REML, "_eval_once", failing_trials)
+    with pytest.raises(FloatingPointError, match="could not evaluate any of 3 candidates") as error:
+        REML.fit_reml(**_problem(), max_linesearch_trials=3)
+    assert calls == 4
+    assert "injected PCG failure" in str(error.value.__cause__)
+
+
+@pytest.mark.parametrize("downhill", [False, True])
+def test_numeric_failure_can_backtrack_to_a_finite_trial(monkeypatch, downhill):
+    original = REML._eval_once
+    warmup = None
+    calls = 0
+
+    def mixed_trials(*args, **kwargs):
+        nonlocal warmup, calls
+        calls += 1
+        if calls == 1:
+            warmup = original(*args, **kwargs)
+            return warmup
+        if calls == 2:
+            raise FloatingPointError("injected failed first trial")
+        result = list(warmup)
+        if downhill:
+            result[0] = warmup[0] - 1.0
+            result[1] = result[2] = None  # finite, lazily rejected objective
+        return tuple(result)
+
+    monkeypatch.setattr(REML, "_eval_once", mixed_trials)
+    theta, history = REML.fit_reml(**_problem(), max_linesearch_trials=3)
+    assert np.all(np.isfinite(theta))
+    assert history[-1]["converged"]
+    assert history[-1]["stop_reason"] == ("ll_down" if downhill else "rel_dll")
+    assert history[-1]["accepted"] == (not downhill)

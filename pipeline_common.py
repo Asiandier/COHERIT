@@ -13,6 +13,7 @@ import scipy.linalg as sla
 logger = logging.getLogger(__name__)
 
 from .suggest_params_v3 import suggest_call_width, PlanResult
+from .runtime_env import resolve_cpu_threads
 
 
 def genetic_variance(theta_g, trace_atoms) -> float:
@@ -34,25 +35,6 @@ def genetic_variance(theta_g, trace_atoms) -> float:
 
 def env(name: str, default: str = "") -> str:
     return os.environ.get(name, default)
-
-
-def resolve_cpu_threads(explicit: int | None = None) -> tuple[int, str]:
-    if explicit is not None:
-        return max(1, int(explicit)), "explicit"
-    for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
-        raw = os.environ.get(name, "").strip()
-        if not raw:
-            continue
-        try:
-            value = int(raw)
-        except ValueError:
-            continue
-        if value > 0:
-            return value, name
-    try:
-        return max(1, len(os.sched_getaffinity(0))), "sched_getaffinity"
-    except (AttributeError, OSError):
-        return max(1, int(os.cpu_count() or 1)), "os.cpu_count"
 
 
 def first_visible_gpu_id() -> Optional[str]:
@@ -241,6 +223,10 @@ def run_planner(
     n_covar: int,
     n_rand_vec: int,
     slq_samples: int = 30,
+    slq_m: int = 30,
+    optimizer: str = "strict",
+    identity_residual: bool = True,
+    slq_workspace_bytes: Optional[int] = None,
     gpu_name: Optional[str] = None,
     ring_depth: Optional[int] = None,
     source_format: Optional[str] = None,
@@ -259,6 +245,10 @@ def run_planner(
         n_covar=n_covar,
         n_rand_vec=n_rand_vec,
         slq_samples=slq_samples,
+        slq_m=slq_m,
+        optimizer=optimizer,
+        identity_residual=identity_residual,
+        slq_workspace_bytes=slq_workspace_bytes,
         ring_depth=ring_depth,
         source_format=source_format,
         arbitrary_component_partition=arbitrary_component_partition,

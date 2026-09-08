@@ -37,9 +37,10 @@ import numpy as np
 
 from .adaptive_ld import (
     add_ld_boundary,
-    atomic_json,
-    read_json,
     write_root_component_spec,
+)
+from .io_utils import (
+    IncompleteOutputError, atomic_json, read_json, validate_output_manifest,
 )
 from .component_spec import load_component_specs
 from .ld_score import (
@@ -516,9 +517,14 @@ def _validate_summary(
     expected_k: int,
     expected_method: str,
     require_prediction: bool,
+    require_effects: bool = False,
+    required_state: Path | None = None,
 ) -> dict[str, Any]:
     path = Path(str(prefix) + ".summary.json")
-    summary = read_json(path)
+    try:
+        summary = read_json(path)
+    except (FileNotFoundError, ValueError) as error:
+        raise IncompleteOutputError(f"Missing or invalid summary: {path}") from error
     if int(summary.get("sparse_output_schema_version", -1)) != 11:
         raise ValueError(f"Unsupported sparse summary schema: {path}")
     if int(summary.get("n_grms", -1)) != int(expected_k):
@@ -536,7 +542,27 @@ def _validate_summary(
         raise ValueError("Final refit did not use the frozen-ratio target path.")
     if require_prediction and summary.get("sparse_prediction", {}).get("status") != "emitted":
         raise ValueError("Requested prediction output was not emitted.")
+    required = [str(prefix) + suffix for suffix in (".history.json", ".selected_snps.tsv")]
+    if require_prediction:
+        required.extend(str(prefix) + suffix for suffix in (".sparse_prediction.tsv", ".sparse_prediction_metadata.json"))
+    if require_effects:
+        required.append(str(prefix) + ".sparse_effects.tsv")
+    if required_state is not None:
+        required.append(required_state)
+    validate_output_manifest(summary.get("output_artifacts"), required_paths=required)
     return summary
+
+
+def _completed_summary(prefix: Path, **requirements) -> dict[str, Any] | None:
+    """Resume only complete stages; semantic/configuration errors still fail."""
+    try:
+        return _validate_summary(prefix, **requirements)
+    except IncompleteOutputError as error:
+        path = Path(str(prefix) + ".summary.json")
+        if path.exists():
+            print(f"[resume] Rebuilding incomplete stage {prefix}: {error}", flush=True)
+            path.unlink()
+        return None
 
 
 def _stage_snapshot(summary: Mapping[str, Any]) -> dict[str, Any]:
@@ -572,9 +598,13 @@ def _run_validation_fit(
 ) -> tuple[Path, Path, dict[str, Any]]:
     prefix = directory / "coherit"
     state = directory / "sparse_state.npz"
-    summary_path = Path(str(prefix) + ".summary.json")
     expected_k = _component_count(component_spec)
-    if not summary_path.is_file() or not state.is_file():
+    requirements = dict(
+        expected_k=expected_k, expected_method="validation_predictive_r2",
+        require_prediction=True, required_state=state,
+    )
+    summary = _completed_summary(prefix, **requirements)
+    if summary is None:
         _run_command(
             _low_level_command(
                 args=args,
@@ -589,14 +619,7 @@ def _run_validation_fit(
             ),
             directory / "runner.log",
         )
-    summary = _validate_summary(
-        prefix,
-        expected_k=expected_k,
-        expected_method="validation_predictive_r2",
-        require_prediction=True,
-    )
-    if not state.is_file():
-        raise RuntimeError(f"Validation fit did not emit its sparse state: {state}")
+        summary = _validate_summary(prefix, **requirements)
     return prefix, state, summary
 
 
@@ -851,8 +874,13 @@ def _run_final_refit(
     selected_summary: Mapping[str, Any],
 ) -> dict[str, Any]:
     expected_k = _component_count(component_spec)
-    final_summary_path = Path(str(args.out_prefix) + ".summary.json")
-    if not final_summary_path.is_file():
+    requirements = dict(
+        expected_k=expected_k, expected_method="fixed_lam_ratio",
+        require_prediction=args.prediction_prefix is not None,
+        require_effects=args.compute_effects,
+    )
+    final = _completed_summary(args.out_prefix, **requirements)
+    if final is None:
         command = _low_level_command(
             args=args,
             phenotype=args.fit_pheno_txt,
@@ -866,12 +894,7 @@ def _run_final_refit(
             final_outputs=True,
         )
         _run_command(command, args.work_dir / "final_refit.log")
-    final = _validate_summary(
-        args.out_prefix,
-        expected_k=expected_k,
-        expected_method="fixed_lam_ratio",
-        require_prediction=args.prediction_prefix is not None,
-    )
+        final = _validate_summary(args.out_prefix, **requirements)
     if not math.isclose(
         float(final["lasso_selected_lam_ratio"]),
         float(selected_summary["lasso_selected_lam_ratio"]),
@@ -879,8 +902,6 @@ def _run_final_refit(
         abs_tol=1e-12,
     ):
         raise RuntimeError("Final refit did not preserve the validation-selected lambda ratio.")
-    if args.compute_effects and not Path(str(args.out_prefix) + ".sparse_effects.tsv").is_file():
-        raise RuntimeError("Final refit did not emit requested sparse effect sizes.")
     return final
 
 
@@ -1213,6 +1234,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         atomic_json(config_path, config)
 
+    result_path = Path(str(args.out_prefix) + ".pipeline.json")
+    result_path.unlink(missing_ok=True)
     status_path = args.work_dir / "status.json"
     atomic_json(
         status_path,
@@ -1280,7 +1303,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             "config": str(config_path.resolve()),
             "finished_at": _now(),
         }
-        result_path = Path(str(args.out_prefix) + ".pipeline.json")
         atomic_json(result_path, result)
         atomic_json(
             status_path,

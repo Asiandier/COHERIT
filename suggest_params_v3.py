@@ -11,6 +11,8 @@ import os
 from dataclasses import dataclass
 from typing import Optional, Sequence
 
+from .slq import default_workspace_bytes, workspace_layout
+
 _GIB = 1024**3
 _W_ALIGN = 256
 _GPU_HEADROOM = 0.85
@@ -329,17 +331,37 @@ def _slq_live_bytes(
     rank: int,
     n_rand_vec: int,
     slq_samples: int,
+    slq_m: int = 30,
+    slq_workspace_bytes: int = 256 * 1024**2,
+    n_covar: int = 0,
+    identity_residual: bool = True,
 ) -> float:
     wide_block = _mat_bytes(n, geom.max_unpack_width)
-    inner = _mat_bytes(geom.max_unpack_width, slq_samples)
-    slq_vec = _mat_bytes(n, slq_samples)
+    if n_grm == 1 and identity_residual:
+        # Affine K + I SLQ stores tridiagonals, not a reverse Lanczos tape.
+        width = slq_samples
+        workspace = (
+            _SLQ_WORK_VECS * _mat_bytes(n, width)
+            + 8 * _mat_bytes(slq_m * slq_m, width)
+        )
+    else:
+        layout = workspace_layout(n, slq_samples, slq_m, slq_workspace_bytes)
+        width = layout["batch_width"]
+        workspace = layout["peak_bytes"]
+    inner = _mat_bytes(geom.max_unpack_width, width)
+    retained_solves = (
+        3 * _mat_bytes(n, n_covar + 1 + n_rand_vec)
+        + 2 * _mat_bytes(n, n_grm + 1)
+        + _mat_bytes(n_grm + 1, n_grm + 1)
+    )
     return (
         _fit_projected_core_state_bytes(n, n_grm, rank)
         + _kvrand_cache_bytes(n, n_grm, n_rand_vec)
         + geom.inflight_packed_row_bytes * n
         + wide_block
         + 2.0 * inner
-        + _SLQ_WORK_VECS * slq_vec
+        + retained_solves
+        + workspace
     )
 
 
@@ -457,6 +479,10 @@ def suggest_call_width(
     n_covar: int = 0,
     n_rand_vec: int = 100,
     slq_samples: int = 30,
+    slq_m: int = 30,
+    optimizer: str = "strict",
+    identity_residual: bool = True,
+    slq_workspace_bytes: Optional[int] = None,
     ring_depth: Optional[int] = None,
     source_format: Optional[str] = None,
     arbitrary_component_partition: bool = False,
@@ -468,6 +494,10 @@ def suggest_call_width(
     Reports estimated host anon memory for informational purposes.
     Never rejects based on host memory.
     """
+    if optimizer not in {"strict", "smile_scoring"}:
+        raise ValueError(f"Unknown REML optimizer: {optimizer}")
+    # Only the approximate SMILE scoring policy has independent trace probes.
+    n_rand_vec = int(n_rand_vec) if optimizer == "smile_scoring" else 0
     segment_sizes = _normalize_segments(
         p_list,
         component_block_sizes,
@@ -499,6 +529,10 @@ def suggest_call_width(
         else gpu_free * float(gpu_headroom)
     )
     gpu_budget_gib = gpu_budget / _GIB
+    slq_workspace_bytes = (
+        default_workspace_bytes(gpu_budget)
+        if slq_workspace_bytes is None else int(slq_workspace_bytes)
+    )
 
     total_p = sum(max(0, int(sz)) for sz in segment_sizes)
     precond_rank = min(_AUTO_PRECOND_FLOOR, max(0, n), max(0, total_p))
@@ -568,6 +602,10 @@ def suggest_call_width(
             rank=precond_rank,
             n_rand_vec=n_rand_vec,
             slq_samples=max(1, int(slq_samples)),
+            slq_m=slq_m,
+            slq_workspace_bytes=slq_workspace_bytes,
+            n_covar=n_covar,
+            identity_residual=identity_residual,
         )
         live_peak = max(build_peak, precompute_peak, solve_peak, projection_peak, slq_peak)
         return (

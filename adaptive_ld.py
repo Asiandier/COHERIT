@@ -31,6 +31,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+# Preserve the sparse workflow's precision without importing its CLI module.
+jax.config.update(
+    "jax_default_matmul_precision",
+    os.environ.get("GPU_REML_MATMUL_PRECISION", "highest"),
+)
+
 from .component_spec import load_component_specs
 from .data_utils import load_pheno_covar_aligned_with_transform
 from .geno_source import PgenGenoSource
@@ -47,12 +53,13 @@ from .pipeline_common import (
     setup_gpu,
 )
 from .reml_model import FitConfig, InfinitesimalREMLFitter, standardize_response
-from .run_sparse_reml_pipeline import (
+from .sparse_core import (
     MultiGRMIndex,
-    _accepted_reml_theta,
-    _sparse_dense_h2,
-    _validate_component_partition,
+    accepted_reml_theta as _accepted_reml_theta,
+    sparse_dense_h2 as _sparse_dense_h2,
+    validate_component_partition as _validate_component_partition,
 )
+from .io_utils import atomic_json, read_json
 from .variant_io import iter_variant_records_for_prefix
 from .score_process import (
     TracePrecisionError,
@@ -67,24 +74,6 @@ logger = logging.getLogger(__name__)
 # Bound float32 dot-product reduction length even when the runtime planner
 # selects a very wide packed block. This is kernel geometry, not a model knob.
 _FACTOR_MAX_REDUCTION_WIDTH = 65536
-
-
-def read_json(path: str | Path) -> dict[str, Any]:
-    value = json.loads(Path(path).read_text(encoding="utf-8"))
-    if not isinstance(value, dict):
-        raise ValueError(f"Expected a JSON object: {path}")
-    return value
-
-
-def atomic_json(path: str | Path, value: dict[str, Any]) -> None:
-    output = Path(path)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_name(f".{output.name}.tmp.{os.getpid()}")
-    temporary.write_text(
-        json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + "\n",
-        encoding="utf-8",
-    )
-    os.replace(temporary, output)
 
 
 def load_ld_rank(path: str | Path) -> tuple[np.ndarray, np.ndarray]:
@@ -830,6 +819,7 @@ def build_analysis_context(args: argparse.Namespace) -> AnalysisContext:
         n_covar=int(covar.shape[1]),
         n_rand_vec=int(args.n_rand_vec),
         slq_samples=int(args.slq_samples),
+        slq_m=int(args.slq_m),
         gpu_name=gpu_name,
         source_format=genotype_format,
         arbitrary_component_partition=True,

@@ -618,6 +618,9 @@ def main():
         n_covar=n_covar,
         n_rand_vec=args.n_rand_vec,
         slq_samples=args.slq_samples,
+        slq_m=args.slq_m,
+        optimizer=args.smile_optimizer if use_smile else "strict",
+        identity_residual=not (use_admixed and args.admix_residual_mode == "per-ancestry"),
         gpu_name=gpu_name,
         ring_depth=args.ring_depth if args.ring_depth > 0 else None,
         source_format=(

@@ -1726,6 +1726,8 @@ def fit_reml(
         alpha_try = 1.0
         alpha_used = alpha_try
         ls_trace: list[tuple[float, float, bool, int, int, bool]] = []
+        evaluated_trials = 0
+        last_trial_error = None
         ll_new = ll
         grad_new = grad
         FI_new = FI
@@ -1828,16 +1830,18 @@ def fit_reml(
                     compute_traces=False,
                     min_loglik=ll if optimizer == "strict" else None,
                 )
-            except FloatingPointError:
+            except FloatingPointError as error:
                 eval_elapsed += time.time() - eval_t0
                 if optimizer == "smile_scoring":
                     raise
+                last_trial_error = error
                 ls_trace.append((alpha_used, float("-inf"), False, 0, 0, False))
                 alpha_try *= 0.5
                 continue
             eval_elapsed += time.time() - eval_t0
             dll_arr, k_pcg_arr = jax.device_get((ll_try - ll, k_pcg_try))
             dll = float(dll_arr)
+            evaluated_trials += 1
             k_pcg_trial = int(k_pcg_arr)
             ai_pcg_trial = (
                 int(FI_try.stats.ai_pcg_iters)
@@ -1866,6 +1870,14 @@ def fit_reml(
             # likelihood path-dependent (and can produce a nonzero likelihood
             # jump even as the trial step tends to zero).
             alpha_try *= 0.5
+
+        if evaluated_trials == 0:
+            # A finite downhill objective is a valid terminal state; a failed
+            # solve is not evidence that likelihood ascent has converged.
+            raise FloatingPointError(
+                f"REML line search could not evaluate any of {trial_count} "
+                f"candidates at iteration {it + 1}: {last_trial_error}"
+            ) from last_trial_error
 
         (
             ll_new_host,

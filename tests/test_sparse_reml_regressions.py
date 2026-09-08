@@ -455,10 +455,24 @@ def test_hinv_column_pcg_batches_bound_rhs_and_match_exact_solution():
     assert diagnostic["max_iterations"] <= 2
 
 
-def test_legacy_complete_path_expansion_is_memory_bounded():
-    assert SPARSE._complete_path_kkt_expansion_budget(100_000, 256, 256) == 256
-    assert SPARSE._complete_path_kkt_expansion_budget(100_000, 256, 2048) == 1024
-    assert SPARSE._complete_path_kkt_expansion_budget(17, 256, 2048) == 17
+def test_hinv_warm_hit_checks_the_true_residual_only_once_per_batch():
+    rhs = np.arange(35, dtype=np.float32).reshape(7, 5) + 1.0
+    calls = []
+
+    def hv(value):
+        calls.append(value.shape[1])
+        return 2.0 * value
+
+    solution, diagnostic = SPARSE._solve_hinv_columns_batched(
+        hv=hv, precond=None, rhs=rhs, warm_start=rhs / 2.0,
+        tol=1e-6, maxiter=10, batch_size=2, stage="warm-hit test",
+    )
+    np.testing.assert_array_equal(solution, rhs / 2.0)
+    assert calls == [2, 2, 1]
+    assert diagnostic["total_batch_iterations"] == 0
+    assert diagnostic["max_true_relative_residual"] == 0.0
+
+
 
 
 def test_complete_path_global_kkt_unions_violators_before_validation():
@@ -1165,7 +1179,7 @@ def test_sparse_defaults_use_twenty_outer_rounds_and_pcg_scaled_kkt_floor(
     assert np.isclose(floored_args.kkt_rel_tol, requested_floor)
 
 
-def test_true_pcg_relative_residual_recomputes_from_linear_system():
+def test_pcg_returns_the_true_relative_residual_of_its_solution():
     matrix = SPARSE.jnp.asarray(
         [[2.0, 0.0], [0.0, 4.0]], dtype=SPARSE.jnp.float32
     )
@@ -1177,10 +1191,11 @@ def test_true_pcg_relative_residual_recomputes_from_linear_system():
     )
     hv = lambda value: matrix @ value
 
-    assert SPARSE._true_pcg_relative_residual(hv, rhs, exact) == 0.0
+    _, residual, _ = SPARSE.pcg_solve(hv, rhs, X0=exact, maxiter=0)
+    assert float(residual) == 0.0
 
     perturbed = exact.at[0, 0].add(0.1)
-    observed = SPARSE._true_pcg_relative_residual(hv, rhs, perturbed)
+    _, observed, _ = SPARSE.pcg_solve(hv, rhs, X0=perturbed, maxiter=0)
     rhs_np = np.asarray(rhs)
     perturbed_np = np.asarray(perturbed)
     expected = np.max(

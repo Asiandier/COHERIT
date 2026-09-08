@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Optional, Sequence
 
 from .pipeline_common import run_planner
+from .slq import default_workspace_bytes
 from .smile_block_w import (
     default_w_device_cache_bytes,
     estimate_bucketed_w_device_cache_bytes,
@@ -85,6 +86,9 @@ def run_smile_planner(
     n_covar: int,
     n_rand_vec: int,
     slq_samples: int = 30,
+    slq_m: int = 30,
+    optimizer: str = "strict",
+    identity_residual: bool = True,
     gpu_name: Optional[str] = None,
     ring_depth: Optional[int] = None,
     source_format: Optional[str] = None,
@@ -142,6 +146,10 @@ def run_smile_planner(
         n_rand_vec=n_rand_vec,
         slq_samples=slq_samples,
         gpu_name=gpu_name,
+        slq_m=slq_m,
+        optimizer=optimizer,
+        identity_residual=identity_residual,
+        slq_workspace_bytes=default_workspace_bytes(base_budget),
         ring_depth=ring_depth,
         source_format=source_format,
         arbitrary_component_partition=arbitrary_component_partition,

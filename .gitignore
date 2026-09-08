@@ -38,6 +38,9 @@ tests/*
 !tests/validate_score_process.py
 !tests/test_sparse_pipeline_end_to_end.py
 !tests/test_sparse_information.py
+!tests/test_sparse_output_recovery.py
+!tests/test_runtime_resources.py
+!tests/test_suggest_params.py
 
 # Local backup snapshot
 bolt_jax_副本 22-47-38-277/

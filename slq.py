@@ -13,6 +13,34 @@ import jax.numpy as jnp
 import numpy as np
 
 
+def default_workspace_bytes(gpu_budget_bytes=None):
+    """Shared SLQ budget policy for fitting and memory planning."""
+    return (
+        min(2 * 1024**3, max(1, int(gpu_budget_bytes / 8)))
+        if gpu_budget_bytes is not None else 256 * 1024**2
+    )
+
+
+def workspace_layout(n, nsamples, m, workspace_bytes, *, itemsize=4):
+    """Estimate the exact batching policy and retained/reverse workspaces.
+
+    One probe is the minimum batch, even when its workspace exceeds the
+    requested budget. The planner must account for that minimum explicitly.
+    """
+    if n < 1 or nsamples < 1 or m < 1 or workspace_bytes < 1:
+        raise ValueError("SLQ dimensions and workspace budget must be positive.")
+    depth = min(int(m), int(n))
+    per_probe = itemsize*n*(8*(depth+1)+32)
+    capacity = max(1, int(workspace_bytes)//per_probe)
+    width = min(int(nsamples), 1 << (capacity.bit_length()-1))
+    retained = itemsize*n*(nsamples*(2*depth+1) + width*(6*(depth+1)+32))
+    eager = per_probe*width
+    peak = max(eager, retained) if retained <= workspace_bytes else eager
+    # Small dense quadrature matrices are live alongside the Lanczos state.
+    peak += 8*itemsize*width*depth*depth
+    return dict(batch_width=width, retained_bytes=retained, peak_bytes=peak)
+
+
 @partial(jax.jit, donate_argnums=(0,))
 def _set_row(array, index, value):
     return array.at[index].set(value)
@@ -130,18 +158,14 @@ def logdet_value_and_grad(matvec, matvec_pullback, n, key, *, nsamples, m,
     defer reverse passes until acceptance. Otherwise retain the original
     streamed eager derivative, without extra caching or repeated forward matvecs.
     """
-    if n < 1 or nsamples < 1 or m < 1 or workspace_bytes < 1:
-        raise ValueError("SLQ dimensions and workspace budget must be positive.")
     depth = min(int(m), int(n))
-    itemsize = np.dtype(dtype).itemsize
     # Q, products, their adjoints and recurrence/VJP workspaces. Batching
     # bounds retained state independently of the total number of probes.
-    capacity = max(1, int(workspace_bytes)//(itemsize*n*(8*(depth+1)+32)))
-    width = min(int(nsamples), 1 << (capacity.bit_length()-1))
-    retained_bytes = itemsize*n*(nsamples*(2*depth+1) + width*(6*(depth+1)+32))
+    layout = workspace_layout(n, nsamples, m, workspace_bytes, itemsize=np.dtype(dtype).itemsize)
+    width = layout["batch_width"]
     defer_gradient = (
         accept_value is not None and matvec_pullback is not None
-        and retained_bytes <= workspace_bytes
+        and layout["retained_bytes"] <= workspace_bytes
     )
     pending = []
     keys = jax.random.split(key, nsamples)

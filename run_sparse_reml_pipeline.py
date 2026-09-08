@@ -61,6 +61,7 @@ _data_mod = importlib.import_module(f"{pkg_name}.data_utils")
 _lasso_mod = importlib.import_module(f"{pkg_name}.lasso_cd")
 _pcg_mod = importlib.import_module(f"{pkg_name}.pcg")
 _information_mod = importlib.import_module(f"{pkg_name}.sparse_information")
+_core_mod = importlib.import_module(f"{pkg_name}.sparse_core")
 _precond_mod = importlib.import_module(f"{pkg_name}.precond")
 _common_mod = importlib.import_module(f"{pkg_name}.pipeline_common")
 _io_utils_mod = importlib.import_module(f"{pkg_name}.io_utils")
@@ -87,6 +88,11 @@ compute_projected_hinv_vector = _lasso_mod.compute_projected_hinv_vector
 fit_weighted_lasso_with_covariates = _lasso_mod.fit_weighted_lasso_with_covariates
 pcg_solve = _pcg_mod.pcg_solve
 SparseMeanInformation = _information_mod.SparseMeanInformation
+MultiGRMIndex = _core_mod.MultiGRMIndex
+SingleGRMIndex = _core_mod.SingleGRMIndex
+_validate_component_partition = _core_mod.validate_component_partition
+_accepted_reml_theta = _core_mod.accepted_reml_theta
+_sparse_dense_h2 = _core_mod.sparse_dense_h2
 load_component_specs = _component_spec_mod.load_component_specs
 write_sparse_effect_outputs = _effect_io_mod.write_sparse_effect_outputs
 iter_variant_records_for_prefix = _variant_io_mod.iter_variant_records_for_prefix
@@ -123,6 +129,8 @@ run_planner = _common_mod.run_planner
 print_planner_info = _common_mod.print_planner_info
 log_runtime_gpu_memory = _common_mod.log_runtime_gpu_memory
 ensure_parent_dir = _io_utils_mod.ensure_parent_dir
+atomic_json = _io_utils_mod.atomic_json
+output_manifest = _io_utils_mod.output_manifest
 solve_spd = _common_mod.solve_spd
 cleanup_path = _common_mod.cleanup_path
 fam_order_mismatch = _common_mod.fam_order_mismatch
@@ -153,37 +161,6 @@ def _load_component_variant_indices(path: str) -> list[np.ndarray]:
     ]
 
 
-def _validate_component_partition(
-    groups: list[np.ndarray], *, n_markers: int
-) -> list[np.ndarray]:
-    """Require a nonempty, disjoint, exhaustive source-marker partition."""
-    if not groups:
-        return []
-    normalized: list[np.ndarray] = []
-    for component_idx, group in enumerate(groups):
-        values = np.asarray(group, dtype=np.int64).reshape(-1)
-        if values.size == 0:
-            raise ValueError(
-                f"Component {component_idx} is empty; every GRM must contain SNPs."
-            )
-        unique = np.unique(values)
-        if unique.size != values.size:
-            raise ValueError(f"Component {component_idx} contains duplicate SNPs.")
-        if np.any((unique < 0) | (unique >= int(n_markers))):
-            raise ValueError(
-                f"Component {component_idx} contains an index outside "
-                f"[0, {int(n_markers)})."
-            )
-        normalized.append(unique)
-    assigned = np.concatenate(normalized)
-    if assigned.size != int(n_markers) or np.unique(assigned).size != int(
-        n_markers
-    ):
-        raise ValueError(
-            "--component-spec must assign every source SNP exactly once "
-            "across mutually exclusive components."
-        )
-    return normalized
 
 
 def _load_lasso_warm_state(
@@ -493,192 +470,9 @@ def _write_lasso_warm_state(
 # Sparse marker-coordinate index
 # ---------------------------------------------------------------------------
 
-class MultiGRMIndex:
-    """Map the sparse cache order to component-local and source coordinates.
-
-    A component-partitioned source is physically cached as the concatenation
-    of its components.  Sparse optimization works in that cache order, while
-    BIM/PVAR reporting must use original source-variant rows.  This class is
-    the single authority for translating between the two coordinate systems.
-    """
-
-    def __init__(self, streamers, component_variant_indices=None):
-        self.streamers = tuple(streamers)
-        if len(self.streamers) != 1:
-            raise ValueError(
-                "Sparse fitting accepts exactly one physical genotype source."
-            )
-        self.streamer = self.streamers[0]
-        self._partitioned_single_streamer = component_variant_indices is not None
-        self._source_variant_indices: np.ndarray | None = None
-
-        if self._partitioned_single_streamer:
-            streamer = self.streamer
-            if not bool(getattr(streamer, "has_component_partition", False)):
-                raise ValueError(
-                    "component_variant_indices were supplied, but the genotype "
-                    "streamer is not component-partitioned."
-                )
-            requested_groups = [
-                np.asarray(group, dtype=np.int64).reshape(-1)
-                for group in component_variant_indices
-            ]
-            self.n_grm = int(streamer.n_components)
-            component_offsets = np.asarray(
-                streamer._component_snp_offsets, dtype=np.int64
-            ).reshape(-1)
-            if component_offsets.shape != (self.n_grm + 1,):
-                raise ValueError("Invalid component offsets in partitioned streamer.")
-            self.m_per_grm = np.diff(component_offsets)
-            cache_to_source = np.asarray(
-                streamer._cache_to_source_variant_indices, dtype=np.int64
-            ).reshape(-1)
-            if cache_to_source.size != int(streamer.m):
-                raise ValueError(
-                    "Partitioned streamer's cache-to-source SNP map has the "
-                    "wrong length."
-                )
-            if not np.array_equal(
-                np.sort(cache_to_source),
-                np.arange(int(streamer.m), dtype=np.int64),
-            ):
-                raise ValueError(
-                    "Sparse component partitions must cover every source SNP "
-                    "exactly once."
-                )
-            if len(requested_groups) != self.n_grm:
-                raise ValueError(
-                    "Component count mismatch between component spec and "
-                    "genotype streamer."
-                )
-            for component_idx, requested in enumerate(requested_groups):
-                start = int(component_offsets[component_idx])
-                stop = int(component_offsets[component_idx + 1])
-                actual = cache_to_source[start:stop]
-                if not np.array_equal(actual, np.unique(requested)):
-                    raise ValueError(
-                        "Component SNP mapping mismatch between component spec "
-                        f"and genotype streamer for component {component_idx}."
-                    )
-            self._source_variant_indices = cache_to_source.copy()
-        else:
-            self.n_grm = 1
-            self.m_per_grm = np.asarray([int(self.streamer.m)], dtype=np.int64)
-
-        self.offsets = np.zeros(self.n_grm + 1, dtype=np.int64)
-        np.cumsum(self.m_per_grm, out=self.offsets[1:])
-        self.m_total = int(self.offsets[-1])
-
-    def _validated_global_indices(self, global_idx: np.ndarray) -> np.ndarray:
-        idx = np.asarray(global_idx, dtype=np.int64)
-        if idx.ndim != 1:
-            raise ValueError("Global SNP indices must be one-dimensional.")
-        if np.any((idx < 0) | (idx >= self.m_total)):
-            raise IndexError(
-                f"Global SNP indices must lie in [0, {self.m_total})."
-            )
-        return idx
-
-    def global_to_local(
-        self, global_idx: np.ndarray
-    ) -> list[tuple[int, np.ndarray, np.ndarray]]:
-        idx = self._validated_global_indices(global_idx)
-        grm_ids = np.searchsorted(self.offsets[1:], idx, side="right")
-        grm_ids = np.clip(grm_ids, 0, self.n_grm - 1)
-        groups: list[tuple[int, np.ndarray, np.ndarray]] = []
-        for grm_idx in range(self.n_grm):
-            positions = np.flatnonzero(grm_ids == grm_idx)
-            if positions.size == 0:
-                continue
-            local = idx[positions] - int(self.offsets[grm_idx])
-            groups.append((grm_idx, local, positions))
-        return groups
-
-    def xtv_all(self, u_jax: jnp.ndarray, normalize: bool = False, *, dtype=np.float64) -> np.ndarray:
-        return np.asarray(
-            self.streamer.xtv(u_jax, normalize=normalize),
-            dtype=dtype,
-        )
-
-    def extract_standardized_columns(
-        self, global_idx: np.ndarray
-    ) -> np.ndarray:
-        idx = self._validated_global_indices(global_idx)
-        return self.streamer.extract_standardized_columns(idx)
-
-    def source_variant_indices(self, global_idx: np.ndarray) -> np.ndarray:
-        idx = self._validated_global_indices(global_idx)
-        if self._source_variant_indices is None:
-            return idx.copy()
-        return self._source_variant_indices[idx].copy()
-
-    def cache_variant_indices(self, source_idx: np.ndarray) -> np.ndarray:
-        """Translate original source rows to the current concatenated cache."""
-        source = np.asarray(source_idx, dtype=np.int64).reshape(-1)
-        if self._source_variant_indices is None:
-            return self._validated_global_indices(source).copy()
-        if np.any((source < 0) | (source >= self.m_total)):
-            raise IndexError(
-                f"Source SNP indices must lie in [0, {self.m_total})."
-            )
-        source_to_cache = np.empty(self.m_total, dtype=np.int64)
-        source_to_cache[self._source_variant_indices] = np.arange(
-            self.m_total, dtype=np.int64
-        )
-        return source_to_cache[source]
-
-    def lookup_bim_rows(
-        self, bed_prefixes: list[str], global_idx: np.ndarray
-    ) -> dict[int, tuple[str, str, str, str, str, str]]:
-        idx = self._validated_global_indices(global_idx)
-        result: dict[int, tuple[str, str, str, str, str, str]] = {}
-        source_idx = self.source_variant_indices(idx)
-        source_rows = _lookup_bim_rows(bed_prefixes[0] + ".bim", source_idx)
-        for global_snp, source_snp in zip(idx.tolist(), source_idx.tolist()):
-            if int(source_snp) in source_rows:
-                result[int(global_snp)] = source_rows[int(source_snp)]
-        return result
 
 
-class SingleGRMIndex(MultiGRMIndex):
-    """Compatibility wrapper for callers that explicitly require K=1."""
 
-    def __init__(self, streamers):
-        if len(streamers) != 1:
-            raise ValueError(
-                "The sparse pipeline supports exactly one whole-genome GRM."
-            )
-        streamer = streamers[0]
-        if bool(getattr(streamer, "has_component_partition", False)) or int(
-            getattr(streamer, "n_components", 1)
-        ) != 1:
-            raise ValueError(
-                "The single-GRM index does not accept component partitions."
-            )
-        super().__init__(streamers)
-
-    def lookup_bim_rows(
-        self, bed_prefix: str, marker_idx: np.ndarray
-    ) -> dict[int, tuple[str, str, str, str, str, str]]:
-        return super().lookup_bim_rows([bed_prefix], marker_idx)
-
-def _lookup_bim_rows(bim_path: str, snp_indices: np.ndarray) -> dict[int, tuple[str, str, str, str, str, str]]:
-    idx = np.asarray(snp_indices, dtype=np.int64)
-    if idx.size == 0:
-        return {}
-    need = set(int(i) for i in idx.tolist())
-    rows: dict[int, tuple[str, str, str, str, str, str]] = {}
-    with open(bim_path, "r") as f:
-        for i, line in enumerate(f):
-            if i not in need:
-                continue
-            parts = line.strip().split()
-            if len(parts) < 6:
-                continue
-            rows[i] = (parts[0], parts[1], parts[2], parts[3], parts[4], parts[5])
-            if len(rows) == len(need):
-                break
-    return rows
 
 
 def _lookup_pvar_rows(
@@ -1334,56 +1128,6 @@ def _alignment_action(
     return "outer_max" if outer >= outer_max else "continue"
 
 
-def _accepted_reml_theta(
-    fit_result,
-    *,
-    expected_components: int,
-    stage: str,
-) -> tuple[np.ndarray, str]:
-    """Return a valid, converged REML state.
-
-    ``fit_reml`` returns the last accepted parameter vector when all
-    line-search candidates are downhill. ``ll_down`` is an accepted terminal
-    state: its rejected trial is discarded, but earlier accepted updates in
-    the same covariance block are retained.
-    """
-    theta = np.asarray(fit_result.var_components, dtype=np.float64).reshape(-1)
-    history = list(fit_result.history)
-    stop_reason = (
-        str(history[-1].get("stop_reason", "")) if history else ""
-    )
-    valid_theta = (
-        theta.shape == (int(expected_components),)
-        and np.all(np.isfinite(theta))
-        and np.all(theta[:-1] >= 0.0)
-        and theta[-1] > 0.0
-    )
-    last_history = history[-1] if history else {}
-    candidate_accepted = bool(last_history.get("accepted", False))
-    converged = bool(last_history.get("converged", False))
-    usable_history = bool(
-        history
-        and converged
-        and (
-            (
-                stop_reason in {"rel_dll", "scoring_step"}
-                and candidate_accepted
-            )
-            or (stop_reason == "ll_down" and not candidate_accepted)
-        )
-    )
-    if not valid_theta or not usable_history:
-        raise RuntimeError(
-            f"{stage} did not return a usable REML state: "
-            f"theta={theta.tolist()}, history_rows={len(history)}, "
-            f"stop_reason={stop_reason!r}, "
-            f"last_accepted="
-            f"{bool(history[-1].get('accepted', False)) if history else False}, "
-            f"converged={converged}, "
-            f"dll_true={last_history.get('dll_true')}, "
-            f"max_rel_dp={last_history.get('max_rel_dp')}."
-        )
-    return theta, stop_reason
 
 
 def _fit_covariate_contrast_residual_reml(
@@ -1453,16 +1197,6 @@ def _require_pcg_converged(
     return rel
 
 
-def _true_pcg_relative_residual(hv, rhs, solution) -> float:
-    """Recompute ``||B-HX||/||B||`` instead of trusting PCG recurrence state."""
-    rhs_arr = jnp.asarray(rhs)
-    solution_arr = jnp.asarray(solution)
-    true_residual = rhs_arr - hv(solution_arr)
-    denominator = jnp.linalg.norm(rhs_arr, axis=0) + 1e-12
-    relative = jnp.max(
-        jnp.linalg.norm(true_residual, axis=0) / denominator
-    )
-    return float(np.asarray(jax.device_get(relative)))
 
 
 def _solve_hinv_columns_batched(
@@ -1540,14 +1274,9 @@ def _solve_hinv_columns_batched(
             maxiter=int(maxiter),
             stage=f"{stage} columns {start}:{stop}",
         )
-        true_residual = _true_pcg_relative_residual(
-            hv, rhs_batch, solution
-        )
-        if not np.isfinite(true_residual):
-            raise RuntimeError(
-                f"{stage} columns {start}:{stop} produced a non-finite "
-                "true residual."
-            )
+        # pcg_solve returns the verified B - H(solution) residual, including
+        # for a converged warm start. Reuse it instead of streaming H twice.
+        true_residual = reported
         solution_np[:, start:stop] = np.asarray(
             jax.device_get(solution), dtype=np.float32
         )
@@ -1611,23 +1340,6 @@ def _standardize_phenotype_at_input(
     )
 
 
-def _sparse_dense_h2(
-    q_sparse: float,
-    background_genetic_variance: float,
-    residual_variance: float,
-) -> float:
-    """Combine sparse, dense-background, and residual variance on one scale."""
-    genetic = float(q_sparse) + float(background_genetic_variance)
-    residual = float(residual_variance)
-    denominator = genetic + residual
-    if (
-        not np.isfinite(genetic)
-        or not np.isfinite(residual)
-        or not np.isfinite(denominator)
-        or denominator <= 0.0
-    ):
-        return float("nan")
-    return genetic / denominator
 
 
 def _outer_coherit_h2_from_fitted_sparse_mean(
@@ -1900,44 +1612,6 @@ def _evaluate_lasso_path_on_validation(
     }
 
 
-def _select_lasso_by_validation_prediction(
-    *,
-    args,
-    fitter,
-    prediction_context: _PredictionFitContext,
-    y_train: np.ndarray,
-    train_covar: np.ndarray | None,
-    train_candidate: np.ndarray,
-    candidate: np.ndarray,
-    lasso_path: dict,
-    theta: np.ndarray,
-    validation_outcome: np.ndarray,
-) -> tuple[dict, dict]:
-    """Evaluate the complete path and return the validation-selected alpha."""
-    evaluated = _evaluate_lasso_path_on_validation(
-        args=args,
-        fitter=fitter,
-        prediction_context=prediction_context,
-        y_train=y_train,
-        train_covar=train_covar,
-        train_candidate=train_candidate,
-        candidate=candidate,
-        beta_cov_path=lasso_path["beta_cov_path"],
-        beta_snp_path=lasso_path["beta_snp_path"],
-        theta=theta,
-        validation_outcome=validation_outcome,
-    )
-    metrics = list(evaluated["metrics"])
-    selected_index = _select_converged_validation_path_index(
-        list(lasso_path["path"]), metrics
-    )
-    return _materialize_validation_selected_lasso(
-        lasso_path,
-        metrics,
-        selected_index=selected_index,
-        path_prediction_pcg_res=float(evaluated["pcg_rel_res"]),
-        path_prediction_pcg_iters=int(evaluated["pcg_iters"]),
-    )
 
 
 def _write_iterative_validation_output(
@@ -3416,25 +3090,6 @@ def _kkt_expansion_budget(n_violators: int, nominal_budget: int) -> int:
     return nominal
 
 
-def _complete_path_kkt_expansion_budget(
-    n_violators: int,
-    nominal_budget: int,
-    current_candidate_size: int,
-) -> int:
-    """Grow a complete-path working set geometrically when violations abound.
-
-    A low-lambda path point can initially violate KKT at hundreds of thousands
-    of markers.  Reusing the whole coefficient path makes a moderately larger
-    expansion cheap relative to repeating PCG and Gram construction in fixed
-    256-column increments.  The increment grows with the working set but is
-    capped at 1024 so scores are refreshed before admitting another block.
-    """
-    count = int(n_violators)
-    current = int(current_candidate_size)
-    if current < 1:
-        raise ValueError("Complete-path candidate size must be positive.")
-    nominal = _kkt_expansion_budget(count, int(nominal_budget))
-    return min(count, max(nominal, min(current, 1024)))
 
 
 def _parse_variance_components_init(
@@ -3768,6 +3423,7 @@ def main() -> None:
         n_covar=n_covar,
         n_rand_vec=args.n_rand_vec,
         slq_samples=args.slq_samples,
+        slq_m=args.slq_m,
         gpu_name=gpu_name,
         ring_depth=args.ring_depth if args.ring_depth > 0 else None,
         source_format=(
@@ -4644,9 +4300,6 @@ def main() -> None:
 
             lasso_path_started = time.perf_counter()
             lasso_path_solve_seconds = float("nan")
-            validation_selection_seconds = 0.0
-            path_global_kkt = None
-            path_global_kkt_seconds = 0.0
             try:
                 try:
                     lasso = fit_weighted_lasso_with_covariates(
@@ -4700,319 +4353,6 @@ def main() -> None:
                 warm_lasso_beta_path = np.asarray(
                     lasso["beta_snp_path"], dtype=np.float64
                 ).copy()
-                if iterative_validation_selection:
-                    if prediction_context is None or validation_outcome is None:
-                        raise RuntimeError(
-                            "Iterative validation selection context is unavailable."
-                        )
-                    # Validation may compare path points only after every one
-                    # is a full-genome Lasso solution.  Recombine the PCG
-                    # solves already used by the candidate Gram objective,
-                    # then obtain all-marker scores for every lambda in one
-                    # streamed X'V pass.  No per-lambda PCG loop is needed.
-                    path_kkt_started = time.perf_counter()
-                    hinv_residual_path = _build_hinv_lasso_residual_path(
-                        hinv_y=Hinv_y_for_path,
-                        hinv_covar=Hinv_covar_for_path,
-                        hinv_geno=sol_z_np,
-                        beta_cov_path=lasso["beta_cov_path"],
-                        beta_snp_path=lasso["beta_snp_path"],
-                    )
-                    path_score_signed = np.asarray(
-                        grm_index.xtv_all(
-                            jnp.asarray(
-                                hinv_residual_path, dtype=jnp.float32
-                            ),
-                            normalize=False,
-                        ),
-                        dtype=np.float64,
-                    )
-                    path_global_kkt = (
-                        _certify_complete_lasso_path_kkt_from_scores(
-                            score_path=path_score_signed,
-                            candidate=candidate,
-                            beta_candidate_path=lasso["beta_snp_path"],
-                            path_rows=list(lasso["path"]),
-                            abs_tol=float(args.kkt_tol),
-                            rel_tol=float(args.kkt_rel_tol),
-                        )
-                    )
-                    lasso["path"] = list(path_global_kkt["path_rows"])
-                    path_global_kkt_seconds = float(
-                        time.perf_counter() - path_kkt_started
-                    )
-                    sparse_path_performance[
-                        "lasso_path_global_kkt_passes"
-                    ] += 1
-                    sparse_path_performance[
-                        "lasso_path_global_kkt_seconds"
-                    ] += path_global_kkt_seconds
-                    sparse_path_performance[
-                        "lasso_path_global_kkt_points_checked"
-                    ] += int(path_global_kkt["n_path_points"])
-
-                    path_violators = np.asarray(
-                        path_global_kkt["outside_violators"],
-                        dtype=np.int64,
-                    )
-                    if path_violators.size > 0:
-                        n_path_viol = int(path_violators.size)
-                        expansion_budget = (
-                            _complete_path_kkt_expansion_budget(
-                                n_path_viol,
-                                int(args.kkt_add_topk),
-                                int(candidate.size),
-                            )
-                        )
-                        max_candidate = int(args.kkt_max_candidate)
-                        candidate_limit_error = None
-                        if max_candidate > 0:
-                            available = max_candidate - int(candidate.size)
-                            strict_required = min(
-                                expansion_budget, n_path_viol
-                            )
-                            if available < strict_required:
-                                candidate_limit_error = (
-                                    "Complete-path KKT refinement cannot add "
-                                    "the required union of strict violators "
-                                    "without exceeding --kkt-max-candidate "
-                                    f"({candidate.size} + {strict_required} "
-                                    f"> {max_candidate})."
-                                )
-                            else:
-                                expansion_budget = min(
-                                    expansion_budget, available
-                                )
-                        expansion = {
-                            "add_indices": np.empty(
-                                (0,), dtype=np.int64
-                            ),
-                            "n_strict_added": 0,
-                            "n_buffered_added": 0,
-                        }
-                        if candidate_limit_error is None:
-                            expansion = _buffered_kkt_expansion_indices(
-                                score_abs=np.asarray(
-                                    path_global_kkt["priority_score"],
-                                    dtype=np.float64,
-                                ),
-                                candidate=candidate,
-                                violators=path_violators,
-                                max_add=expansion_budget,
-                            )
-                        action = (
-                            "candidate_limit_reached"
-                            if candidate_limit_error is not None
-                            else "expand_candidate"
-                        )
-                        kkt_trace.append(
-                            {
-                                "round": int(kkt_round),
-                                "candidate_size": int(candidate.size),
-                                "support_size": int(
-                                    max(
-                                        int(row["k"])
-                                        for row in lasso["path"]
-                                    )
-                                ),
-                                "lambda": None,
-                                "lambda_ratio": None,
-                                "selection_method": (
-                                    "pending_complete_path_global_kkt"
-                                ),
-                                "validation_predictive_r2": None,
-                                "n_violators": n_path_viol,
-                                "n_expansion_strict_added": int(
-                                    expansion["n_strict_added"]
-                                ),
-                                "n_expansion_buffered_added": int(
-                                    expansion["n_buffered_added"]
-                                ),
-                                "lasso_path_warm_start_columns": int(
-                                    warm_lasso_columns
-                                ),
-                                "lasso_path_warm_start_used": bool(
-                                    lasso[
-                                        "external_beta_path_warm_start_used"
-                                    ]
-                                ),
-                                "lasso_path_warm_start_rows_used": int(
-                                    lasso[
-                                        "external_beta_path_warm_start_rows_used"
-                                    ]
-                                ),
-                                "lasso_path_solve_seconds": (
-                                    lasso_path_solve_seconds
-                                ),
-                                "path_global_kkt_seconds": (
-                                    path_global_kkt_seconds
-                                ),
-                                "validation_selection_seconds": 0.0,
-                                "decision": action,
-                                "path_pcg_tol": path_pcg_tol,
-                                "candidate_pcg_reported_res": float(
-                                    np.asarray(res_all)
-                                ),
-                                "candidate_pcg_true_res": float(
-                                    candidate_true_res
-                                ),
-                                "candidate_pcg_iters": int(it_all),
-                                "candidate_pcg": dict(candidate_pcg),
-                                "complete_path_global_kkt": {
-                                    "passed": False,
-                                    "n_path_points": int(
-                                        path_global_kkt["n_path_points"]
-                                    ),
-                                    "n_violating_path_points": int(
-                                        path_global_kkt[
-                                            "n_violating_path_points"
-                                        ]
-                                    ),
-                                    "n_union_violators": n_path_viol,
-                                    "max_outside_excess_over_threshold": (
-                                        float(
-                                            path_global_kkt[
-                                                "max_outside_excess_over_threshold"
-                                            ]
-                                        )
-                                    ),
-                                    "score_backend": str(
-                                        path_global_kkt["score_backend"]
-                                    ),
-                                },
-                            }
-                        )
-                        logger.info(
-                            "[outer %s kkt %s path] cand=%s lambdas=%s "
-                            "violating_lambdas=%s union_violators=%s "
-                            "add=%s buffer=%s warm_cols=%s path_sec=%.1f "
-                            "global_kkt_sec=%.1f decision=%s",
-                            outer,
-                            kkt_round,
-                            int(candidate.size),
-                            int(path_global_kkt["n_path_points"]),
-                            int(
-                                path_global_kkt[
-                                    "n_violating_path_points"
-                                ]
-                            ),
-                            n_path_viol,
-                            int(expansion["n_strict_added"]),
-                            int(expansion["n_buffered_added"]),
-                            int(warm_lasso_columns),
-                            lasso_path_solve_seconds,
-                            path_global_kkt_seconds,
-                            action,
-                        )
-                        if candidate_limit_error is not None:
-                            penalized_block_failure = (
-                                candidate_limit_error
-                            )
-                            break
-                        add_idx = np.asarray(
-                            expansion["add_indices"], dtype=np.int64
-                        )
-                        if add_idx.size == 0:
-                            penalized_block_failure = (
-                                "Complete-path KKT refinement produced an "
-                                "empty expansion despite "
-                                f"{n_path_viol} union violators."
-                            )
-                            break
-                        sparse_path_performance[
-                            "kkt_strict_violators_added"
-                        ] += int(expansion["n_strict_added"])
-                        sparse_path_performance[
-                            "kkt_buffered_markers_added"
-                        ] += int(expansion["n_buffered_added"])
-                        candidate = np.unique(
-                            np.concatenate([candidate, add_idx])
-                        ).astype(np.int64)
-                        candidate.sort()
-                        if (
-                            max_candidate > 0
-                            and candidate.size > max_candidate
-                        ):
-                            penalized_block_failure = (
-                                "Complete-path KKT refinement exceeded "
-                                "--kkt-max-candidate "
-                                f"({candidate.size} > {max_candidate})."
-                            )
-                            break
-                        # The next round remaps this complete alpha path onto
-                        # the expanded basis and uses it as a same-lambda warm
-                        # start.  Validation is intentionally deferred until
-                        # every path point passes the all-marker certificate.
-                        continue
-
-                    validation_started = time.perf_counter()
-                    lasso, validation_record = (
-                        _select_lasso_by_validation_prediction(
-                            args=args,
-                            fitter=fitter,
-                            prediction_context=prediction_context,
-                            y_train=y_np,
-                            train_covar=covar_np,
-                            train_candidate=Z_cand,
-                            candidate=candidate,
-                            lasso_path=lasso,
-                            theta=theta,
-                            validation_outcome=validation_outcome,
-                        )
-                    )
-                    validation_selection_seconds = float(
-                        time.perf_counter() - validation_started
-                    )
-                    sparse_path_performance[
-                        "lasso_validation_selection_seconds"
-                    ] += validation_selection_seconds
-                    trace_record = {
-                        "outer": int(outer),
-                        "stage": (
-                            "final_covariance_lasso"
-                            if final_alignment
-                            else "outer_update"
-                        ),
-                        "final_alignment": bool(final_alignment),
-                        "kkt_round": int(kkt_round),
-                        "candidate_size": int(candidate.size),
-                        "lasso_path_warm_start_columns": int(
-                            warm_lasso_columns
-                        ),
-                        "lasso_path_warm_start_used": bool(
-                            lasso[
-                                "external_beta_path_warm_start_used"
-                            ]
-                        ),
-                        "lasso_path_warm_start_rows_used": int(
-                            lasso[
-                                "external_beta_path_warm_start_rows_used"
-                            ]
-                        ),
-                        "lasso_path_solve_seconds": lasso_path_solve_seconds,
-                        "validation_selection_seconds": (
-                            validation_selection_seconds
-                        ),
-                        "theta": np.asarray(
-                            theta, dtype=np.float64
-                        ).tolist(),
-                        **validation_record,
-                    }
-                    iterative_validation_trace.append(trace_record)
-                    logger.info(
-                        "[outer %s kkt %s validation alpha] cand=%s "
-                        "ratio=%.6g active=%s validation_predictive_R2=%.8f",
-                        outer,
-                        kkt_round,
-                        int(candidate.size),
-                        float(lasso["selected_lam_ratio"]),
-                        int(np.asarray(lasso["active_idx"]).size),
-                        float(
-                            validation_record["selected"][
-                                "predictive_r2"
-                            ]
-                        ),
-                    )
             except (
                 FloatingPointError,
                 RuntimeError,
@@ -5034,10 +4374,6 @@ def main() -> None:
             if not (
                 bool(best_path.get("converged", False))
                 and bool(best_path.get("kkt_passed", False))
-                and (
-                    not iterative_validation_selection
-                    or bool(best_path.get("global_kkt_passed", False))
-                )
             ):
                 penalized_block_failure = (
                     "Selected LASSO solution did not receive complete "
@@ -5074,14 +4410,7 @@ def main() -> None:
                     tol=path_pcg_tol,
                     maxiter=args.max_pcg_iters,
                 )
-                true_res_kkt = _true_pcg_relative_residual(
-                    hv, residual_rhs, sol_resid
-                )
-                if not np.isfinite(true_res_kkt):
-                    raise RuntimeError(
-                        "KKT score PCG produced a non-finite true residual."
-                    )
-                _require_pcg_converged(
+                true_res_kkt = _require_pcg_converged(
                     res_kkt,
                     tol=path_pcg_tol,
                     iters=it_kkt,
@@ -5177,11 +4506,7 @@ def main() -> None:
                 "max_inactive_excess": max(
                     internal_inactive_excess, outside_inactive_excess
                 ),
-                "method": (
-                    "complete_path_batched_global_kkt_plus_selected_direct_score"
-                    if iterative_validation_selection
-                    else "candidate_gram_plus_outside_marker_score"
-                ),
+                "method": "candidate_gram_plus_outside_marker_score",
                 "decision_precision": "ordinary_pcg",
                 "pcg_tol": path_pcg_tol,
                 "pcg_reported_res": float(np.asarray(res_kkt)),
@@ -5190,16 +4515,6 @@ def main() -> None:
                 "max_outside_score": max_outside_score,
                 "n_outside_violators": n_viol,
                 "candidate_path_kkt_passed": internal_kkt_passed,
-                "complete_path_global_kkt_passed": (
-                    bool(path_global_kkt["passed"])
-                    if path_global_kkt is not None
-                    else None
-                ),
-                "complete_path_global_kkt_points": (
-                    int(path_global_kkt["n_path_points"])
-                    if path_global_kkt is not None
-                    else None
-                ),
                 # This independent score is diagnostic only: finite-PCG
                 # differences on candidate coordinates do not reject an
                 # otherwise solved Lasso block.
@@ -5215,15 +4530,6 @@ def main() -> None:
                     "lambda": float(lasso["lam"]),
                     "lambda_ratio": float(lasso["selected_lam_ratio"]),
                     "selection_method": str(lasso["selection_method"]),
-                    "validation_predictive_r2": (
-                        float(
-                            lasso["validation_selection"]["selected"][
-                                "predictive_r2"
-                            ]
-                        )
-                        if lasso.get("validation_selection") is not None
-                        else None
-                    ),
                     "threshold": float(kkt_threshold),
                     "max_outside_score": max_outside_score,
                     "n_violators": n_viol,
@@ -5245,50 +4551,19 @@ def main() -> None:
                         ]
                     ),
                     "lasso_path_solve_seconds": lasso_path_solve_seconds,
-                    "path_global_kkt_seconds": path_global_kkt_seconds,
-                    "validation_selection_seconds": (
-                        validation_selection_seconds
-                    ),
                     "decision": action,
                     "path_pcg_tol": path_pcg_tol,
                     "candidate_pcg_reported_res": float(np.asarray(res_all)),
                     "candidate_pcg_true_res": float(candidate_true_res),
                     "candidate_pcg_iters": int(it_all),
                     "candidate_pcg": dict(candidate_pcg),
-                    "complete_path_global_kkt": (
-                        {
-                            "passed": bool(path_global_kkt["passed"]),
-                            "n_path_points": int(
-                                path_global_kkt["n_path_points"]
-                            ),
-                            "n_violating_path_points": int(
-                                path_global_kkt[
-                                    "n_violating_path_points"
-                                ]
-                            ),
-                            "n_union_violators": int(
-                                path_global_kkt["n_union_violators"]
-                            ),
-                            "max_outside_excess_over_threshold": float(
-                                path_global_kkt[
-                                    "max_outside_excess_over_threshold"
-                                ]
-                            ),
-                            "score_backend": str(
-                                path_global_kkt["score_backend"]
-                            ),
-                        }
-                        if path_global_kkt is not None
-                        else None
-                    ),
                     "kkt": dict(current_record),
                 }
             )
             logger.info(
                 "[outer %s kkt %s] cand=%s active=%s lam=%.3e "
                 "max_outside=%.3e threshold=%.3e violators=%s "
-                "add=%s buffer=%s warm_cols=%s path_sec=%.1f "
-                "validation_sec=%.1f decision=%s",
+                "add=%s buffer=%s warm_cols=%s path_sec=%.1f decision=%s",
                 outer,
                 kkt_round,
                 int(candidate.size),
@@ -5301,7 +4576,6 @@ def main() -> None:
                 int(expansion["n_buffered_added"]),
                 int(warm_lasso_columns),
                 lasso_path_solve_seconds,
-                validation_selection_seconds,
                 action,
             )
 
@@ -5822,6 +5096,9 @@ def main() -> None:
     out_dir = os.path.dirname(out_prefix)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
+    # A new emission must not leave an older completion marker visible while
+    # its artifacts are being replaced.
+    cleanup_path(out_prefix + ".summary.json")
 
     unavailable = float("nan")
     background_genetic_variance = _background_genetic_variance(theta_lasso_ml)
@@ -6398,20 +5675,7 @@ def main() -> None:
     if lasso_warm_state_out_summary is not None:
         summary["lasso_warm_state_out"] = lasso_warm_state_out_summary
 
-    with open(out_prefix + ".summary.json", "w") as f:
-        json.dump(
-            _json_safe_value(summary),
-            f,
-            indent=2,
-            allow_nan=False,
-        )
-    with open(out_prefix + ".history.json", "w") as f:
-        json.dump(
-            _json_safe_value(history),
-            f,
-            indent=2,
-            allow_nan=False,
-        )
+    atomic_json(out_prefix + ".history.json", _json_safe_value(history))
 
     beta_map: dict[int, float] = {}
     if final_lasso is not None and final_candidate.size > 0:
@@ -6458,6 +5722,17 @@ def main() -> None:
                 f"{snp_id}\t{cm}\t{bp}\t{a1}\t{a2}\t{beta_val:.8e}"
             )
             f.write(row + "\n")
+
+    # Summary is the completion marker: publish it only after every requested
+    # artifact is closed, including selected SNPs and reusable sparse state.
+    artifacts = [out_prefix + ".history.json", out_prefix + ".selected_snps.tsv"]
+    if args.lasso_warm_state_out:
+        artifacts.append(args.lasso_warm_state_out)
+    artifacts.extend(sparse_effect_summary.get("paths", {}).values())
+    artifacts.extend(prediction_summary.get("paths", {}).values())
+    artifacts.extend(sparsity_validation_summary.get("outputs", {}).values())
+    summary["output_artifacts"] = output_manifest(artifacts)
+    atomic_json(out_prefix + ".summary.json", _json_safe_value(summary))
 
     logger.info("[INFO] done @ %s elapsed=%.1fs", datetime.now().isoformat(timespec='seconds'), time.time() - t0)
     logger.info("[INFO] summary -> %s.summary.json", out_prefix)

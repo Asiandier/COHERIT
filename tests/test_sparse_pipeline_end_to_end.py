@@ -106,6 +106,12 @@ def test_sparse_pipeline_automatic_fit_effects_prediction(tmp_path, mode):
     assert final["n_samples"] == 400
     assert final["lasso_branch_valid"]
     assert final["sparse_prediction"]["status"] == "emitted"
+    # Summary is published last and describes the complete output set.
+    for name, size in final["output_artifacts"].items():
+        assert Path(name).is_file()
+        assert Path(name).stat().st_size == size > 0
+    for suffix in (".history.json", ".selected_snps.tsv", ".sparse_effects.tsv", ".sparse_prediction.tsv"):
+        assert str(output.with_suffix(suffix)) in final["output_artifacts"]
     assert output.with_suffix(".sparse_effects.tsv").is_file()
     assert len(output.with_suffix(".sparse_prediction.tsv").read_text().splitlines()) == 81
     if mode in {"fixed_multi", "missing_multi"}:

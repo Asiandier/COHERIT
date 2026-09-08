@@ -18,6 +18,7 @@ from .geno_stream import BedBlockStreamer, GenoBlockStreamer, _ensure_on_device
 from .pipeline_common import fam_order_mismatch as _fam_order_mismatch
 from .pipeline_common import resolve_cpu_threads as _resolve_cpu_threads
 from .pcg import pcg_solve
+from .slq import default_workspace_bytes
 from .precond import (
     ProjectedCorePrecondConf,
     build_lowrank_basis,
@@ -1907,10 +1908,7 @@ class InfinitesimalREMLFitter:
                 slq_samples=self.cfg.slq_samples,
                 slq_m=self.cfg.slq_m,
                 slq_mode=self.cfg.slq_mode,
-                slq_workspace_bytes=(
-                    min(2 * 1024**3, max(1, int(self.cfg.gpu_budget_bytes / 8)))
-                    if self.cfg.gpu_budget_bytes is not None else 256 * 1024**2
-                ),
+                slq_workspace_bytes=default_workspace_bytes(self.cfg.gpu_budget_bytes),
                 precond_conf=self.precond_conf,
                 slq_precond_conf=self.precond_conf,
                 precond_refresh_fn=self._make_pcg_precond_refresh_fn(ops),

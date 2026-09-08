@@ -33,11 +33,12 @@ import time
 import numpy as np
 import jax
 import jax.numpy as jnp
-from numba import get_num_threads, njit, prange, set_num_threads
+from numba import config as numba_config, get_num_threads, njit, prange, set_num_threads
 
 logger = logging.getLogger(__name__)
 
 from .block_backend import DensePackedBlockDescriptor
+from .runtime_env import resolve_cpu_threads
 
 
 def _resolve_tmpdir() -> str | None:
@@ -1089,7 +1090,7 @@ def _unpack_selected_u2_columns_numba(
 @contextlib.contextmanager
 def _numba_thread_mask(n_threads: int):
     prev = get_num_threads()
-    n_use = max(1, int(n_threads))
+    n_use = min(max(1, int(n_threads)), int(numba_config.NUMBA_NUM_THREADS))
     if n_use != prev:
         set_num_threads(n_use)
     try:
@@ -1251,7 +1252,8 @@ class GenoBlockStreamer:
             raise ValueError("Genotype source must contain at least one variant.")
 
         self._bed_int_missing = source.missing_val
-        self._build_threads = max(1, int(build_threads or (os.cpu_count() or 1)))
+        requested_threads, _ = resolve_cpu_threads(build_threads or None)
+        self._build_threads = min(requested_threads, int(numba_config.NUMBA_NUM_THREADS))
         self._source_build_chunk_width_cfg = (
             max(1, int(source_build_chunk_width))
             if source_build_chunk_width is not None and int(source_build_chunk_width) > 0
