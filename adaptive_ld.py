@@ -30,6 +30,7 @@ configure_runtime_env()
 import jax
 import jax.numpy as jnp
 import numpy as np
+import scipy.linalg as sla
 
 # Preserve the sparse workflow's precision without importing its CLI module.
 jax.config.update(
@@ -59,6 +60,7 @@ from .sparse_core import (
     sparse_dense_h2 as _sparse_dense_h2,
     validate_component_partition as _validate_component_partition,
 )
+from .sparse_information import SparseMeanInformation
 from .io_utils import atomic_json, read_json
 from .variant_io import iter_variant_records_for_prefix
 from .score_process import (
@@ -271,6 +273,7 @@ class REMLProjector:
     covar: np.ndarray | None
     pcg_tol: float
     max_pcg_iters: int
+    mean_information: SparseMeanInformation | None = None
 
     def __post_init__(self) -> None:
         theta = np.asarray(self.theta, dtype=np.float64).reshape(-1)
@@ -301,6 +304,20 @@ class REMLProjector:
             self._gram_inverse = np.linalg.pinv(
                 0.5 * (gram + gram.T), rcond=1e-10, hermitian=True
             )
+        self.mean_state = None
+        self._mean_w = np.empty((n_samples, 0), dtype=np.float64)
+        self._reference_null_basis = None
+        if self.mean_information is not None:
+            self.mean_state = self.mean_information.evaluate(
+                self.theta, self._hv, self._preconditioner, self._vinv_c,
+                tol=self.pcg_tol, maxiter=self.max_pcg_iters,
+            )
+            self._mean_w = self.mean_state["w"]
+            if self.mean_information.rank:
+                basis = self.mean_information.basis
+                covar_remainder = self._covar-basis @ (basis.T @ self._covar)
+                covar_basis = sla.qr(covar_remainder, mode="economic", check_finite=False)[0]
+                self._reference_null_basis = np.column_stack([basis, covar_basis])
 
     def _solve(self, rhs: np.ndarray, *, stage: str) -> np.ndarray:
         array = np.asarray(rhs, dtype=np.float32)
@@ -351,6 +368,24 @@ class REMLProjector:
             )
             projected = projected - self._vinv_c @ coefficients.astype(np.float32)
         return projected[:, 0] if squeeze else projected
+
+    def apply_reference(self, rhs: np.ndarray, *, stage: str) -> np.ndarray:
+        """Apply P_S=P-P Sigma_mu P for the local Gaussian reference only.
+
+        The observed offset residual uses apply(), i.e. P r. Replacing it by
+        P_S r would instead test the unpenalized expanded-mean REML model.
+        """
+        array = np.asarray(rhs, dtype=np.float64)
+        null_basis = self._reference_null_basis
+        if null_basis is not None:
+            # P_S annihilates [C,Q_S] on both sides. Enforce this exact identity
+            # so cancellation of P and W W' cannot create spurious core modes.
+            array = array-null_basis @ (null_basis.T @ array)
+        selected_projection = self._mean_w @ (self._mean_w.T @ array)
+        result = np.asarray(self.apply(array, stage=stage), dtype=np.float64) - selected_projection
+        if null_basis is not None:
+            result = result-null_basis @ (null_basis.T @ result)
+        return result
 
 @dataclass
 class BoundaryContractions:
@@ -592,7 +627,7 @@ def _factor_rhs(index, theta, streams):
 
 
 def _build_score_core(projector, index, contractions, rank, rng, workspace):
-    """Build H=PT with T'PT=I from a phenotype-independent root-GRM sketch."""
+    """Build H=P_S T with T'P_S T=I from the root-GRM sketch."""
     n = projector._covar.shape[0]
     rank = min(int(rank), n, index.m_total)
     width = _score_rhs_width(projector, index)
@@ -615,7 +650,7 @@ def _build_score_core(projector, index, contractions, rank, rng, workspace):
     basis = basis[:, singular > 1e-7 * np.max(singular, initial=0.0)]
     projected = workspace.allocate(basis.shape)
     for offset in range(0, basis.shape[1], width):
-        projected[:, offset:offset + width] = projector.apply(
+        projected[:, offset:offset + width] = projector.apply_reference(
             basis[:, offset:offset + width], stage="adaptive_ld_common_core",
         )
     gram = basis.T @ projected
@@ -646,7 +681,7 @@ def _fill_probe_cache(projector, index, h, seed, samples, markers, start, stop, 
         end = min(stop, offset + width)
         streams = [np.random.default_rng(child) for child in seed.spawn(end - offset)]
         rhs = _factor_rhs(index, projector.theta, streams)
-        projected = projector.apply(rhs, stage=stage).astype(np.float64)
+        projected = projector.apply_reference(rhs, stage=stage).astype(np.float64)
         b = projected - h @ (h.T @ rhs)
         samples[offset:end] = b.T
         markers[offset:end] = index.xtv_all(
@@ -673,6 +708,11 @@ def _estimate_score_process(args, projector, grm_index, contractions, response, 
     projected = projector.apply(response[:, None], stage="adaptive_ld_observed")
     marker = np.asarray(grm_index.xtv_all(jnp.asarray(projected), normalize=False))
     quadratics = contractions.apply(projected, projected, marker, marker)[:, 0]
+    # Keep the derivative of the fitted offset objective ell_C unchanged.
+    # The rank-adjusted working reference is v*~N(0,P_S), giving score
+    # covariance tr(P_S D_i P_S D_j)/2. This is not the exact distribution of
+    # an adaptively fitted Lasso residual; no extra shrinkage-centering term
+    # is subtracted from the likelihood score used to propose a split.
     core_seed, pilot_seed, evaluation_seed, reference_seed = np.random.SeedSequence(
         args.score_trace_seed
     ).spawn(4)
@@ -727,6 +767,11 @@ def _estimate_score_process(args, projector, grm_index, contractions, response, 
             pilot_probes=pilot_count,
             nuisance_information_eigenvalues=nuisance_eigenvalues.tolist(),
             reference_seed=int(reference_seed.generate_state(1)[0]),
+            mean_information_rank=(projector.mean_information.rank
+                                   if projector.mean_information is not None else 0),
+            reference_covariance="P_S = P - P Sigma_mu P",
+            reference_mean="zero: rank-adjusted Gaussian working reference",
+            reference_scope="local_selected_space_zero_mean_working_reference_not_post_selection_exact",
         )
         error = max(process.diagnostics["max_score_trace_standard_error"],
                     process.diagnostics["max_information_relative_standard_error"] / 2)
@@ -875,16 +920,16 @@ def build_analysis_context(args: argparse.Namespace) -> AnalysisContext:
 def _load_sparse_mean(
     state_path: str | Path,
     grm_index: MultiGRMIndex,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    covar: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, SparseMeanInformation]:
     with np.load(state_path, allow_pickle=False) as state:
         source_markers = np.asarray(state["marker_indices"], dtype=np.int64)
         beta = np.asarray(state["selected_beta_snp"], dtype=np.float64)
+    active = beta != 0.0
+    source_markers, beta = source_markers[active], beta[active]
     cache_markers = grm_index.cache_variant_indices(source_markers)
-    sparse_mean = (
-        grm_index.extract_standardized_columns(cache_markers).astype(np.float64)
-        @ beta
-    )
-    return source_markers, beta, sparse_mean
+    design = grm_index.extract_standardized_columns(cache_markers).astype(np.float64)
+    return source_markers, beta, design @ beta, SparseMeanInformation(design, covar)
 
 
 def run_score(args: argparse.Namespace) -> None:
@@ -905,8 +950,8 @@ def run_score(args: argparse.Namespace) -> None:
         excluded = candidates[~positive_parent]
         candidates = candidates[positive_parent]
         base = {
-            "schema_version": 3,
-            "method": "joint_quadratic_reml_ld_cusum",
+            "schema_version": 5,
+            "method": "joint_quadratic_information_corrected_ld_cusum",
             "criterion": "global_p_value_le_split_alpha",
             "split_alpha": float(args.split_alpha),
             "current_k": len(context.groups),
@@ -928,12 +973,15 @@ def run_score(args: argparse.Namespace) -> None:
         context.fitter._ensure_projected_core_precond_ready(
             ops, var_components_init=jnp.asarray(theta, dtype=jnp.float32)
         )
+        _markers, _beta, sparse_mean, mean_information = _load_sparse_mean(
+            args.state_path, context.grm_index, context.covar,
+        )
         projector = REMLProjector(
             fitter=context.fitter, ops=ops, theta=theta, covar=context.covar,
             pcg_tol=min(float(args.pcg_tol), 1e-5, float(args.score_trace_tol) / 10),
             max_pcg_iters=int(args.max_pcg_iters),
+            mean_information=mean_information,
         )
-        _markers, _beta, sparse_mean = _load_sparse_mean(args.state_path, context.grm_index)
         # P already profiles C; retain the same frozen sparse mean and response
         # scale as the covariance fit. No simulated phenotype enters this stage.
         response = (context.y.astype(np.float64) - sparse_mean).astype(np.float32)
@@ -970,9 +1018,8 @@ def run_score(args: argparse.Namespace) -> None:
 def run_frozen_fit(args: argparse.Namespace) -> None:
     context = build_analysis_context(args)
     try:
-        parent = read_json(args.parent_summary)
-        _markers, _beta, sparse_mean = _load_sparse_mean(
-            args.state_path, context.grm_index
+        markers, _beta, sparse_mean, mean_information = _load_sparse_mean(
+            args.state_path, context.grm_index, context.covar,
         )
         residual = context.y.astype(np.float64) - sparse_mean
         theta_init = np.asarray(
@@ -984,13 +1031,26 @@ def run_frozen_fit(args: argparse.Namespace) -> None:
             jnp.asarray(residual, dtype=jnp.float32),
             jnp.asarray(context.covar, dtype=jnp.float32),
             var_components_init=jnp.asarray(theta_init, dtype=jnp.float32),
+            mean_information=mean_information,
         )
         theta, covariance_stop_reason = _accepted_reml_theta(
             fit,
             expected_components=len(context.groups) + 1,
             stage="adaptive frozen-alpha covariance refit",
         )
-        q_sparse = float(parent["q_chive"])
+        ops = context.fitter._assemble_reml_operators()
+        theta_device = jnp.asarray(theta, dtype=jnp.float32)
+        hv = context.fitter._make_hv(ops, theta_device[:-1], theta_device[-1])
+        precond = context.fitter._make_effect_precond(ops, theta_device[:-1], theta_device[-1])
+        state, calibrated_residual, gamma = mean_information.statistics(
+            theta, hv, precond, residual,
+            tol=min(float(args.pcg_tol), 1e-5), maxiter=int(args.max_pcg_iters),
+        )
+        n = sparse_mean.size
+        term1 = float(sparse_mean @ sparse_mean / n)
+        term2 = float(2 * sparse_mean @ calibrated_residual / n)
+        uncertainty = float(state["trace"] / n)
+        q_sparse = term1 + term2 - uncertainty
         genetic_trace_atoms = np.asarray(
             jax.device_get(fit.genetic_trace_atoms), dtype=np.float64
         )
@@ -1001,22 +1061,27 @@ def run_frozen_fit(args: argparse.Namespace) -> None:
         )
         history = list(fit.history)
         payload = {
-            "schema_version": 1,
-            "method": "fixed_sparse_mean_covariance_reml",
+            "schema_version": 2,
+            "method": "fixed_sparse_mean_information_corrected_reml",
             "n_grms": len(context.groups),
             "n_snps_total": int(context.grm_index.m_total),
             "component_spec": str(Path(args.component_spec).resolve()),
             "component_sizes": [int(group.size) for group in context.groups],
             "parent_summary": str(Path(args.parent_summary).resolve()),
-            "parent_q_sparse_held_fixed": q_sparse,
             "q_chive": q_sparse,
+            "q_chive_term1": term1,
+            "q_chive_term2": term2,
+            "mean_uncertainty_trace_per_n": uncertainty,
+            "mean_information_rank": mean_information.rank,
+            "mean_information_logdet": float(state["logdet"]),
+            "beta_cov": gamma.tolist(),
             "theta_initial": theta_init.tolist(),
             "theta": theta.tolist(),
             "var_components_lasso_ml": theta.tolist(),
             "grm_variance_scale": "trace_weighted",
             "genetic_trace_atoms": genetic_trace_atoms.tolist(),
             "h2": h2,
-            "support_size": int(parent["support_size"]),
+            "support_size": int(markers.size),
             "restricted_loglik_per_sample": float(fit.final_loglik),
             "stop_reason": covariance_stop_reason,
             "history": history,
@@ -1104,6 +1169,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
+    if args.verbose:
+        logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
     if args.command == "score":
         run_score(args)
     elif args.command == "frozen-fit":

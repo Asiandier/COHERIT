@@ -23,18 +23,56 @@ write_root_component_spec = ADAPTIVE.write_root_component_spec
 write_ld_rank_artifact = LD_SCORE.write_ld_rank_artifact
 
 
-def test_frozen_fit_uses_current_partition_trace_and_keeps_sparse_variance(
+@pytest.mark.parametrize("beta", [np.zeros(4), np.array([.3, 0., -.2, 0.])])
+def test_frozen_state_load_uses_active_source_ids_and_current_design(tmp_path, beta):
+    rng = np.random.default_rng(801)
+    source_ids = np.array([9, 2, 6, 4])
+    design = rng.normal(size=(13, 4))
+    covar = np.column_stack([np.ones(13), rng.normal(size=13)])
+    state = tmp_path / "state.npz"
+    np.savez(state, marker_indices=source_ids, selected_beta_snp=beta)
+    source_to_cache = {9: 2, 2: 0, 6: 3, 4: 1}
+    cached_design = design[:, [1, 3, 0, 2]]
+    index = SimpleNamespace(
+        cache_variant_indices=lambda ids: np.array([source_to_cache[i] for i in ids], dtype=int),
+        extract_standardized_columns=lambda ids: cached_design[:, ids],
+    )
+    markers, loaded_beta, mean, information = ADAPTIVE._load_sparse_mean(state, index, covar)
+    np.testing.assert_array_equal(markers, source_ids[beta != 0])
+    np.testing.assert_array_equal(loaded_beta, beta[beta != 0])
+    np.testing.assert_allclose(mean, design @ beta, atol=1e-12)
+    assert information.rank == np.count_nonzero(beta)
+    if information.rank:
+        q = information.basis
+        np.testing.assert_allclose(q @ q.T @ mean, mean, atol=1e-12)
+    else:
+        assert information.basis.shape == (13, 0)
+
+
+def test_frozen_fit_corrects_covariance_and_recomputes_paired_sparse_variance(
     monkeypatch, tmp_path: Path,
 ) -> None:
+    import jax.numpy as jnp
+
+    rng = np.random.default_rng(118)
+    n = 11
     theta = np.asarray([0.3, 0.2, 0.5])
-    atoms = np.asarray([0.5, 1.5])
-    q = 0.12
-    sparse_mean = np.asarray([0.1, -0.1, 0.0])
+    kernels = []
+    for count in (7, 9):
+        z = rng.normal(size=(n, count))
+        kernels.append(z @ z.T / count)
+    covariance = theta[0]*kernels[0] + theta[1]*kernels[1] + theta[2]*np.eye(n)
+    atoms = np.array([np.trace(k)/n for k in kernels])
+    design = rng.normal(size=(n, 2))
+    covar = np.column_stack([np.ones(n), rng.normal(size=n)])
+    sparse_mean = design @ np.array([.2, -.1])
+    mean_info = ADAPTIVE.SparseMeanInformation(design, covar)
     calls = {}
 
-    def fit_infinitesimal(response, covar, *, var_components_init):
+    def fit_infinitesimal(response, covar, *, var_components_init, mean_information):
         calls["response"] = np.asarray(response)
         calls["theta_init"] = np.asarray(var_components_init)
+        assert mean_information is mean_info
         return SimpleNamespace(
             var_components=theta,
             genetic_trace_atoms=atoms,
@@ -45,15 +83,20 @@ def test_frozen_fit_uses_current_partition_trace_and_keeps_sparse_variance(
     context = SimpleNamespace(
         groups=[np.arange(2), np.arange(2, 6)],
         grm_index=SimpleNamespace(m_total=6),
-        y=np.asarray([0.2, -0.3, 0.1]),
-        covar=np.ones((3, 1)),
-        fitter=SimpleNamespace(fit_infinitesimal=fit_infinitesimal),
+        y=rng.normal(size=n),
+        covar=covar,
+        fitter=SimpleNamespace(
+            fit_infinitesimal=fit_infinitesimal,
+            _assemble_reml_operators=lambda: None,
+            _make_hv=lambda *args: lambda rhs: jnp.asarray(covariance) @ rhs,
+            _make_effect_precond=lambda *args: None,
+        ),
         close=lambda: calls.update(closed=True),
     )
     parent_path = tmp_path / "parent.json"
     # The parent has a different partition: its atom must not be reused.
     parent_path.write_text(json.dumps({
-        "q_chive": q, "support_size": 1, "genetic_trace_atoms": [0.8],
+        "q_chive": 999.0, "support_size": 2, "genetic_trace_atoms": [0.8],
     }))
     args = SimpleNamespace(
         parent_summary=parent_path,
@@ -61,9 +104,12 @@ def test_frozen_fit_uses_current_partition_trace_and_keeps_sparse_variance(
         component_spec=tmp_path / "child.npz",
         theta_init_json=json.dumps(theta.tolist()),
         out=tmp_path / "frozen.json",
+        pcg_tol=1e-6, max_pcg_iters=200,
     )
     monkeypatch.setattr(ADAPTIVE, "build_analysis_context", lambda args: context)
-    monkeypatch.setattr(ADAPTIVE, "_load_sparse_mean", lambda *args: (None, None, sparse_mean))
+    monkeypatch.setattr(ADAPTIVE, "_load_sparse_mean", lambda *args: (
+        np.array([0, 1]), None, sparse_mean, mean_info,
+    ))
     ADAPTIVE.run_frozen_fit(args)
     summary = json.loads(args.out.read_text())
     assert calls["closed"]
@@ -72,8 +118,19 @@ def test_frozen_fit_uses_current_partition_trace_and_keeps_sparse_variance(
     np.testing.assert_array_equal(summary["var_components_lasso_ml"], theta)
     np.testing.assert_array_equal(summary["genetic_trace_atoms"], atoms)
     assert summary["grm_variance_scale"] == "trace_weighted"
-    assert summary["q_chive"] == q
-    assert summary["h2"] == pytest.approx((q + 0.45) / (q + 0.45 + 0.5))
+    inverse = np.linalg.inv(covariance)
+    gamma = np.linalg.solve(covar.T @ inverse @ covar, covar.T @ inverse @ (context.y-sparse_mean))
+    p = inverse-inverse @ covar @ np.linalg.solve(covar.T @ inverse @ covar, covar.T @ inverse)
+    sigma = design @ np.linalg.solve(design.T @ p @ design, design.T)
+    q = (sparse_mean @ sparse_mean + 2*sparse_mean @ (context.y-sparse_mean-covar @ gamma)
+         - np.trace(sigma))/n
+    assert summary["q_chive"] == pytest.approx(q, abs=1e-6)
+    np.testing.assert_allclose(summary["beta_cov"], gamma, atol=1e-6)
+    assert summary["mean_uncertainty_trace_per_n"] == pytest.approx(np.trace(sigma)/n, abs=1e-6)
+    background = atoms @ theta[:-1]
+    assert summary["h2"] == pytest.approx((q + background)/(q + background + 0.5), abs=2e-6)
+    assert summary["method"] == "fixed_sparse_mean_information_corrected_reml"
+    assert "parent_q_sparse_held_fixed" not in summary
     assert summary["stop_reason"] == "ll_down"
 
 
@@ -269,7 +326,7 @@ def test_common_core_random_draws_do_not_change_with_compute_batching(tmp_path, 
 
     index = SimpleNamespace(m_total=m, streamer=SimpleNamespace(kv=kv),
                             xtv_all=lambda value, **kw:np.zeros((m, value.shape[1])))
-    projector = SimpleNamespace(_covar=np.ones((n, 1)), apply=lambda value, **kw:value)
+    projector = SimpleNamespace(_covar=np.ones((n, 1)), apply_reference=lambda value, **kw:value)
 
     def bilinear(left, right, *args, out):
         out[:] = left.T @ right
@@ -323,7 +380,8 @@ def test_probe_growth_releases_pilot_and_previous_tier(tmp_path, monkeypatch):
 
     n, m, rank, count = 8, 40, 2, 3
     candidates = np.array([10, 20, 30])
-    projector = SimpleNamespace(_covar=np.empty((n, 0)), apply=lambda r, **kw:r)
+    projector = SimpleNamespace(_covar=np.empty((n, 0)), apply=lambda r, **kw:r,
+                                mean_information=None)
     index = SimpleNamespace(m_total=m, xtv_all=lambda r, **kw:np.zeros((m, r.shape[1])))
     contractions = SimpleNamespace(intervals=[(0, m)], candidates=candidates,
                                    apply=lambda *a:np.zeros((count+2, 1)))
@@ -344,7 +402,7 @@ def test_probe_growth_releases_pilot_and_previous_tier(tmp_path, monkeypatch):
             samples[start:stop] = np.arange(start, stop)[:, None]
             markers[start:stop] = 0
 
-        def sketch(contractions, h, marker_h, core, samples, markers, workspace):
+        def sketch(contractions, h, marker_h, core, samples, markers, workspace, **kwargs):
             probes = len(samples)
             cross = workspace.allocate((count+2, rank, probes)); cross[:] = 0
             bulk = workspace.allocate((count+2, probes, probes)); bulk[:] = 0
@@ -369,7 +427,8 @@ def test_probe_growth_releases_pilot_and_previous_tier(tmp_path, monkeypatch):
     assert list(tmp_path.iterdir()) == []
 
 
-def test_full_core_score_with_real_bed_pcg_matches_dense_reml(tmp_path):
+@pytest.mark.parametrize("selected_size", [0, 3])
+def test_full_core_score_with_real_bed_pcg_matches_dense_corrected_model(tmp_path, selected_size):
     from bed_reader import to_bed
 
     rng = np.random.default_rng(312)
@@ -391,8 +450,12 @@ def test_full_core_score_with_real_bed_pcg_matches_dense_reml(tmp_path):
         index = ADAPTIVE.MultiGRMIndex(fitter.streamers, component_variant_indices=groups)
         covar = np.column_stack([np.ones(n), rng.normal(size=n)])
         theta = np.array([0.25, 0.35, 0.5])
+        z = index.extract_standardized_columns(np.arange(m)).astype(float)
+        selected = z[:, 1:1+selected_size]
+        mean_info = ADAPTIVE.SparseMeanInformation(selected, covar)
         projector = ADAPTIVE.REMLProjector(
             fitter, fitter._assemble_reml_operators(), theta, covar, 1e-6, 200,
+            mean_information=mean_info,
         )
         normalizers = np.asarray(index.streamer._component_eff_m_host)
         candidates = np.array([8, 16, 24, 40, 48, 56])
@@ -403,7 +466,6 @@ def test_full_core_score_with_real_bed_pcg_matches_dense_reml(tmp_path):
         args = SimpleNamespace(score_trace_seed=74, score_core_rank=64, score_trace_probes=32,
                                score_trace_max_probes=128, score_trace_tol=0.05)
         response = rng.normal(size=n).astype(np.float32)
-        z = index.extract_standardized_columns(np.arange(m)).astype(float)
         ranked = z[:, index.cache_variant_indices(order)]
         directions = np.stack([
             z[:, :32]@z[:, :32].T/normalizers[0],
@@ -413,7 +475,10 @@ def test_full_core_score_with_real_bed_pcg_matches_dense_reml(tmp_path):
         v = np.einsum("a,aij->ij", theta, directions[:3])
         vi = np.linalg.inv(v)
         p = vi - vi@covar@np.linalg.solve(covar.T@vi@covar, covar.T@vi)
-        pd = p@directions
+        sigma = (selected @ np.linalg.solve(selected.T @ p @ selected, selected.T)
+                 if selected_size else np.zeros((n, n)))
+        ps = p-p @ sigma @ p
+        pd = ps@directions
         fisher = 0.5*np.einsum("aij,bji->ab", pd, pd)
         coefficients = np.linalg.solve(fisher[:3, :3], fisher[:3, 3:]).T
         raw_scores = 0.5*(np.einsum("i,aij,j->a", p@response, directions, p@response)
@@ -423,6 +488,7 @@ def test_full_core_score_with_real_bed_pcg_matches_dense_reml(tmp_path):
             process = ADAPTIVE._estimate_score_process(
                 args, projector, index, contractions, response, workspace=workspace,
             )
+            np.testing.assert_allclose(process.raw_scores, raw_scores[3:], atol=2e-4, rtol=2e-4)
             np.testing.assert_allclose(process.scores, raw_scores[3:]-coefficients@raw_scores[:3],
                                        atol=2e-4, rtol=2e-4)
             np.testing.assert_allclose(process.information, np.diag(information), atol=2e-4, rtol=2e-4)
@@ -430,7 +496,24 @@ def test_full_core_score_with_real_bed_pcg_matches_dense_reml(tmp_path):
             actual = 0.5*np.einsum("aij,bji->ab", matrix, matrix)
             scale = np.sqrt(np.diag(information))
             np.testing.assert_allclose(actual, information/scale[:, None]/scale, atol=2e-4, rtol=2e-4)
-            assert process.diagnostics["core_rank"] == n-covar.shape[1]
+            assert process.diagnostics["core_rank"] == n-covar.shape[1]-selected_size
+            assert process.diagnostics["mean_information_rank"] == selected_size
+            np.testing.assert_allclose(projector.apply_reference(response, stage="oracle"),
+                                       ps @ response, atol=3e-5)
+            if selected_size:
+                assert np.linalg.norm((p-ps) @ response) > .01
+                # A finite-difference derivative proves these are ell_C scores,
+                # not scores from fully profiling the selected SNP directions.
+                def objective(covariance):
+                    vi = np.linalg.inv(covariance)
+                    pc = vi-vi@covar@np.linalg.solve(covar.T@vi@covar, covar.T@vi)
+                    return -.5*(np.linalg.slogdet(covariance)[1]
+                                + np.linalg.slogdet(covar.T@vi@covar)[1]
+                                + np.linalg.slogdet(selected.T@pc@selected)[1]
+                                + response@pc@response)
+                derivatives = [(objective(v+1e-5*d)-objective(v-1e-5*d))/2e-5
+                               for d in directions[3:]]
+                np.testing.assert_allclose(process.raw_scores, derivatives, atol=3e-4, rtol=3e-4)
         assert not list(tmp_path.glob(".score-*"))
     finally:
         fitter.close()
@@ -452,6 +535,6 @@ def test_zero_parent_variance_stops_before_trace_solves(monkeypatch, tmp_path):
     assert result["stop_reason"] == "no_positive_parent_variance"
     assert not result["accepted"]
     assert result["zero_parent_boundaries_excluded"] == [2, 4, 6]
-    assert result["method"] == "joint_quadratic_reml_ld_cusum"
+    assert result["method"] == "joint_quadratic_information_corrected_ld_cusum"
     assert result["diagnostics"]["global_p_value"] == 1.0
     assert closed == [True]

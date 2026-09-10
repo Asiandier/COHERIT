@@ -121,12 +121,15 @@ def test_sparse_pipeline_automatic_fit_effects_prediction(tmp_path, mode):
         assert score_paths
         for score_path in score_paths:
             score = json.loads(score_path.read_text())
-            assert score["schema_version"] == 3
-            assert score["method"] == "joint_quadratic_reml_ld_cusum"
+            assert score["schema_version"] == 5
+            assert score["method"] == "joint_quadratic_information_corrected_ld_cusum"
             diagnostics = score["diagnostics"]
             assert score["accepted"] == (diagnostics["global_p_value"] <= 0.05)
             if score["candidates"]:
                 assert diagnostics["calibration_method"] == "joint_core_probe_quadratic"
+                assert diagnostics["reference_covariance"] == "P_S = P - P Sigma_mu P"
+                assert diagnostics["reference_mean"].startswith("zero:")
+                assert "mean_information_rank" in diagnostics
                 assert diagnostics["max_score_trace_standard_error"] <= 0.05
                 assert diagnostics["max_information_relative_standard_error"] <= 0.10
                 assert score["selected_candidate"] == score["candidates"][0]
@@ -137,6 +140,17 @@ def test_sparse_pipeline_automatic_fit_effects_prediction(tmp_path, mode):
                     row["score_statistic"] for row in score["candidates"])
                 assert diagnostics["global_p_value"] >= 1/(diagnostics["reference_samples"]+1)
         assert not list(tmp_path.glob("**/.score-*"))
+        frozen_paths = list(tmp_path.glob("**/fixed_alpha_path/k*.frozen_fit.json"))
+        assert frozen_paths, "This fixture must exercise an actual corrected covariance refit."
+        for frozen_path in frozen_paths:
+            frozen = json.loads(frozen_path.read_text())
+            assert frozen["schema_version"] == 2
+            assert frozen["method"] == "fixed_sparse_mean_information_corrected_reml"
+            assert frozen["q_chive"] == pytest.approx(
+                frozen["q_chive_term1"] + frozen["q_chive_term2"]
+                - frozen["mean_uncertainty_trace_per_n"]
+            )
+            assert "parent_q_sparse_held_fixed" not in frozen
 
     for path in tmp_path.glob("**/*.history.json"):
         records = json.loads(path.read_text())

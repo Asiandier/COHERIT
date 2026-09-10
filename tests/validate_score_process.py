@@ -79,7 +79,11 @@ def experiment(n, m, rho, bins, *, seed, repetitions, trace_seeds, reference_sam
         xtv_all=lambda x, **_: z.T@np.asarray(x),
         extract_standardized_columns=lambda indices: z[:, indices].astype(np.float32),
     )
-    projector = SimpleNamespace(_covar=covar, theta=theta, apply=lambda x, **_: p@np.asarray(x))
+    projector = SimpleNamespace(
+        _covar=covar, theta=theta, apply=lambda x, **_: p@np.asarray(x),
+        apply_reference=lambda x, **_: p@np.asarray(x),
+        mean_information=None,
+    )
     with tempfile.TemporaryDirectory(prefix="validate_joint_score_") as directory:
         for i in range(trace_seeds):
             args = SimpleNamespace(

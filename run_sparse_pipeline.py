@@ -727,7 +727,8 @@ def _run_adaptive_selection(
                 adaptive_dir / f"k{current_k:04d}.score.log",
             )
         score = read_json(score_path)
-        if score.get("schema_version") != 3:
+        if (score.get("schema_version") != 5
+                or score.get("method") != "joint_quadratic_information_corrected_ld_cusum"):
             raise ValueError(f"Unsupported score schema; rerun the score stage: {score_path}")
         p_value = float(score["diagnostics"]["global_p_value"])
         selected = score.get("selected_candidate")
@@ -799,6 +800,9 @@ def _run_adaptive_selection(
                 adaptive_dir / f"k{next_k:04d}.frozen_fit.log",
             )
         next_summary = read_json(next_fit_path)
+        if (next_summary.get("schema_version") != 2
+                or next_summary.get("method") != "fixed_sparse_mean_information_corrected_reml"):
+            raise ValueError(f"Uncorrected or unsupported frozen fit; use a new work directory: {next_fit_path}")
         theta = np.asarray(next_summary["var_components_lasso_ml"], dtype=np.float64)
         if theta.shape != (next_k + 1,) or not np.all(np.isfinite(theta)):
             raise RuntimeError(f"Invalid frozen covariance fit: {next_fit_path}")
@@ -811,7 +815,7 @@ def _run_adaptive_selection(
                 "genetic_trace_atoms": list(next_summary["genetic_trace_atoms"]),
                 "component_spec": str(next_spec.resolve()),
                 "fit": str(next_fit_path.resolve()),
-                "stage": "fixed_k1_sparse_mean_covariance_refit",
+                "stage": "fixed_k1_sparse_mean_information_corrected_covariance_refit",
                 "added_boundary_position": int(selected["boundary_position"]),
             }
         )
@@ -821,9 +825,9 @@ def _run_adaptive_selection(
         current_summary = next_summary
 
     path_payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "complete",
-        "algorithm": "fixed_k1_sparse_mean_global_ld_cusum",
+        "algorithm": "fixed_k1_sparse_mean_information_corrected_global_ld_cusum",
         "stop_reason": stop_reason,
         "selected_k": current_k,
         "selected_h2_fixed_alpha": float(current_summary["h2"]),
