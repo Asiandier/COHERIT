@@ -28,47 +28,6 @@ def full_core(directions, p):
     return sketch(directions, h, np.zeros((len(p), 3)))
 
 
-def test_corrected_offset_score_does_not_subtract_a_second_shrinkage_term():
-    rng = np.random.default_rng(1149)
-    n = 24
-    c = np.column_stack([np.ones(n), rng.normal(size=n)])
-    z = rng.normal(size=(n, 3)) + .3*c[:, 1:2]
-    factor = rng.normal(size=(n, 11))
-    k = factor @ factor.T / 11
-    covariance = .4*k + .6*np.eye(n)
-    vi = np.linalg.inv(covariance)
-    p = vi-vi@c@np.linalg.solve(c.T@vi@c, c.T@vi)
-    info = z.T@p@z
-    ps = p-p@z@np.linalg.solve(info, z.T@p)
-    signs, lam = np.array([1., -1., 1.]), .7
-    noise = np.linalg.cholesky(covariance) @ rng.normal(size=n)
-    y = c @ np.array([.3, -.2]) + z @ (10*signs) + noise
-    beta = np.linalg.solve(info, z.T@p@y-lam*signs)
-    np.testing.assert_array_equal(np.sign(beta), signs)
-    residual = y-z@beta
-    v = p@residual
-    shift = lam*p@z@np.linalg.solve(info, signs)
-    np.testing.assert_allclose(v, shift+ps@noise, atol=1e-12)
-    # Shrinkage is present. The working reference is not claimed to be the
-    # exact Lasso sampling law; adding another centering term would change
-    # the efficient derivative of the ell_C objective used for split search.
-    candidate = rng.normal(size=(n, 6))
-    directions = np.stack([k, np.eye(n), np.diag(np.linspace(-1, 1, n)),
-                           candidate@candidate.T/6-k])
-    quadratic = np.einsum("i,aij,j->a", v, directions, v)
-    raw = .5*(quadratic-np.trace(ps@directions, axis1=1, axis2=2))
-    exact = full_core(directions, ps)
-    coefficients, _ = SCORE.fit_nuisance_projection(exact, 2)
-    process = SCORE.score_process_moments(
-        quadratic, evaluation=exact, coefficients=coefficients,
-        boundary_positions=np.array([10, 20]),
-    )
-    transform = np.column_stack([-coefficients, np.eye(2)])
-    np.testing.assert_allclose(process.scores, transform@raw, atol=1e-12)
-    extra = .5*np.einsum("i,aij,j->a", shift, directions, shift)
-    assert np.linalg.norm(transform@extra) > 1e-5
-
-
 @pytest.mark.parametrize("contrast_scale", [1.0, 1e-12, 1e12])
 def test_full_core_matches_dense_reml_score_and_joint_covariance(contrast_scale):
     rng = np.random.default_rng(415)

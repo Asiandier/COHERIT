@@ -25,8 +25,7 @@ class TraceSketch:
     """Common-core/probe contractions for all nuisance and candidate directions.
 
     core=H'DH, cross=H'DB, diagonal=diag(B'DB); bulk is B'DB with its
-    diagonal removed. B has independent columns with covariance R-HH'. In the corrected sparse
-    path R=P_S, while the observed offset residual remains P(y-mu_s).
+    diagonal removed. B has independent columns with covariance P-HH'.
     Large arrays may be file-backed; validation and products use bounded blocks.
     """
 
@@ -66,7 +65,7 @@ class TraceSketch:
         return self.core.shape[-1]
 
     def information_rows(self, count: int) -> np.ndarray:
-        """PSD all-pairs score-covariance Gram, computing only the requested leading rows."""
+        """PSD all-pairs Fisher Gram, computing only the requested leading rows."""
         directions = len(self.core)
         if not 1 <= count <= directions:
             raise ValueError("Nuisance count must match the trace directions.")
@@ -80,12 +79,12 @@ class TraceSketch:
                 feature = np.ascontiguousarray(flat[:, start:start + width])
                 rows += weight * (feature[:count] @ feature.T)
         if not np.all(np.isfinite(rows)):
-            raise FloatingPointError("Non-finite score-covariance information.")
+            raise FloatingPointError("Non-finite Fisher information.")
         return rows
 
 
 def fit_nuisance_projection(pilot: TraceSketch, nuisance_count: int) -> tuple[np.ndarray, np.ndarray]:
-    """Fit only nuisance score-covariance rows using independent pilot probes."""
+    """Fit only nuisance Fisher rows using independent pilot probes."""
     q = int(nuisance_count)
     rows = pilot.information_rows(q)
     information = 0.5 * (rows[:, :q] + rows[:, :q].T)
@@ -95,7 +94,7 @@ def fit_nuisance_projection(pilot: TraceSketch, nuisance_count: int) -> tuple[np
     eigenvalues, basis = np.linalg.eigh(normalized)
     tolerance = 1e-10 * max(1.0, float(eigenvalues[-1]))
     if eigenvalues[0] < -tolerance:
-        raise FloatingPointError("Nuisance score-covariance Gram is indefinite beyond roundoff.")
+        raise FloatingPointError("Nuisance Fisher Gram is indefinite beyond roundoff.")
     keep = eigenvalues > tolerance
     inverse = (basis[:, keep] / eigenvalues[keep]) @ basis[:, keep].T
     inverse /= scale[:, None] * scale[None, :]
@@ -126,7 +125,7 @@ def score_process_moments(
 ) -> ScoreProcess:
     """Evaluate the actual pilot-fitted directions, without another Schur fit.
 
-    The reference covariance is exactly the same all-pairs score-covariance estimate.
+    The reference covariance is exactly the same all-pairs Fisher estimate.
     Information uncertainty uses a delete-one jackknife of the combined cross
     and bulk terms, retaining their dependence. Zero-information rows have a
     zero reference matrix and are excluded from the test.
